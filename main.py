@@ -22,6 +22,7 @@ class UserMessage(BaseModel):
 
 import os
 from dotenv import load_dotenv   
+load_dotenv()
 
 os.environ["GEMINI_API_KEY"] = os.getenv("GEMINI_API_KEY")
 client = genai.Client()
