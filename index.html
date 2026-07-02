@@ -1,0 +1,352 @@
+<html>
+<head>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
+<style>
+
+
+@keyframes breathe {
+  0% { transform: scale(0.8); opacity: 0.4; }
+  50% { transform: scale(1.1); opacity: 1; }
+  100% { transform: scale(0.8); opacity: 0.4; }
+}
+
+
+.loading-dot {
+  width: 12px;
+  height: 12px;
+  background-color: black; 
+  border-radius: 50%;
+  display: inline-block;
+  margin: 4px; 
+  animation: breathe 1.2s infinite ease-in-out;
+}
+
+.thinking {
+  animation: pulse 1s infinite ease-in-out;
+}
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    transition: background 0.3s;
+    background: rgba(233, 233, 246, 0.35);
+    font-family: sans-serif;
+    width: 100%;
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+    border-radius: 16px;
+  }
+
+  #header {
+    position: relative;
+    height: 40px;
+    margin-bottom: 12px;
+    -webkit-app-region: drag;
+    font-family: 'DM Mono', monospace;
+  }
+
+  #btn {
+    position: absolute;
+    transform: translateY(-50%);
+    left: 0;
+    top: 19px;
+    -webkit-app-region: no-drag;
+    width: 20px;
+    height: 20px;
+    background: #333;
+    cursor: pointer;
+    transition: border-radius 0.5s;
+    border: none;
+    outline: none;
+  }
+
+  #btn.circle {
+    border-radius: 60%;
+    background: black;
+    border: none;
+    outline: none;
+  }
+
+  #title {
+    position: absolute;
+    left: 36px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    color: #333;
+    font-family: 'DM Mono', monospace;
+  }
+
+  #content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .bubble {
+    background: rgba(0,0,0,0.1);
+    border-radius: 12px;
+    padding: 12px 16px;
+    font-size: 13px;
+    color: #333;
+    max-width: 80%;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  #input-area {
+    display: flex;
+    gap: 8px;
+    padding-top: 12px;
+    margin-top: auto;
+    flex-shrink: 0;
+  }
+
+  input {
+    flex: 1;
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: 1px solid rgba(0,0,0,0.15);
+    background: white;
+    font-size: 13px;
+    outline: none;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  button {
+    padding: 10px 16px;
+    border-radius: 10px;
+    border: none;
+    background: #555;
+    color: rgb(211, 211, 211);
+    font-size: 13px;
+    cursor: pointer;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <div id="btn"></div>
+  <span id="title">michelle.ai</span>
+</div>
+
+<div id="content">
+  <div class="bubble">What's up?</div>
+</div>
+
+<div id="input-area">
+  <input type="text" placeholder="Ask me anything..." />
+  <button>Send</button>
+</div>
+
+<script>
+  const { ipcRenderer } = require('electron')
+  const btn = document.getElementById('btn')
+  const title = document.getElementById('title')
+  const content = document.getElementById('content')
+  const inputArea = document.getElementById('input-area')
+  const body = document.querySelector('body')
+
+  let collapsed = false
+  let savedheight = 600
+  const CENTER = 170
+  let skipNextClick = false
+
+
+  btn.addEventListener('click', () => {
+    if (skipNextClick) { skipNextClick = false; return }
+    if (collapsed) return
+    collapsed = true
+
+    anime({ targets: title, opacity: 0, duration: 200, easing: 'linear' })
+    anime({ targets: [content, inputArea], opacity: 0, duration: 200, easing: 'linear',
+      complete: () => {
+        content.style.display = 'none'
+        inputArea.style.display = 'none'
+      }
+    })
+    anime({
+      targets: btn,
+      left: 0,
+      duration: 500,
+      easing: 'easeInOutSine',
+      complete: () => {
+        body.style.removeProperty('height')
+        body.style.height = '100vh'
+        btn.classList.add('circle')
+        body.style.transition = 'background 0.3s'
+        body.style.background = 'transparent'
+        body.style.border = 'none'
+        body.style.boxShadow = 'none'
+        setTimeout(() => { ipcRenderer.send('collapse', true) }, 300)
+      }
+    })
+    savedheight = body.clientHeight
+    anime({ targets: body, height: 60, duration: 500, easing: 'easeInOutSine' })
+  })
+
+
+  let dragStartScreen = null
+
+  btn.addEventListener('mousedown', (e) => {
+    if (!collapsed) return
+    e.preventDefault()
+
+    dragStartScreen = { x: e.screenX, y: e.screenY }
+    ipcRenderer.send('drag-start', { screenX: e.screenX, screenY: e.screenY })
+
+    function onDragEnd(e) {
+      document.removeEventListener('mouseup', onDragEnd)
+      ipcRenderer.send('drag-stop')
+
+      const dx = Math.abs(e.screenX - dragStartScreen.x)
+      const dy = Math.abs(e.screenY - dragStartScreen.y)
+      dragStartScreen = null
+
+      if (dx < 5 && dy < 5) {
+      
+        skipNextClick = true
+        collapsed = false
+        ipcRenderer.send('collapse', false)
+        btn.style.webkitAppRegion = 'no-drag'
+        body.style.webkitAppRegion = 'no-drag'
+        body.style.transition = 'background 0.3s'
+        body.style.background = 'rgba(233, 233, 246, 0.35)'
+        btn.classList.remove('circle')
+        btn.style.border = 'none'
+
+        anime({
+          targets: body,
+          height: savedheight,
+          duration: 500,
+          easing: 'easeInOutSine',
+          complete: () => { body.style.removeProperty('height') }
+        })
+        anime({ targets: btn, left: 0, duration: 500, easing: 'easeInOutSine' })
+        content.style.display = 'flex'
+        inputArea.style.display = 'flex'
+        inputArea.style.marginTop = 'auto'
+        anime({ targets: title, opacity: 1, duration: 300, delay: 300, easing: 'linear' })
+        anime({ targets: [content, inputArea], opacity: 1, duration: 300, delay: 300, easing: 'linear' })
+      }
+    }
+
+    document.addEventListener('mouseup', onDragEnd)
+  })
+
+
+
+const sendButton = document.querySelector('button');
+const inputBox = document.querySelector('input');
+const chatContainer = document.getElementById('content');
+
+
+function addBubble(text, sender) {
+  const newBubble = document.createElement('div');
+  newBubble.classList.add('bubble');
+  newBubble.innerText = text;
+
+  if (sender === 'user') {
+    newBubble.style.marginLeft = 'auto'; 
+    newBubble.style.background = 'rgba(0,0,0,0.2)';
+  }
+
+  content.appendChild(newBubble); 
+  content.scrollTop = content.scrollHeight;
+
+  return newBubble; 
+}
+
+function revealScramble(element, finalString) {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  let iterations = 0;
+  
+  const interval = setInterval(() => {
+    let scrambledText = "";
+    
+    for (let i = 0; i < finalString.length; i++) {
+      if (i < iterations) {
+        scrambledText += finalString[i];
+      } else if (finalString[i] === ' ') {
+        scrambledText += ' '; 
+      } else {
+        scrambledText += chars[Math.floor(Math.random() * chars.length)]; 
+      }
+    }
+    
+    element.innerText = scrambledText;
+
+    if (iterations >= finalString.length) {
+      clearInterval(interval);
+    }
+    
+    iterations += 1/2; 
+  }, 10); 
+}
+
+
+function handleSend() {
+  const userText = inputBox.value;
+  if (userText.trim() === '') return;
+
+  addBubble(userText, 'user');
+  inputBox.value = '';
+
+  const botBubble = addBubble('', 'bot');
+  botBubble.innerHTML = '<div class="loading-dot"></div>';
+
+  fetch('http://127.0.0.1:8000/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+
+      body: JSON.stringify({ text: userText })
+    })
+    .then(response => response.json()) 
+    .then(data => {
+      setTimeout(()=>{
+        let botReply = data.answer;
+        revealScramble(botBubble, botReply);
+      }, 1200);
+    })
+
+     
+    .catch(error => {
+      
+      console.error('Error:', error);
+      revealScramble(botBubble, "System Error: Connection to backend lost.");
+    });
+  }
+
+
+ 
+  
+
+
+sendButton.addEventListener('click', handleSend);
+inputBox.addEventListener('keypress', (event) => {
+  if (event.key === 'Enter') {
+    handleSend();
+  }
+});
+
+
+
+
+
+</script>
+
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "dependencies": {
+    "animejs": "^4.0.0"
+  },
+  "name": "prototypeanimationrolling",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^28.3.3",
+    "electron-builder": "^26.15.3"
+  }
+}
