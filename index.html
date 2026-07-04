@@ -7,6 +7,7 @@
 <style>
 
 
+
 @keyframes breathe {
   0% { transform: scale(0.8); opacity: 0.4; }
   50% { transform: scale(1.1); opacity: 1; }
@@ -163,6 +164,7 @@
   const CENTER = 170
   let skipNextClick = false
 
+// Handle the collapse button click.
 
   btn.addEventListener('click', () => {
     if (skipNextClick) { skipNextClick = false; return }
@@ -196,6 +198,7 @@
     anime({ targets: body, height: 60, duration: 500, easing: 'easeInOutSine' })
   })
 
+// Handle dragging the window when collapsed.
 
   let dragStartScreen = null
 
@@ -214,8 +217,12 @@
       const dy = Math.abs(e.screenY - dragStartScreen.y)
       dragStartScreen = null
 
+// If the mouse didn't move much, treat it as a click to expand.
+
       if (dx < 5 && dy < 5) {
       
+// Handle the expansion of the window back to its original size.
+
         skipNextClick = true
         collapsed = false
         ipcRenderer.send('collapse', false)
@@ -251,6 +258,7 @@ const sendButton = document.querySelector('button');
 const inputBox = document.querySelector('input');
 const chatContainer = document.getElementById('content');
 
+// Handle sending messages and thinking animation for bot responses.
 
 function addBubble(text, sender) {
   const newBubble = document.createElement('div');
@@ -267,6 +275,8 @@ function addBubble(text, sender) {
 
   return newBubble; 
 }
+
+// Function to reveal the bot's response with a scramble text.
 
 function revealScramble(element, finalString) {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
@@ -295,6 +305,7 @@ function revealScramble(element, finalString) {
   }, 10); 
 }
 
+// Function to handle sending user messages and fetching bot responses.
 
 function handleSend() {
   const userText = inputBox.value;
@@ -330,10 +341,7 @@ function handleSend() {
     });
   }
 
-
- 
-  
-
+// Event listeners for sending messages on button click or pressing Enter key.
 
 sendButton.addEventListener('click', handleSend);
 inputBox.addEventListener('keypress', (event) => {
