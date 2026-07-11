@@ -3,7 +3,7 @@ Uses Electron to create a desktop window hosting the AI agent michelle.ai.
 
 
 Tasks finished:
-- Create suitable UI
+
 - Collapse/Expand feature
 - Mock thinking feature
 - Scramble text feature
