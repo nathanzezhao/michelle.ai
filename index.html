@@ -164,6 +164,7 @@
   let savedheight = 600
   const CENTER = 170
   let skipNextClick = false
+  let conversationId = null
 
 // Handle the collapse button click.
 
@@ -324,10 +325,16 @@ function handleSend() {
         'Content-Type': 'application/json'
       },
 
-      body: JSON.stringify({ text: userText })
+      body: JSON.stringify({
+        text: userText,
+        conversation_id: conversationId
+      })
     })
     .then(response => response.json()) 
     .then(data => {
+      if (data.conversation_id) {
+        conversationId = data.conversation_id
+      }
       setTimeout(()=>{
         let botReply = data.answer;
         revealScramble(botBubble, botReply);

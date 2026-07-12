@@ -9,5 +9,13 @@ __pycache__/
 venv/
 .venv/
 
+# MacOS garbage
+.DS_Store
+
 # Ignore environment variables / API keys
 .env
+
+# Ignore local Michelle memory database (chats stay on this laptop)
+michelle.db
+michelle.db-wal
+michelle.db-shm
