@@ -20,7 +20,7 @@ LLMs:
     - set .env file LLM_PROVIDER=gemini
     - Refresh backend and electron by pressing control + c.
 
-As of now, Michelle has a memory of the last 10 messages in current chat session. That means that if you state your name in the first message and chat about other things for another 10 messages, asking her for your name on the 11th will result in her not remembering. 
+As of July 15 2026, Michelle has a memory of the last 10 messages in current chat session. That means that if you state your name in the first message and chat about other things for another 10 messages, asking her for your name on the 11th will result in her not remembering. 
 
 `michelle.db` is the filing cabinet.  It stores every chat from every session. `memory.py` opens that cabinet and pulls out the last 10 messages. `main.py` sends those plus your new message to the LLM. So the DB remembers everything, but Michelle only "sees" the most recent 10 messages each time.
 
@@ -28,7 +28,11 @@ main.py  →  memory.py (get last 10 from DB)
 →  llm.py (send those + new message to Gemini/Ollama/mock)
 →  memory.py (save the new turn)
 
-As of July 15th 2026, Michelle now has intent routers behind every message before being sent to an llm. 
+Michelle now also has intent routers behind every message before being sent to an llm in the form of either an estimated or hardcoded number between 0 an 1.0 to distinguish between three different main intent sections:
+
+- Chat -> Small talk, greetings, casual conversation → Ollama generates reply
+- Action -> User wants Michelle to do something → stub reply (not built yet)
+- Retrieve -> User wants info from docs/data → stub reply (not built yet)
 
 .env setup for intent:
 
