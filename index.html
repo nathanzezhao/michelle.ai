@@ -9,9 +9,9 @@
 
 
 @keyframes breathe {
-  0% { transform: scale(0.8); opacity: 0.4; }
+  0% { transform: scale(0.8); opacity: 0.1; }
   50% { transform: scale(1.1); opacity: 1; }
-  100% { transform: scale(0.8); opacity: 0.4; }
+  100% { transform: scale(0.8); opacity: 0.1; }
 }
 
 
@@ -95,11 +95,11 @@
   }
 
   .bubble {
-    background: rgba(0,0,0,0.1);
+    background: rgba(255, 253, 253, 0.5);
     border-radius: 12px;
     padding: 12px 16px;
     font-size: 13px;
-    color: #333;
+    color: #151515;
     max-width: 80%;
     font-family: 'IBM Plex Mono', monospace;
   }
@@ -164,7 +164,8 @@
   let savedheight = 600
   const CENTER = 170
   let skipNextClick = false
-  let conversationId = null
+  const CONVERSATION_STORAGE_KEY = 'michelle_conversation_id'
+  let conversationId = localStorage.getItem(CONVERSATION_STORAGE_KEY)
 
 // Handle the collapse button click.
 
@@ -172,6 +173,7 @@
     if (skipNextClick) { skipNextClick = false; return }
     if (collapsed) return
     collapsed = true
+    savedheight = body.clientHeight
 
     anime({ targets: title, opacity: 0, duration: 200, easing: 'linear' })
     anime({ targets: [content, inputArea], opacity: 0, duration: 200, easing: 'linear',
@@ -196,7 +198,6 @@
         setTimeout(() => { ipcRenderer.send('collapse', true) }, 300)
       }
     })
-    savedheight = body.clientHeight
     anime({ targets: body, height: 60, duration: 500, easing: 'easeInOutSine' })
   })
 
@@ -334,6 +335,7 @@ function handleSend() {
     .then(data => {
       if (data.conversation_id) {
         conversationId = data.conversation_id
+        localStorage.setItem(CONVERSATION_STORAGE_KEY, conversationId)
       }
       setTimeout(()=>{
         let botReply = data.answer;

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from intent import classify_intent
 from llm import ask_llm
 from memory import get_history, init_db, save_message
 
@@ -73,7 +74,27 @@ def handle_chat(incoming_data: UserMessage):
 
     try:
         history = get_history(conversation_id)
-        answer = ask_llm(user_text, history)
+        intent_result = classify_intent(user_text, history)
+        intent = intent_result["intent"]
+        confidence = intent_result["confidence"]
+
+        print(
+            f"[{provider}] [{conversation_id[:8]}] "
+            f"intent={intent} ({confidence:.2f})"
+        )
+
+        if intent == "RETRIEVE":
+            answer = (
+                "I can't search your documents or databases yet — "
+                "that's the next step. For now I can only chat."
+            )
+        elif intent == "ACTION":
+            answer = (
+                "I can't run actions yet — like creating tickets or sending emails — "
+                "but that feature is coming soon."
+            )
+        else:
+            answer = ask_llm(user_text, history)
 
         # Save only after a successful answer: a failed turn leaves no trace,
         # so Michelle never "remembers" her own error messages.
@@ -81,7 +102,11 @@ def handle_chat(incoming_data: UserMessage):
         save_message(conversation_id, "assistant", answer)
 
         print(f"[{provider}] [{conversation_id[:8]}] Michelle responded: {answer}")
-        return {"answer": answer, "conversation_id": conversation_id}
+        return {
+            "answer": answer,
+            "conversation_id": conversation_id,
+            "intent": intent,
+        }
     except Exception as e:
         print(f"Error: {e}")
         return {

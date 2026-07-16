@@ -1,9 +1,16 @@
 import os
 from typing import Optional
-
+from google.genai import types
 import httpx
 from google import genai
 
+## To keep responses nice and concise
+SYSTEM_PROMPT = (
+    "You are Michelle, a helpful assistant. "
+    "Keep replies short — 1 to 5 sentences max. "
+    "No bullet lists unless the user asks. Be direct, but nice. "
+    "Have a lax personality, you are allowed to use gen z lingo and swear a little. "
+)
 
 def ask_llm(prompt: str, history: Optional[list[dict]] = None) -> str:
     provider = os.getenv("LLM_PROVIDER", "mock").lower()
@@ -54,7 +61,8 @@ def _ask_ollama(prompt: str, history: list[dict]) -> str:
     model = os.getenv("OLLAMA_MODEL", "llama3.2")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 
-    messages = [{"role": turn["role"], "content": turn["content"]} for turn in history]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages += [{"role": turn["role"], "content": turn["content"]} for turn in history]
     messages.append({"role": "user", "content": prompt})
 
     response = httpx.post(
@@ -85,8 +93,15 @@ def _ask_gemini(prompt: str, history: list[dict]) -> str:
         contents.append({"role": role, "parts": [{"text": turn["content"]}]})
     contents.append({"role": "user", "parts": [{"text": prompt}]})
 
-    response = client.models.generate_content(model=model, contents=contents)
+    response = client.models.generate_content(
+    model=model,
+    contents=contents,
+    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+    )
     text = (response.text or "").strip()
     if not text:
         raise RuntimeError("Gemini returned an empty response.")
     return text
+
+
+
