@@ -6,7 +6,7 @@ Video demo 07/02/2026:
 
 [https://github.com/user-attachments/assets/36f5f3f5-7986-40b3-92b2-21973c9dfdfb](https://github.com/user-attachments/assets/36f5f3f5-7986-40b3-92b2-21973c9dfdfb)
 
-Video demo 07/02/2026:
+Video demo 07/02/2026 (memory.py, intent.py, llm.py, michelle.db):
 
 https://github.com/user-attachments/assets/201dd571-df6e-40d5-bfd9-fc0a9b7425e9
 
