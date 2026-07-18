@@ -1,9 +1,14 @@
 Uses Electron to create a desktop window hosting the AI agent michelle.ai.
 
+VIDEO DEMOS:
 
 Video demo 07/02/2026:
 
 [https://github.com/user-attachments/assets/36f5f3f5-7986-40b3-92b2-21973c9dfdfb](https://github.com/user-attachments/assets/36f5f3f5-7986-40b3-92b2-21973c9dfdfb)
+
+Video demo 07/02/2026:
+
+https://github.com/user-attachments/assets/201dd571-df6e-40d5-bfd9-fc0a9b7425e9
 
 LLMs:
 
@@ -19,6 +24,8 @@ LLMs:
     - Paid with tokens.
     - set .env file LLM_PROVIDER=gemini
     - Refresh backend and electron by pressing control + c.
+
+UPDATES:
 
 As of July 15 2026, Michelle has a memory of the last 10 messages in current chat session. That means that if you state your name in the first message and chat about other things for another 10 messages, asking her for your name on the 11th will result in her not remembering. 
 
