@@ -110,10 +110,13 @@
     padding-top: 12px;
     margin-top: auto;
     flex-shrink: 0;
+    min-width: 0;
+    width: 100%;
   }
 
   input {
     flex: 1;
+    min-width: 0;
     padding: 10px 14px;
     border-radius: 10px;
     border: 1px solid rgba(0,0,0,0.15);
@@ -124,6 +127,7 @@
   }
 
   button {
+    flex-shrink: 0;
     padding: 10px 16px;
     border-radius: 10px;
     border: none;
@@ -233,6 +237,8 @@
         body.style.webkitAppRegion = 'no-drag'
         body.style.transition = 'background 0.3s'
         body.style.background = 'rgba(233, 233, 246, 0.35)'
+        body.style.removeProperty('border')
+        body.style.removeProperty('box-shadow')
         btn.classList.remove('circle')
         btn.style.border = 'none'
 

@@ -1,5 +1,9 @@
 const { app, BrowserWindow, ipcMain, screen } = require('electron')
 
+const MIN_WIDTH = 300
+const MIN_HEIGHT = 460
+const COLLAPSED_SIZE = { width: 70, height: 80 }
+
 let win
 let dragInterval = null
 let dragOffset = null
@@ -9,8 +13,8 @@ function createWindow() {
   win = new BrowserWindow({
     width: 380,
     height: 600,
-    minWidth: 300,
-    minHeight: 460,
+    minWidth: MIN_WIDTH,
+    minHeight: MIN_HEIGHT,
     frame: false,
     alwaysOnTop: true,
     transparent: true,
@@ -28,12 +32,15 @@ ipcMain.on('collapse', (event, isCollapsed) => {
     const bounds = win.getBounds()
     savedBounds = { width: bounds.width, height: bounds.height }
     win.setMinimumSize(50, 50)
-    win.setSize(70, 80)
+    win.setSize(COLLAPSED_SIZE.width, COLLAPSED_SIZE.height)
     win.setResizable(false)
   } else {
-    win.setMinimumSize(270, 460)
+    win.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
     win.setResizable(true)
-    win.setSize(savedBounds.width, savedBounds.height)
+    win.setSize(
+      Math.max(savedBounds.width, MIN_WIDTH),
+      Math.max(savedBounds.height, MIN_HEIGHT)
+    )
   }
 })
 
