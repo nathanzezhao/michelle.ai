@@ -1,5 +1,7 @@
 Uses Electron to create a desktop window hosting the AI agent michelle.ai.
 
+Project roadmap and checklist: [ROADMAP.md](ROADMAP.md)
+
 VIDEO DEMOS:
 
 Video demo 07/02/2026:
