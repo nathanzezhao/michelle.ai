@@ -57,8 +57,8 @@
     left: 0;
     top: 19px;
     -webkit-app-region: no-drag;
-    width: 20px;
-    height: 20px;
+    width: 22px;
+    height: 22px;
     background: #333;
     cursor: pointer;
     transition: border-radius 0.5s;
@@ -67,15 +67,30 @@
   }
 
   #btn.circle {
-    border-radius: 60%;
-    background: black;
-    border: none;
+    border-radius: 50%;
+    background: #333;
+    border: 1.5px solid whitesmoke;
     outline: none;
+  }
+
+  body.collapsed {
+    background: transparent !important;
+  }
+
+  body.collapsed #header {
+    margin-bottom: 0;
+    -webkit-app-region: no-drag;
+  }
+
+  body.collapsed #title,
+  body.collapsed #content,
+  body.collapsed #input-area {
+    display: none !important;
   }
 
   #title {
     position: absolute;
-    left: 36px;
+    left: 40px;
     top: 50%;
     transform: translateY(-50%);
     font-size: 14px;
@@ -165,44 +180,100 @@
   
 
   let collapsed = false
-  let savedheight = 600
+  let pointerOnBtn = false
+  let ignoreMouse = true
   const CENTER = 170
   let skipNextClick = false
   const CONVERSATION_STORAGE_KEY = 'michelle_conversation_id'
   let conversationId = localStorage.getItem(CONVERSATION_STORAGE_KEY)
+
+  function setBtnHitTest(enabled) {
+    // enabled=true means the orb should receive clicks (ignore mouse OFF)
+    const nextIgnore = !enabled
+    if (ignoreMouse === nextIgnore) return
+    ignoreMouse = nextIgnore
+    ipcRenderer.send('set-ignore-mouse', nextIgnore)
+  }
+
+  function syncCollapsedHitTest() {
+    if (!collapsed) return
+    setBtnHitTest(pointerOnBtn)
+  }
+
+  function setCollapsedMode(on) {
+    collapsed = on
+    if (on) {
+      body.classList.add('collapsed')
+      btn.classList.add('circle')
+      content.style.display = 'none'
+      inputArea.style.display = 'none'
+      title.style.opacity = '0'
+      body.style.background = 'transparent'
+      body.style.border = 'none'
+      body.style.boxShadow = 'none'
+      // Cursor is usually still on the btn after collapse — mouseenter won't re-fire.
+      pointerOnBtn = true
+      ipcRenderer.sendSync('collapse', true) // starts click-through
+      ignoreMouse = true // match main process state
+      syncCollapsedHitTest() // re-enable hits while pointer is on the orb
+    } else {
+      body.classList.remove('collapsed')
+      btn.classList.remove('circle')
+      btn.style.removeProperty('border')
+      content.style.display = 'flex'
+      inputArea.style.display = 'flex'
+      inputArea.style.marginTop = 'auto'
+      body.style.background = 'rgba(233, 233, 246, 0.35)'
+      body.style.removeProperty('border')
+      body.style.removeProperty('box-shadow')
+      ipcRenderer.sendSync('collapse', false)
+      ignoreMouse = false
+    }
+  }
 
 // Handle the collapse button click.
 
   btn.addEventListener('click', () => {
     if (skipNextClick) { skipNextClick = false; return }
     if (collapsed) return
-    collapsed = true
-    savedheight = body.clientHeight
 
-    anime({ targets: title, opacity: 0, duration: 200, easing: 'linear' })
-    anime({ targets: [content, inputArea], opacity: 0, duration: 200, easing: 'linear',
-      complete: () => {
-        content.style.display = 'none'
-        inputArea.style.display = 'none'
-      }
-    })
+    // Morph in place while UI fades — window size never changes.
+    btn.classList.add('circle')
+    body.style.transition = 'none'
+    body.style.background = 'transparent'
+
+    anime({ targets: title, opacity: 0, duration: 180, easing: 'linear' })
     anime({
-      targets: btn,
-      left: 0,
-      duration: 500,
-      easing: 'easeInOutSine',
-      complete: () => {
-        body.style.removeProperty('height')
-        body.style.height = '100vh'
-        btn.classList.add('circle')
-        body.style.transition = 'background 0.3s'
-        body.style.background = 'transparent'
-        body.style.border = 'none'
-        body.style.boxShadow = 'none'
-        setTimeout(() => { ipcRenderer.send('collapse', true) }, 300)
-      }
+      targets: [content, inputArea],
+      opacity: 0,
+      duration: 180,
+      easing: 'linear',
+      complete: () => setCollapsedMode(true)
     })
-    anime({ targets: body, height: 60, duration: 500, easing: 'easeInOutSine' })
+  })
+
+  // Forwarded mousemove keeps hit-testing in sync even when enter/leave skip a cycle.
+  document.addEventListener('mousemove', (e) => {
+    if (!collapsed) return
+    const over = e.target === btn || btn.contains(e.target)
+    if (over === pointerOnBtn) return
+    pointerOnBtn = over
+    setBtnHitTest(over)
+  })
+
+  document.addEventListener('mouseleave', () => {
+    if (!collapsed) return
+    pointerOnBtn = false
+    setBtnHitTest(false)
+  })
+
+  btn.addEventListener('mouseenter', () => {
+    pointerOnBtn = true
+    if (collapsed) setBtnHitTest(true)
+  })
+  btn.addEventListener('mouseleave', () => {
+    pointerOnBtn = false
+    if (collapsed) setBtnHitTest(false)
   })
 
 // Handle dragging the window when collapsed.
@@ -212,6 +283,8 @@
   btn.addEventListener('mousedown', (e) => {
     if (!collapsed) return
     e.preventDefault()
+    pointerOnBtn = true
+    setBtnHitTest(true)
 
     dragStartScreen = { x: e.screenX, y: e.screenY }
     ipcRenderer.send('drag-start', { screenX: e.screenX, screenY: e.screenY })
@@ -227,34 +300,14 @@
 // If the mouse didn't move much, treat it as a click to expand.
 
       if (dx < 5 && dy < 5) {
-      
-// Handle the expansion of the window back to its original size.
-
         skipNextClick = true
-        collapsed = false
-        ipcRenderer.send('collapse', false)
-        btn.style.webkitAppRegion = 'no-drag'
-        body.style.webkitAppRegion = 'no-drag'
-        body.style.transition = 'background 0.3s'
-        body.style.background = 'rgba(233, 233, 246, 0.35)'
-        body.style.removeProperty('border')
-        body.style.removeProperty('box-shadow')
-        btn.classList.remove('circle')
-        btn.style.border = 'none'
-
-        anime({
-          targets: body,
-          height: savedheight,
-          duration: 500,
-          easing: 'easeInOutSine',
-          complete: () => { body.style.removeProperty('height') }
-        })
-        anime({ targets: btn, left: 0, duration: 500, easing: 'easeInOutSine' })
-        content.style.display = 'flex'
-        inputArea.style.display = 'flex'
-        inputArea.style.marginTop = 'auto'
-        anime({ targets: title, opacity: 1, duration: 300, delay: 300, easing: 'linear' })
-        anime({ targets: [content, inputArea], opacity: 1, duration: 300, delay: 300, easing: 'linear' })
+        setCollapsedMode(false)
+        anime({ targets: title, opacity: 1, duration: 250, easing: 'linear' })
+        content.style.opacity = '0'
+        inputArea.style.opacity = '0'
+        anime({ targets: [content, inputArea], opacity: 1, duration: 250, easing: 'linear' })
+      } else if (collapsed) {
+        syncCollapsedHitTest()
       }
     }
 

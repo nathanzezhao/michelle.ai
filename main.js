@@ -2,12 +2,12 @@ const { app, BrowserWindow, ipcMain, screen } = require('electron')
 
 const MIN_WIDTH = 300
 const MIN_HEIGHT = 460
-const COLLAPSED_SIZE = { width: 70, height: 80 }
 
 let win
 let dragInterval = null
 let dragOffset = null
-let savedBounds = { width: 380, height: 600 }
+let collapsed = false
+let ignoringMouse = false
 
 function createWindow() {
   win = new BrowserWindow({
@@ -19,6 +19,7 @@ function createWindow() {
     alwaysOnTop: true,
     transparent: true,
     resizable: true,
+    hasShadow: false,
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false
@@ -27,21 +28,27 @@ function createWindow() {
   win.loadFile('index.html')
 }
 
+function setIgnore(ignore) {
+  ignoringMouse = !!ignore
+  if (ignore) win.setIgnoreMouseEvents(true, { forward: true })
+  else win.setIgnoreMouseEvents(false)
+}
+
+// Collapsed = click-through window with the orb still in place (no resize flash).
 ipcMain.on('collapse', (event, isCollapsed) => {
-  if (isCollapsed) {
-    const bounds = win.getBounds()
-    savedBounds = { width: bounds.width, height: bounds.height }
-    win.setMinimumSize(50, 50)
-    win.setSize(COLLAPSED_SIZE.width, COLLAPSED_SIZE.height)
-    win.setResizable(false)
-  } else {
-    win.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
-    win.setResizable(true)
-    win.setSize(
-      Math.max(savedBounds.width, MIN_WIDTH),
-      Math.max(savedBounds.height, MIN_HEIGHT)
-    )
+  collapsed = !!isCollapsed
+  if (collapsed) setIgnore(true)
+  else setIgnore(false)
+  event.returnValue = true
+})
+
+ipcMain.on('set-ignore-mouse', (event, ignore) => {
+  if (!collapsed) {
+    event.returnValue = true
+    return
   }
+  setIgnore(!!ignore)
+  event.returnValue = true
 })
 
 ipcMain.on('drag-start', (event, { screenX, screenY }) => {
