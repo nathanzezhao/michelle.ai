@@ -182,6 +182,7 @@
   let collapsed = false
   let pointerOnBtn = false
   let ignoreMouse = true
+  let savedheight = 600
   const CENTER = 170
   let skipNextClick = false
   const CONVERSATION_STORAGE_KEY = 'michelle_conversation_id'
@@ -236,18 +237,27 @@
   btn.addEventListener('click', () => {
     if (skipNextClick) { skipNextClick = false; return }
     if (collapsed) return
+    savedheight = body.clientHeight
 
-    // Morph in place while UI fades — window size never changes.
+    // Morph to circle, fade UI, roll panel up — window size stays put.
     btn.classList.add('circle')
-    body.style.transition = 'none'
-    body.style.background = 'transparent'
 
-    anime({ targets: title, opacity: 0, duration: 180, easing: 'linear' })
+    anime({ targets: title, opacity: 0, duration: 200, easing: 'linear' })
     anime({
       targets: [content, inputArea],
       opacity: 0,
-      duration: 180,
+      duration: 200,
       easing: 'linear',
+      complete: () => {
+        content.style.display = 'none'
+        inputArea.style.display = 'none'
+      }
+    })
+    anime({
+      targets: body,
+      height: 56,
+      duration: 500,
+      easing: 'easeInOutSine',
       complete: () => setCollapsedMode(true)
     })
   })
@@ -302,10 +312,20 @@
       if (dx < 5 && dy < 5) {
         skipNextClick = true
         setCollapsedMode(false)
-        anime({ targets: title, opacity: 1, duration: 250, easing: 'linear' })
+        body.style.height = '56px'
         content.style.opacity = '0'
         inputArea.style.opacity = '0'
-        anime({ targets: [content, inputArea], opacity: 1, duration: 250, easing: 'linear' })
+        title.style.opacity = '0'
+
+        anime({
+          targets: body,
+          height: savedheight,
+          duration: 500,
+          easing: 'easeInOutSine',
+          complete: () => { body.style.removeProperty('height') }
+        })
+        anime({ targets: title, opacity: 1, duration: 300, delay: 200, easing: 'linear' })
+        anime({ targets: [content, inputArea], opacity: 1, duration: 300, delay: 200, easing: 'linear' })
       } else if (collapsed) {
         syncCollapsedHitTest()
       }
