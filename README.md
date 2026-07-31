@@ -15,7 +15,7 @@ Video demo 07/17/2026 (memory.py, intent.py, llm.py, michelle.db):
 LLMs:
 
 - Ollama
-  - Local backend AI with no memory, start by running “python3 -m uvicorn main:app —reload” in terminal
+  - Local backend AI with no memory, start by running “b” in terminal
   - Should be default AI in use,  if not find .env file and set LLM_PROVIDER to ollama and run “ollama pull llama3.2” in terminal
   - Refresh backend and electron by pressing control + c.
 - Mock
@@ -52,5 +52,3 @@ UI:
 Click top left square -> Collapse animation -> Square symbol into circle symbol
 
 Click floating circle -> Expand Animation
-
-    
