@@ -162,7 +162,7 @@
 </div>
 
 <div id="content">
-  <div class="bubble">What's up?</div>
+  <div class="bubble" id="greeting-bubble">…</div>
 </div>
 
 <div id="input-area">
@@ -186,7 +186,46 @@
   const CENTER = 170
   let skipNextClick = false
   const CONVERSATION_STORAGE_KEY = 'michelle_conversation_id'
+  const USER_STORAGE_KEY = 'michelle_user_id'
   let conversationId = localStorage.getItem(CONVERSATION_STORAGE_KEY)
+  let userId = localStorage.getItem(USER_STORAGE_KEY)
+  const greetingBubble = document.getElementById('greeting-bubble')
+
+  // Session = Electron UI open. Backend ctrl+c restart is NOT a new session.
+  // Asks for a name only if long-term memory does not already have one.
+  function startSession() {
+    fetch('http://127.0.0.1:8000/session/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversation_id: conversationId,
+        user_id: userId
+      })
+    })
+      .then(response => response.json())
+      .then(data => {
+        if (data.conversation_id) {
+          conversationId = data.conversation_id
+          localStorage.setItem(CONVERSATION_STORAGE_KEY, conversationId)
+        }
+        if (data.user_id) {
+          userId = data.user_id
+          localStorage.setItem(USER_STORAGE_KEY, userId)
+        }
+        const greeting = data.greeting || "What's up?"
+        if (greetingBubble) {
+          revealScramble(greetingBubble, greeting)
+        }
+      })
+      .catch(error => {
+        console.error('Session start failed:', error)
+        if (greetingBubble) {
+          greetingBubble.innerText = "What's up?"
+        }
+      })
+  }
+
+  startSession()
 
   function setBtnHitTest(enabled) {
     // enabled=true means the orb should receive clicks (ignore mouse OFF)
@@ -407,7 +446,8 @@ function handleSend() {
 
       body: JSON.stringify({
         text: userText,
-        conversation_id: conversationId
+        conversation_id: conversationId,
+        user_id: userId
       })
     })
     .then(response => response.json()) 
@@ -415,6 +455,10 @@ function handleSend() {
       if (data.conversation_id) {
         conversationId = data.conversation_id
         localStorage.setItem(CONVERSATION_STORAGE_KEY, conversationId)
+      }
+      if (data.user_id) {
+        userId = data.user_id
+        localStorage.setItem(USER_STORAGE_KEY, userId)
       }
       setTimeout(()=>{
         let botReply = data.answer;

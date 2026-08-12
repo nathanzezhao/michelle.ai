@@ -16,31 +16,42 @@ Reference doc for what's done, what's next, and what's planned later.
 - FastAPI backend + Ollama / Gemini / mock LLM providers
 - **Memory v1:** SQLite (`michelle.db`), conversation IDs, `localStorage` persistence
 - Last 10 messages sent to LLM per turn (`MAX_HISTORY`, tunable via `.env`)
+- **Long-term fact memory:** second assessor + `long_term_facts` table keyed by `user_id`
 - Guardrails: blank messages, 4000-char cap, invalid UUID rejected, failed turns not saved
-- **Intent router v1:** CHAT / RETRIEVE / ACTION (RETRIEVE + ACTION are stub replies for now)
+- **Intent router v1:** CHAT / RETRIEVE / REMEMBER (ACTION parked — next)
+- **RETRIEVE v1:** local `docs/` folder → SQLite FTS5 → grounded answer (`retrieve.py`)
 - Shorter replies via `SYSTEM_PROMPT` in `llm.py`
 
 ### How memory works today
 
 ```
-main.py → memory.py (load last 10 from DB)
-       → intent.py (classify message)
-       → llm.py (generate reply for CHAT)
-       → memory.py (save user + assistant turn)
+main.py → memory.py (regular: last 10 turns + long-term facts for user)
+       → intent.py (route: CHAT / RETRIEVE / REMEMBER)
+       → intent.py (memory assessor: is this worth long-term storage?)
+       → retrieve.py (if RETRIEVE: search docs/ via FTS)
+       → llm.py (CHAT or grounded RETRIEVE reply)
+       → memory.py / long_term_memory.py (save turn + facts)
 ```
 
-- **DB:** stores every message in the thread
-- **LLM:** only sees the last 10 messages each turn
-- **Refresh:** same conversation continues via `localStorage`, but chat bubbles don't reload in the UI
+**Two memory layers:**
+
+| Layer | What | Scope | Limit |
+|-------|------|--------|--------|
+| Regular | Chat turns in `messages` | Per `conversation_id` | Last `MAX_HISTORY` (default 10) sent to LLM |
+| Long-term | Stable facts in `long_term_facts` | Per `user_id` (survives new chats) | Always injected into system prompt |
+
+- **DB:** stores every message in the thread + upserted user facts
+- **LLM:** sees last 10 messages + all long-term facts each turn
+- **Refresh:** same conversation + same user continue via `localStorage`, but chat bubbles don't reload in the UI yet
 
 ---
 
 ## Track 1: Finish memory (do this first)
 
 - [ ] **Reload chat bubbles on open** — fetch history from DB so the UI matches backend after refresh
-- [ ] **Long-term fact memory** — extract stable facts (e.g. user's name) and always inject into prompt so they survive beyond the 10-message window
+- [x] **Long-term fact memory** — second assessor decides importance; durable facts (name, location, etc.) stored per user and injected into the prompt beyond the 10-message window
 - [ ] **Tune / document `MAX_HISTORY`** — decide default and document in README + `.env`
-- [ ] **Update README** — fix outdated "Ollama has no memory" note; point to this roadmap
+- [x] **Update README** — docs/retrieve + reset instructions; Ollama memory note fixed
 
 ---
 
@@ -49,7 +60,8 @@ main.py → memory.py (load last 10 from DB)
 From the original Michelle architecture (intent router → RAG → agents):
 
 - [ ] **Intent polish** — Ollama-based intent classification (not just rules); use confidence for clarifying questions
-- [ ] **RETRIEVE for real** — Query translator + vector search (pgvector / doc ingestion)
+- [x] **RETRIEVE v1** — local `docs/` ingest + SQLite FTS5 + grounded answers (sample KB included)
+- [ ] **RETRIEVE v2** — query translator + vector/embeddings (optional pgvector later); same `retrieve.search()` API
 - [ ] **ACTION for real** — Tool/API calls (tickets, email, etc.) with confirmation before writes
 - [ ] **Evaluator loop** — Don't hallucinate when retrieval fails; structured "not found" behavior
 - [ ] **Diagnostic agent** — Identify knowledge gaps, ask targeted follow-ups
@@ -109,15 +121,16 @@ Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 
 | `INTENT_MODE` | Behavior |
 |---------------|----------|
-| `llm` | Gemini classifies (default); falls back to rules on failure |
-| `rules` | Keyword matching; good for Ollama-only setups |
+| `llm` | Uses `LLM_PROVIDER` model (Ollama or Gemini); falls back to rules on failure |
+| `rules` | Keyword matching only |
 | `mock` | Simplest keywords; terminal testing only |
 
 | Intent | Today |
 |--------|-------|
-| CHAT | Ollama/Gemini reply |
-| RETRIEVE | Stub — search not built |
-| ACTION | Stub — tools not built |
+| CHAT | Ollama/Gemini/mock reply |
+| RETRIEVE | Search `docs/` (FTS5) + grounded answer |
+| REMEMBER | Store or recall long-term facts |
+| ACTION | Parked — next (tools + confirm). Not classified. |
 
 ---
 
@@ -125,10 +138,28 @@ Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 
 | File | Role |
 |------|------|
-| `memory.py` | SQLite read/write |
-| `intent.py` | Intent classification |
-| `llm.py` | Chat replies + `SYSTEM_PROMPT` |
-| `main.py` | `/chat` endpoint, routing |
-| `index.html` | Electron UI |
+| `memory.py` | SQLite regular chat history (last-N window) |
+| `long_term_memory.py` | Durable per-user facts table |
+| `retrieve.py` | Index/search `docs/` via SQLite FTS5 |
+| `docs/` | Sample + user knowledge base (`.md` / `.txt`) |
+| `scripts/reset_michelle.sh` | Wipe local DB so another person starts clean |
+| `intent.py` | Intent router + memory-worthiness assessor (priority gate) |
+| `llm.py` | Chat replies + grounded RETRIEVE answers |
+| `main.py` | `/chat`, `/session/start`, routing, memory write |
+| `index.html` | Electron UI (`conversation_id` + `user_id` in localStorage) |
 | `main.js` | Window collapse/expand, drag |
-| `michelle.db` | Local chat archive (gitignored) |
+| `michelle.db` | Local chat archive + facts + doc index (gitignored) |
+
+## Quick reference: memory assessor
+
+Uses the same `INTENT_MODE` as the intent router (`llm` / `rules` / `mock`).
+
+LLM returns `priority` (`high` / `medium` / `low`) + `confidence`.
+Only writes when `important`, `priority` meets `MEMORY_MIN_PRIORITY` (default `high`),
+and `confidence >= MEMORY_SAVE_THRESHOLD` (default `0.85`).
+
+On Electron launch (`POST /session/start`): if no `name` fact yet, Michelle asks once;
+after they answer it stays in long-term memory forever. Backend restart is not a new session.
+
+Examples that should save: "My name is Nathan", "I live in Seattle".
+Examples that should not: "hey", "what's the weather", temporary mood, medium/low prefs.

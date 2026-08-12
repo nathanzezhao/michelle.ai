@@ -15,40 +15,83 @@ Video demo 07/17/2026 (memory.py, intent.py, llm.py, michelle.db):
 LLMs:
 
 - Ollama
-  - Local backend AI with no memory, start by running “b” in terminal
-  - Should be default AI in use,  if not find .env file and set LLM_PROVIDER to ollama and run “ollama pull llama3.2” in terminal
-  - Refresh backend and electron by pressing control + c.
+  - Local backend AI **with** short-term chat memory + long-term facts + doc retrieve
+  - Start backend by running `b` in terminal
+  - Should be default AI in use; if not, set `LLM_PROVIDER=ollama` in `.env` and run `ollama pull llama3.2`
+  - Refresh backend and Electron by pressing control + c, then restart
 - Mock
-  - Very basic local mock AI for simple responses.
-  - Set LLM_PROVIDER=mock to use
-  - Refresh backend and electron by pressing control + c.
+  - Very basic local mock AI for simple responses (also answers RETRIEVE from doc snippets)
+  - Set `LLM_PROVIDER=mock` to use
 - Gemini
-  - Paid with tokens.
-  - set .env file LLM_PROVIDER=gemini
-  - Refresh backend and electron by pressing control + c.
+  - Paid with tokens
+  - Set `LLM_PROVIDER=gemini` in `.env`
 
-DB:
+## Memory
 
-main.py  →  memory.py (get last 10 from DB)
-→  llm.py (send those + new message to Gemini/Ollama/mock)
-→  memory.py (save the new turn)
+- **Regular:** last `MAX_HISTORY` messages (default 10) from SQLite per conversation
+- **Long-term:** durable facts (e.g. name) per `user_id`, injected every turn
+- Flow: `main.py` → `memory.py` / `long_term_memory.py` → `intent.py` → `llm.py` / `retrieve.py`
 
-Intents:
+## Intents
 
-- Chat -> Small talk, greetings, casual conversation → Ollama generates reply
-- Action -> User wants Michelle to do something → stub reply (not built yet)
-- Retrieve -> User wants info from docs/data → stub reply (not built yet)
+- **CHAT** → normal reply from Ollama/Gemini/mock
+- **RETRIEVE** → search files in `docs/` (SQLite FTS), then answer from snippets
+- **REMEMBER** → keep something / recall something already saved
+- **ACTION** → not live yet (next). Tool requests currently fall through as CHAT.
 
-.env setup for intent:
+With `INTENT_MODE=llm`, REMEMBER is meaning-based (“keep in mind”, “don’t forget”, “note that…”, etc.), not only the words “remember this”.
 
-INTENT_MODE=llm      ← default, uses Gemini
-INTENT_MODE=rules    ← keyword matching, no API
+If she’s unsure something should be saved forever, she’ll ask **yes/no** next; yes → long-term memory.
+
+Examples: `keep in mind that I'm 22` · `remember I prefer short replies`
+
+### Intent modes (`.env`)
+
+```
+INTENT_MODE=llm      ← default; uses the SAME model as LLM_PROVIDER (Ollama or Gemini)
+INTENT_MODE=rules    ← keyword matching only (no model call)
 INTENT_MODE=mock     ← simplest keywords, for terminal testing
+```
 
-If you choose to use ollama as the llm, the intent router is a set of hardcoded parameters through if statements that are tested against what you type when chatting.
+So with `LLM_PROVIDER=ollama` + `INTENT_MODE=llm`, Ollama does chat **and** intent/remember detection first (rules only if Ollama fails).
 
-UI:
+## Docs / RETRIEVE (how to “link” your own files)
 
-Click top left square -> Collapse animation -> Square symbol into circle symbol
+1. Put `.md` or `.txt` files in the [`docs/`](docs/) folder (samples are already there).
+2. Restart the backend (`b`) so Michelle re-indexes.
+3. Ask things like “What’s the refund policy?” or “How much vacation do we get?”
 
-Click floating circle -> Expand Animation
+No Postgres. Search is local SQLite full-text over that folder. Later you can swap in embeddings/pgvector behind the same retrieve API.
+
+Try these demo questions against the sample KB:
+
+- What’s the refund policy?
+- How many remote days per week?
+- What’s the learning budget?
+
+## Reset (so someone else doesn’t get your chats/name)
+
+Personal data lives in `michelle.db` (gitignored) and Electron `localStorage`. Sample files in `docs/` stay.
+
+```bash
+# stop backend first (Ctrl+C), then:
+./scripts/reset_michelle.sh
+```
+
+Then clear localStorage in Electron DevTools:
+
+```js
+localStorage.removeItem('michelle_user_id')
+localStorage.removeItem('michelle_conversation_id')
+location.reload()
+```
+
+A fresh git clone has no `michelle.db`, so it’s already clean.
+
+## UI
+
+- Run `f` in terminal to start Electron.
+
+Click top left square → Collapse animation → Square into circle  
+
+Click floating circle → Expand animation
