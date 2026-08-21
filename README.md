@@ -37,7 +37,11 @@ LLMs:
 - **CHAT** → normal reply from Ollama/Gemini/mock
 - **RETRIEVE** → search files in `docs/` (SQLite FTS), then answer from snippets
 - **REMEMBER** → keep something / recall something already saved
-- **ACTION** → do a task: `open_app` (opens a Mac app immediately) or `send_email` (Confirm/Cancel buttons, sent via Composio). Everything else is refused. Every attempt is audited in the `actions_log` table.
+- **ACTION** → do a task. v1 whitelist:
+  - `open_app` — runs now (`open -a` on macOS)
+  - `send_email` — glass composer (to / subject / body, urgent, attach, generate body) then **Confirm / Cancel**. Sent via Composio Gmail. Everything else is refused. Every attempt is audited in `actions_log`.
+
+Say *send an email* (even without the details). Michelle asks for what’s missing and the composer drops under her message. Fill it, press **Send** with the chat box empty (or Enter in the body), then Confirm. Files and generate sit in the same bottom bar as Send.
 
 With `INTENT_MODE=llm`, REMEMBER is meaning-based (“keep in mind”, “don’t forget”, “note that…”, etc.), not only the words “remember this”.
 
@@ -56,9 +60,11 @@ To enable real sends (Gmail), Michelle needs **Composio Platform**, not Composio
 3. Paste the project key into `.env` as `COMPOSIO_API_KEY=...` (leave `COMPOSIO_USER_ID=default` unless Composio gave you a different user id).
 4. Restart the backend (`b`). Electron (`f`) can stay open.
 
-Then: *send an email to you@example.com subject hi body hello* → Confirm → it actually sends. Don't paste the key into chat.
+Then: *send an email* → composer → Confirm → it actually sends as the connected Gmail inbox. Don't paste the key into chat.
 
-First-time CLI alternative: `composio login` then `composio dev init` in this repo. That writes a project key to `.env.local`; copy `COMPOSIO_API_KEY` into `.env` (this app loads `.env`, not `.env.local`).
+This app loads `.env`, not `.env.local`. For You consumer keys (`ck_...`) are ignored.
+
+First-time CLI alternative: `composio login` then `composio dev init` in this repo. That writes a project key to `.env.local`; copy `COMPOSIO_API_KEY` into `.env`.
 
 ### Intent modes (`.env`)
 
@@ -105,8 +111,10 @@ A fresh git clone has no `michelle.db`, so it’s already clean.
 
 ## UI
 
-- Run `f` in terminal to start Electron.
+- Run `f` in terminal to start Electron. Restart `f` after `index.html` changes (the backend `b` hot-reloads; Electron does not).
 
 Click top left square → Collapse animation → Square into circle  
 
 Click floating circle → Expand animation
+
+Email composer: to / subject / body in the chat card; **files** and **generate** stay pinned above Send (same bottom bar, same size). Chat history in that pane scrolls. Confirm / Cancel still appear once the draft is complete.

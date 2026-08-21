@@ -2,13 +2,15 @@
 
 Reference doc for what's done, what's next, and what's planned later.
 
-**Build order:** Finish memory → finish post-memory plan → screen capture / vision (see PDF reference below).
+**Build order:** Memory + ACTION v1 are in. Next is leftover memory/UI polish and RETRIEVE v2, then screen capture / vision.
 
 **Screen capture source doc:** `/Users/nathan/Downloads/desktop_ai_agent_roadmap_screencapture.pdf`
 
+**Slice 1 spec:** [SPEC-PIPELINE.md](SPEC-PIPELINE.md) (ACTION engine). Do not put specs in `docs/` — that folder is Michelle's RAG KB.
+
 ---
 
-## Current status (July 2026)
+## Current status (August 2026)
 
 ### Shipped
 
@@ -18,19 +20,25 @@ Reference doc for what's done, what's next, and what's planned later.
 - Last 10 messages sent to LLM per turn (`MAX_HISTORY`, tunable via `.env`)
 - **Long-term fact memory:** second assessor + `long_term_facts` table keyed by `user_id`
 - Guardrails: blank messages, 4000-char cap, invalid UUID rejected, failed turns not saved
-- **Intent router v1:** CHAT / RETRIEVE / REMEMBER (ACTION parked — next)
+- **Intent router:** CHAT / RETRIEVE / REMEMBER / **ACTION** (live). `INTENT_MODE=llm` uses the same model as `LLM_PROVIDER`
 - **RETRIEVE v1:** local `docs/` folder → SQLite FTS5 → grounded answer (`retrieve.py`)
+- **ACTION v1:** whitelist only — `open_app` (native `open -a`) and `send_email` (Composio Gmail)
+- **Email composer** in the window: to / subject / body, urgent, attach, generate body; files + generate pinned above Send; Confirm / Cancel before send
+- **Composio Platform** Gmail: real sends as the connected inbox (`COMPOSIO_API_KEY` project key `ak_…`, user `default`). For You `ck_…` keys are rejected
+- `actions_log` audit + no replay after backend restart
+- R0/R1 pytest suites (`tests/`)
 - Shorter replies via `SYSTEM_PROMPT` in `llm.py`
 
-### How memory works today
+### How a turn works today
 
 ```
-main.py → memory.py (regular: last 10 turns + long-term facts for user)
-       → intent.py (route: CHAT / RETRIEVE / REMEMBER)
-       → intent.py (memory assessor: is this worth long-term storage?)
-       → retrieve.py (if RETRIEVE: search docs/ via FTS)
-       → llm.py (CHAT or grounded RETRIEVE reply)
-       → memory.py / long_term_memory.py (save turn + facts)
+main.py → memory.py (last N turns + long-term facts)
+       → intent.py (CHAT | RETRIEVE | REMEMBER | ACTION)
+       → ACTION: analyze params → actions_log → native or Composio
+       → REMEMBER: existing store/recall
+       → RETRIEVE: docs/ FTS
+       → CHAT: reply + synchronous memory assessor
+       → save turn / facts / action row
 ```
 
 **Two memory layers:**
@@ -40,29 +48,31 @@ main.py → memory.py (regular: last 10 turns + long-term facts for user)
 | Regular | Chat turns in `messages` | Per `conversation_id` | Last `MAX_HISTORY` (default 10) sent to LLM |
 | Long-term | Stable facts in `long_term_facts` | Per `user_id` (survives new chats) | Always injected into system prompt |
 
-- **DB:** stores every message in the thread + upserted user facts
+- **DB:** stores every message in the thread + upserted user facts + `actions_log`
 - **LLM:** sees last 10 messages + all long-term facts each turn
 - **Refresh:** same conversation + same user continue via `localStorage`, but chat bubbles don't reload in the UI yet
 
 ---
 
-## Track 1: Finish memory (do this first)
+## Track 1: Finish memory
 
 - [ ] **Reload chat bubbles on open** — fetch history from DB so the UI matches backend after refresh
 - [x] **Long-term fact memory** — second assessor decides importance; durable facts (name, location, etc.) stored per user and injected into the prompt beyond the 10-message window
-- [ ] **Tune / document `MAX_HISTORY`** — decide default and document in README + `.env`
-- [x] **Update README** — docs/retrieve + reset instructions; Ollama memory note fixed
+- [x] **Document `MAX_HISTORY`** — default 10; set in `.env`; described in README
+- [x] **Update README** — docs/retrieve, reset, ACTION, Composio, composer UI
 
 ---
 
-## Track 2: Post-memory plan (do before screen capture)
+## Track 2: Post-memory plan (before screen capture)
 
 From the original Michelle architecture (intent router → RAG → agents):
 
-- [ ] **Intent polish** — Ollama-based intent classification (not just rules); use confidence for clarifying questions
+- [x] **Intent includes ACTION** — fourth live label; `INTENT_MODE=llm` uses Ollama/Gemini (rules fallback)
+- [ ] **Intent clarifying questions** — use classifier confidence when she's unsure of the route
 - [x] **RETRIEVE v1** — local `docs/` ingest + SQLite FTS5 + grounded answers (sample KB included)
-- [ ] **RETRIEVE v2** — query translator + vector/embeddings (optional pgvector later); same `retrieve.search()` API
-- [ ] **ACTION for real** — Tool/API calls (tickets, email, etc.) with confirmation before writes
+- [ ] **RETRIEVE v2** — query translator + vector/embeddings (sqlite-vec + nomic-embed-text); same `retrieve.search()` API
+- [x] **ACTION v1** — `open_app` + `send_email` (Composio), Confirm/Cancel, composer UI, `actions_log`
+- [ ] **More actions** — quit apps, calendar, Slack, etc. Still whitelist + risk tiers in code, never LLM-judged
 - [ ] **Evaluator loop** — Don't hallucinate when retrieval fails; structured "not found" behavior
 - [ ] **Diagnostic agent** — Identify knowledge gaps, ask targeted follow-ups
 - [ ] **Escalation agent** — Human handoff when Michelle can't answer
@@ -73,7 +83,7 @@ From the original Michelle architecture (intent router → RAG → agents):
 
 ## Track 3: Screen capture & vision (after Track 1 + 2)
 
-**Do not start until memory and post-memory items above are in good shape.**
+**Do not start until leftover memory UI and RETRIEVE v2 are in good shape.** ACTION v1 / Composio Gmail does not unblock this track.
 
 Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 
@@ -111,9 +121,10 @@ Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 
 ### Phase 5 — Background task execution (The Hands)
 
-- **Tool integration (PDF suggests Composio):** Standardized APIs for Gmail, Slack, Notion, etc.
-- **Flow:** LLM decides action → function call to tool API → runs in background without hijacking mouse/keyboard → reports back to floating agent
-- Ties into Track 2 ACTION agent work
+- **Tool integration:** Composio. Gmail send is live in ACTION v1 (`actions.py` + Platform project key).
+- **Still later:** more apps (Slack, Notion, calendar), same confirm-before-write pattern
+- **Flow:** LLM decides action → whitelist + executor → Confirm if high-risk → reports back in the floating window
+- Does **not** hijack mouse/keyboard
 
 ---
 
@@ -130,7 +141,7 @@ Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 | CHAT | Ollama/Gemini/mock reply |
 | RETRIEVE | Search `docs/` (FTS5) + grounded answer |
 | REMEMBER | Store or recall long-term facts |
-| ACTION | Parked — next (tools + confirm). Not classified. |
+| ACTION | `open_app` now; `send_email` composer + Confirm → Composio Gmail |
 
 ---
 
@@ -143,12 +154,15 @@ Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 | `retrieve.py` | Index/search `docs/` via SQLite FTS5 |
 | `docs/` | Sample + user knowledge base (`.md` / `.txt`) |
 | `scripts/reset_michelle.sh` | Wipe local DB so another person starts clean |
-| `intent.py` | Intent router + memory-worthiness assessor (priority gate) |
+| `intent.py` | Intent router + memory assessor + action analyzer |
+| `actions.py` | ACTION whitelist, `actions_log`, native + Composio executors |
 | `llm.py` | Chat replies + grounded RETRIEVE answers |
-| `main.py` | `/chat`, `/session/start`, routing, memory write |
-| `index.html` | Electron UI (`conversation_id` + `user_id` in localStorage) |
+| `main.py` | `/chat`, `/session/start`, `/action/confirm`, `/action/draft_body` |
+| `index.html` | Electron UI (chat, composer, Confirm/Cancel) |
 | `main.js` | Window collapse/expand, drag |
-| `michelle.db` | Local chat archive + facts + doc index (gitignored) |
+| `tests/` | R0/R1 pytest (httpx); `COMPOSIO_API_KEY` unset in suite |
+| `SPEC-PIPELINE.md` | Slice 1 ACTION spec (not a RAG doc) |
+| `michelle.db` | Local chat archive + facts + doc index + actions (gitignored) |
 
 ## Quick reference: memory assessor
 
