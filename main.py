@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, List
 from uuid import UUID, uuid4
 
 from dotenv import load_dotenv
@@ -16,6 +16,7 @@ from intent import (
     classify_intent,
     classify_memory_confirmation,
     maybe_promote_to_remember,
+    parse_mixed_utterance,
     usable_memory_facts,
 )
 from llm import ask_llm, ask_llm_with_context, history_for_reply
@@ -50,6 +51,14 @@ app.add_middleware(
 
 class UserMessage(BaseModel):
     text: str
+    conversation_id: Optional[str] = None
+    user_id: Optional[str] = None
+    attachments: Optional[List[str]] = None
+
+
+class DraftBodyRequest(BaseModel):
+    recipient: str = ""
+    subject: str = ""
     conversation_id: Optional[str] = None
     user_id: Optional[str] = None
 
@@ -127,6 +136,7 @@ def _task_fields(action: dict) -> dict:
         "risk": action["risk"],
         "confirm_required": action["status"] == "PENDING",
         "missing_params": action["missing_params"],
+        "resolved_params": action.get("resolved_params") or {},
     }
 
 
@@ -155,6 +165,12 @@ def _exec_reply(action_type: str, params: dict, status: str, exec_result: dict) 
             return f"Opened {params.get('app_name')}."
         return f"Sent the email to {params.get('recipient')}."
     if exec_result.get("error") == "composio_not_connected":
+        link = exec_result.get("connect_link")
+        if link:
+            return (
+                "I can't send email until Gmail is connected. "
+                f"Open this link to connect it: {link}"
+            )
         return COMPOSIO_NOT_CONNECTED_REPLY
     if action_type == "open_app":
         return (
@@ -164,7 +180,138 @@ def _exec_reply(action_type: str, params: dict, status: str, exec_result: dict) 
     return f"That didn't work — {exec_result.get('detail') or 'the action failed'}."
 
 
+def _existing_files(paths) -> list[str]:
+    files = []
+    for path in paths or []:
+        if isinstance(path, str) and os.path.isfile(path):
+            files.append(path)
+    return files
+
+
+def _merge_attachments(action: dict | None, paths) -> dict | None:
+    if action is None:
+        return None
+    files = _existing_files(paths)
+    if not files:
+        return action
+    resolved = dict(action.get("resolved_params") or {})
+    resolved["attachments"] = files
+    return actions.update_action(action["action_id"], resolved_params=resolved)
+
+
 def _settle_action(action: dict, note: str) -> tuple[dict, str]:
+    """Move a non-terminal row to the state its params dictate (§4) and build
+    the reply. Low-risk + complete executes NOW, same request."""
+    action_type = action["action_type"]
+    risk = action["risk"]
+    resolved = action["resolved_params"]
+    missing = action["missing_params"]
+    if missing:
+        action = actions.update_action(action["action_id"], status="AWAITING_INPUT")
+        answer = note + _missing_ask(action_type, missing)
+    elif risk == "high":
+        action = actions.update_action(action["action_id"], status="PENDING")
+        answer = note + _pending_summary(resolved)
+    else:
+        status, exec_result = actions.confirm_and_execute(action["action_id"])
+        action = actions.get_action(action["action_id"])
+        answer = note + _exec_reply(action_type, resolved, status, exec_result)
+    return action, answer
+
+
+def _queue_item(analysis: dict) -> dict:
+    return {
+        "action_type": analysis["action_type"],
+        "resolved_params": analysis["resolved_params"],
+        "missing_params": analysis["missing_params"],
+    }
+
+
+def _run_one_action(user_id, conversation_id, analysis, note="", queue=None):
+    action = actions.create_action(
+        user_id,
+        conversation_id,
+        analysis["action_type"],
+        analysis["resolved_params"],
+        analysis["missing_params"],
+        "AWAITING_INPUT",
+        queue=queue,
+    )
+    return _settle_action(action, note)
+
+
+def _handle_action_intents(
+    user_text: str,
+    reply_history: list,
+    history: list,
+    long_term_facts: list,
+    user_id: str,
+    conversation_id: str,
+    open_action: dict | None,
+) -> tuple[dict, str]:
+    """Run every action clause in the message. Chat filler gets a reply too.
+
+    Low-risk complete actions execute now. High-risk / incomplete ones go
+    PENDING or AWAITING_INPUT; extras of those are queued and started after
+    Confirm on the current one.
+    """
+    parsed = parse_mixed_utterance(user_text)
+    clauses = parsed["actions"] or [user_text]
+    analyses = []
+    for clause in clauses:
+        analysis = analyze_action_request(clause, reply_history)
+        print(
+            f"action_clause={clause!r} type={analysis['action_type']} "
+            f"resolved={analysis['resolved_params']} "
+            f"missing={analysis['missing_params']}"
+        )
+        if analysis["action_type"] in actions.ACTION_WHITELIST:
+            analyses.append(analysis)
+
+    drop_note = ""
+    if open_action:
+        actions.cancel_action(open_action["action_id"])
+        drop_note = f"Dropped the {_action_desc(open_action['action_type'])} — "
+
+    if not analyses:
+        return None, drop_note
+
+    answer_parts: list[str] = []
+    if drop_note:
+        answer_parts.append(drop_note.rstrip(" —"))
+    chat = parsed.get("chat") or ""
+    if chat:
+        try:
+            answer_parts.append(ask_llm(chat, history, long_term_facts))
+        except Exception as e:
+            print(f"mixed-chat reply failed ({e})")
+
+    immediate = []
+    deferred = []
+    for analysis in analyses:
+        risk = actions.ACTION_WHITELIST[analysis["action_type"]]["risk"]
+        if analysis["missing_params"] or risk == "high":
+            deferred.append(analysis)
+        else:
+            immediate.append(analysis)
+
+    last_action = None
+    for analysis in immediate:
+        last_action, piece = _run_one_action(
+            user_id, conversation_id, analysis, note=""
+        )
+        answer_parts.append(piece)
+
+    if deferred:
+        first, rest = deferred[0], deferred[1:]
+        queue = [_queue_item(item) for item in rest] or None
+        last_action, piece = _run_one_action(
+            user_id, conversation_id, first, note="", queue=queue
+        )
+        answer_parts.append(piece)
+
+    answer = "\n\n".join(p for p in answer_parts if p)
+    return last_action, answer
     """Move a non-terminal row to the state its params dictate (§4) and build
     the reply. Low-risk + complete executes NOW, same request."""
     action_type = action["action_type"]
@@ -190,7 +337,9 @@ def _action_turn_payload(
     user_id: str,
     action: dict,
     intent_result: dict,
+    attachments=None,
 ) -> dict:
+    action = _merge_attachments(action, attachments) or action
     return {
         "answer": answer,
         "conversation_id": conversation_id,
@@ -413,31 +562,16 @@ def handle_chat(incoming_data: UserMessage):
         # analyze_remember_request on REMEMBER turns.
         action_note = ""
         if intent == "ACTION":
-            analysis = analyze_action_request(user_text, reply_history)
-            print(
-                f"[{provider}] [{conversation_id[:8]}] "
-                f"action_type={analysis['action_type']} "
-                f"resolved={analysis['resolved_params']} "
-                f"missing={analysis['missing_params']}"
+            action, answer = _handle_action_intents(
+                user_text,
+                reply_history,
+                history,
+                long_term_facts,
+                user_id,
+                conversation_id,
+                open_action,
             )
-            if analysis["action_type"] in actions.ACTION_WHITELIST:
-                note = ""
-                if open_action:
-                    # One pending action at a time: new order replaces old,
-                    # and the reply states the swap in passing (§10-A).
-                    actions.cancel_action(open_action["action_id"])
-                    note = (
-                        f"Dropped the {_action_desc(open_action['action_type'])} — "
-                    )
-                action = actions.create_action(
-                    user_id,
-                    conversation_id,
-                    analysis["action_type"],
-                    analysis["resolved_params"],
-                    analysis["missing_params"],
-                    "AWAITING_INPUT",
-                )
-                action, answer = _settle_action(action, note)
+            if action is not None:
                 save_message(conversation_id, "user", user_text, kind="action")
                 save_message(conversation_id, "assistant", answer, kind="action")
                 print(
@@ -445,15 +579,14 @@ def handle_chat(incoming_data: UserMessage):
                     f"action {action['action_id'][:8]} → {action['status']}"
                 )
                 return _action_turn_payload(
-                    answer, conversation_id, user_id, action, intent_result
+                    answer, conversation_id, user_id, action, intent_result,
+                    attachments=incoming_data.attachments,
                 )
             # Non-whitelisted order: no actions_log row, no execution path,
             # engine reports "chat" (§3.2, §8).
-            if open_action:
-                actions.cancel_action(open_action["action_id"])
-                action_note = (
-                    f"\n\n(dropped the {_action_desc(open_action['action_type'])})"
-                )
+            action_note = ""
+            if answer:
+                action_note = f"\n\n({answer.rstrip('.')})"
             answer = UNSUPPORTED_ACTION_REPLY + action_note
             save_message(conversation_id, "user", user_text)
             save_message(conversation_id, "assistant", answer)
@@ -496,7 +629,8 @@ def handle_chat(incoming_data: UserMessage):
                         f"{action['status']}"
                     )
                     return _action_turn_payload(
-                        answer, conversation_id, user_id, action, intent_result
+                        answer, conversation_id, user_id, action, intent_result,
+                        attachments=incoming_data.attachments,
                     )
             # Unrelated turn: Michelle's open question dies quietly — cancel
             # the action, carry a one-line drop note, handle the new message
@@ -703,6 +837,30 @@ def handle_chat(incoming_data: UserMessage):
         }
 
 
+@app.post("/action/draft_body")
+def draft_body(incoming_data: DraftBodyRequest):
+    """Fill the composer body without touching actions_log or /chat."""
+    user_id = _valid_uuid(incoming_data.user_id)
+    recipient = (incoming_data.recipient or "").strip()
+    subject = (incoming_data.subject or "").strip()
+    prompt = (
+        "Write only the body of a short email. No subject line, no markdown, "
+        "no 'Subject:' prefix. 2 to 6 sentences.\n"
+        f"To: {recipient or '(not given)'}\n"
+        f"Subject: {subject or '(not given)'}"
+    )
+    try:
+        body = ask_llm(
+            prompt,
+            history=[],
+            long_term_facts=long_term_memory.get_facts(user_id),
+        )
+    except Exception as e:
+        print(f"draft_body failed ({e})")
+        return {"body": ""}
+    return {"body": (body or "").strip()}
+
+
 @app.post("/action/confirm")
 def confirm_action(incoming_data: ActionDecision):
     """Confirm/Cancel button press for a PENDING action (SPEC-PIPELINE §9.2).
@@ -727,12 +885,13 @@ def confirm_action(incoming_data: ActionDecision):
             "user_id": user_id,
             "intent": "ACTION",
             "engine": "action",
-            "task_id": incoming_data.task_id,
+            "task_id": action["action_id"] if action else incoming_data.task_id,
             "task_status": action["status"] if action else "UNKNOWN",
             "action_type": action["action_type"] if action else None,
             "risk": action["risk"] if action else None,
-            "confirm_required": False,
-            "missing_params": [],
+            "confirm_required": bool(action and action["status"] == "PENDING"),
+            "missing_params": (action.get("missing_params") or []) if action else [],
+            "resolved_params": (action.get("resolved_params") or {}) if action else {},
         }
         return payload
 
@@ -758,11 +917,29 @@ def confirm_action(incoming_data: ActionDecision):
         action = actions.cancel_action(action["action_id"])
         answer = "Cancelled — I won't send it."
     else:
+        queued = list(action.get("queue") or [])
         status, exec_result = actions.confirm_and_execute(action["action_id"])
-        action = actions.get_action(action["action_id"])
+        done = actions.get_action(action["action_id"])
         answer = _exec_reply(
-            action["action_type"], action["resolved_params"], status, exec_result
+            done["action_type"], done["resolved_params"], status, exec_result
         )
+        if status == "SUCCESS" and queued:
+            nxt = queued[0]
+            rest = queued[1:]
+            action, more = _run_one_action(
+                done["user_id"],
+                done["conversation_id"],
+                {
+                    "action_type": nxt["action_type"],
+                    "resolved_params": nxt.get("resolved_params") or {},
+                    "missing_params": nxt.get("missing_params") or [],
+                },
+                note="",
+                queue=rest or None,
+            )
+            answer = f"{answer}\n\n{more}"
+        else:
+            action = done
 
     save_message(conversation_id, "assistant", answer, kind="action")
     print(

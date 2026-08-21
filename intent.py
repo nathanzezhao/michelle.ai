@@ -351,9 +351,20 @@ def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
     rules = rules or {}
     raw_type = str(out.get("action_type") or "").strip().lower()
     rules_type = str(rules.get("action_type") or "").strip().lower()
-    if raw_type not in ACTION_WHITELIST and rules_type in ACTION_WHITELIST:
+    if rules_type in ACTION_WHITELIST and (
+        raw_type not in ACTION_WHITELIST or rules_type != raw_type
+    ):
+        # llama often labels "send an email …" as open_app. If rules matched a
+        # real verb, that type wins.
         out["action_type"] = rules_type
         raw_type = rules_type
+        allowed = set(ACTION_WHITELIST[rules_type]["required_params"])
+        resolved = {
+            k: v
+            for k, v in (out.get("resolved_params") or {}).items()
+            if k in allowed
+        }
+        out["resolved_params"] = resolved
 
     resolved = dict(out.get("resolved_params") or {})
     if not str(resolved.get("app_name") or "").strip():
@@ -923,8 +934,48 @@ _ACTION_EMAIL_RE = re.compile(
 
 
 def _looks_like_action_order(text: str) -> bool:
-    stripped = (text or "").strip()
+    return bool(parse_mixed_utterance(text)["actions"])
+
+
+def _clause_is_action(clause: str) -> bool:
+    stripped = (clause or "").strip()
     return bool(_ACTION_OPEN_RE.match(stripped) or _ACTION_EMAIL_RE.match(stripped))
+
+
+_ACTION_START_RE = re.compile(
+    rf"(?:{_LEADING_FILLER})(?:{_OPEN_VERBS}(?:\s+up)?\s+\S|"
+    r"(?:send\s+(?:an?\s+)?e-?mail\b|e-?mail\s+\S))",
+    re.IGNORECASE,
+)
+_TRAILING_CONNECTOR_RE = re.compile(
+    r"[\s,;]*(?:\b(?:and then|and|also|then|plus|btw)\b[\s,;]*)+$",
+    re.IGNORECASE,
+)
+
+
+def parse_mixed_utterance(text: str) -> dict:
+    """Split chat filler from one or more action clauses.
+
+    Commas are NOT a blanket split (email params use them). An action starts
+    wherever an open/email verb appears, so 'hey, open Notes' still routes.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return {"chat": "", "actions": []}
+    starts = [m.start() for m in _ACTION_START_RE.finditer(stripped)]
+    if not starts:
+        return {"chat": stripped if not _clause_is_action(stripped) else "",
+                "actions": [stripped] if _clause_is_action(stripped) else []}
+    chat = stripped[: starts[0]].strip()
+    chat = _TRAILING_CONNECTOR_RE.sub("", chat).strip(" \t,;.")
+    actions: list[str] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(stripped)
+        chunk = stripped[start:end]
+        chunk = _TRAILING_CONNECTOR_RE.sub("", chunk).strip(" \t,;.")
+        if chunk:
+            actions.append(chunk)
+    return {"chat": chat, "actions": actions}
 
 
 def _classify_with_rules(text: str) -> dict:

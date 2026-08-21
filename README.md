@@ -47,7 +47,18 @@ Examples: `keep in mind that I'm 22` · `remember I prefer short replies`
 
 ### `COMPOSIO_API_KEY` (`.env`, optional)
 
-Auth for the Composio email executor. Without it the backend still boots and the whole email flow works up to Confirm, which then replies that email isn't connected yet (no crash, no pretend success). Set the key to enable real sends (Gmail via Composio).
+Auth for the Composio email executor. Without it the backend still boots and the whole email flow works up to Confirm, which then replies that email isn't connected yet (no crash, no pretend success).
+
+To enable real sends (Gmail), Michelle needs **Composio Platform**, not Composio For You:
+
+1. Open [dashboard.composio.dev](https://dashboard.composio.dev) → **Platform** → your project → Getting Started / Settings → API keys. Copy a **project** API key (`ak_...`). A For You consumer key (`ck_...`) from Sessions & API Key will 401 and is not interchangeable.
+2. In that **same** Platform project, connect Gmail (one OAuth). Michelle sends as that inbox.
+3. Paste the project key into `.env` as `COMPOSIO_API_KEY=...` (leave `COMPOSIO_USER_ID=default` unless Composio gave you a different user id).
+4. Restart the backend (`b`). Electron (`f`) can stay open.
+
+Then: *send an email to you@example.com subject hi body hello* → Confirm → it actually sends. Don't paste the key into chat.
+
+First-time CLI alternative: `composio login` then `composio dev init` in this repo. That writes a project key to `.env.local`; copy `COMPOSIO_API_KEY` into `.env` (this app loads `.env`, not `.env.local`).
 
 ### Intent modes (`.env`)
 

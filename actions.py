@@ -7,6 +7,7 @@ any time — create_action() enforces it by cancelling leftovers.
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -83,10 +84,17 @@ def _row_to_action(row: sqlite3.Row) -> dict:
         "resolved_params": payload.get("resolved_params") or {},
         "missing_params": payload.get("missing_params") or [],
         "error": payload.get("error"),
+        "queue": payload.get("queue") or [],
     }
 
 
-def _payload_json(action_type: str, resolved: dict, missing: list, error=None) -> str:
+def _payload_json(
+    action_type: str,
+    resolved: dict,
+    missing: list,
+    error=None,
+    queue=None,
+) -> str:
     payload = {
         "resolved_params": resolved or {},
         "missing_params": missing or [],
@@ -94,6 +102,8 @@ def _payload_json(action_type: str, resolved: dict, missing: list, error=None) -
     }
     if error:
         payload["error"] = error
+    if queue:
+        payload["queue"] = queue
     return json.dumps(payload)
 
 
@@ -129,6 +139,7 @@ def create_action(
     resolved_params: dict,
     missing_params: list,
     status: str,
+    queue: list | None = None,
 ) -> dict:
     """Insert a new action row, cancelling any leftover non-terminal row so the
     one-open-action invariant (§4) holds even if a caller forgot to."""
@@ -158,7 +169,9 @@ def create_action(
                 user_id,
                 conversation_id,
                 action_type,
-                _payload_json(action_type, resolved_params, missing_params),
+                _payload_json(
+                    action_type, resolved_params, missing_params, queue=queue
+                ),
                 status,
             ),
         )
@@ -172,6 +185,7 @@ def update_action(
     resolved_params: dict | None = None,
     missing_params: list | None = None,
     error: str | None = None,
+    queue: list | None = None,
 ) -> dict | None:
     """Update a NON-terminal row. Terminal states are never mutated (§4)."""
     action = get_action(action_id)
@@ -180,6 +194,7 @@ def update_action(
     new_status = status or action["status"]
     resolved = resolved_params if resolved_params is not None else action["resolved_params"]
     missing = missing_params if missing_params is not None else action["missing_params"]
+    kept_queue = queue if queue is not None else action.get("queue")
     with _connect() as conn:
         conn.execute(
             """
@@ -189,7 +204,13 @@ def update_action(
             """,
             (
                 new_status,
-                _payload_json(action["action_type"], resolved, missing, error),
+                _payload_json(
+                    action["action_type"],
+                    resolved,
+                    missing,
+                    error,
+                    queue=kept_queue,
+                ),
                 action_id,
             ),
         )
@@ -269,22 +290,74 @@ class NativeExecutor:
         }
 
 
+def platform_api_key() -> str | None:
+    """Platform project key only. A For You consumer key (`ck_...`) is the
+    wrong product and would 401 against the SDK — treat it as not connected."""
+    api_key = (os.getenv("COMPOSIO_API_KEY") or "").strip()
+    if not api_key or api_key.startswith("ck_"):
+        return None
+    return api_key
+
+
+def _gmail_connect_link(client, user_id: str) -> str | None:
+    """Hosted Connect Link for Gmail. Uses session.authorize (current API)."""
+    try:
+        session = client.create(user_id=user_id, toolkits=["gmail"])
+        req = session.authorize("gmail")
+        return getattr(req, "redirect_url", None)
+    except Exception:
+        return None
+
+
+def _not_connected_result(client, user_id: str, detail: str) -> dict:
+    result = {
+        "ok": False,
+        "detail": detail,
+        "error": "composio_not_connected",
+    }
+    link = _gmail_connect_link(client, user_id)
+    if link:
+        result["connect_link"] = link
+    return result
+
+
+def _stage_attachments(paths) -> list[str]:
+    """Copy user-picked files into Composio's default upload allowlist."""
+    staged = []
+    dest_dir = Path.home() / ".composio" / "temp" / "michelle"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for path in paths or []:
+        if not isinstance(path, str) or not os.path.isfile(path):
+            continue
+        name = Path(path).name or "attachment"
+        dest = dest_dir / name
+        if dest.exists():
+            dest = dest_dir / f"{uuid4().hex[:8]}-{name}"
+        shutil.copy2(path, dest)
+        staged.append(str(dest))
+    return staged
+
+
 class ComposioExecutor:
     """External actions via Composio (Gmail toolkit first). Lazy client:
-    without COMPOSIO_API_KEY this reports not-connected — it never raises at
-    startup and the backend boots without the key (§5, decision 6)."""
+    without a Platform `COMPOSIO_API_KEY` this reports not-connected — it never
+    raises at startup and the backend boots without the key (§5, decision 6)."""
 
     def __init__(self):
         self._client = None
+        self._api_key = None
 
     def _get_client(self):
-        api_key = os.getenv("COMPOSIO_API_KEY")
+        api_key = platform_api_key()
         if not api_key:
             return None
-        if self._client is None:
+        if self._client is None or self._api_key != api_key:
             from composio import Composio
 
-            self._client = Composio(api_key=api_key)
+            # SDK also reads COMPOSIO_API_KEY from the environment; passing it
+            # here lets a key rotation take effect without restarting the process.
+            self._client = Composio()
+            self._api_key = api_key
         return self._client
 
     def execute(self, action_type: str, params: dict) -> dict:
@@ -295,23 +368,55 @@ class ComposioExecutor:
         except Exception as e:
             return {"ok": False, "detail": f"Composio init failed: {e}", "error": "composio_error"}
         if client is None:
+            raw = (os.getenv("COMPOSIO_API_KEY") or "").strip()
+            detail = (
+                "COMPOSIO_API_KEY is a For You consumer key; Michelle needs a Platform project API key"
+                if raw.startswith("ck_")
+                else "COMPOSIO_API_KEY is not set"
+            )
             return {
                 "ok": False,
-                "detail": "COMPOSIO_API_KEY is not set",
+                "detail": detail,
                 "error": "composio_not_connected",
             }
-        try:
-            response = client.tools.execute(
-                slug="GMAIL_SEND_EMAIL",
-                user_id=os.getenv("COMPOSIO_USER_ID", "default"),
-                arguments={
-                    "recipient_email": params.get("recipient", ""),
-                    "subject": params.get("subject", ""),
-                    "body": params.get("body", ""),
-                },
-                dangerously_skip_version_check=True,
+        arguments = {
+            "recipient_email": params.get("recipient", ""),
+            "subject": params.get("subject", ""),
+            "body": params.get("body", ""),
+            "is_html": False,
+        }
+        attachments = _stage_attachments(params.get("attachments"))
+        if attachments:
+            arguments["attachment"] = (
+                attachments[0] if len(attachments) == 1 else attachments
             )
+            try:
+                from composio import Composio
+
+                client = Composio(dangerously_allow_auto_upload_download_files=True)
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "detail": f"Composio init failed: {e}",
+                    "error": "composio_error",
+                }
+        execute_kwargs = {
+            "slug": "GMAIL_SEND_EMAIL",
+            "user_id": os.getenv("COMPOSIO_USER_ID", "default"),
+            "arguments": arguments,
+            "dangerously_skip_version_check": True,
+        }
+        account_id = (os.getenv("COMPOSIO_CONNECTED_ACCOUNT_ID") or "").strip()
+        if account_id:
+            execute_kwargs["connected_account_id"] = account_id
+        user_id = execute_kwargs["user_id"]
+        try:
+            response = client.tools.execute(**execute_kwargs)
         except Exception as e:
+            detail = str(e)
+            lowered = detail.lower()
+            if "no connected account" in lowered or "not connected" in lowered:
+                return _not_connected_result(client, user_id, detail)
             return {"ok": False, "detail": f"Composio send failed: {e}", "error": "composio_error"}
         if isinstance(response, dict):
             successful = bool(response.get("successful", True))
@@ -321,7 +426,11 @@ class ComposioExecutor:
             error = getattr(response, "error", None)
         if successful:
             return {"ok": True, "detail": "email sent", "error": None}
-        return {"ok": False, "detail": str(error or "Composio send failed"), "error": "composio_error"}
+        detail = str(error or "Composio send failed")
+        lowered = detail.lower()
+        if "not connected" in lowered or "no connected account" in lowered:
+            return _not_connected_result(client, user_id, detail)
+        return {"ok": False, "detail": detail, "error": "composio_error"}
 
 
 _EXECUTORS = {

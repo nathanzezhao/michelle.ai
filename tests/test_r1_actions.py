@@ -57,6 +57,7 @@ TASK_FIELDS = (
     "risk",
     "confirm_required",
     "missing_params",
+    "resolved_params",
 )
 
 EMAIL_FULL = "send an email to alex@example.com subject hi body hello"
@@ -294,6 +295,55 @@ def test_open_app_slang_and_gibberish_names(client, ids, fake_open, text, app_na
     assert fake_open.calls == [["open", "-a", app_name]]
 
 
+def test_chat_then_open_runs_action_and_replies(client, ids, fake_open):
+    body = chat(client, "hey how are you, open Notes", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "open_app"
+    assert body["task_status"] == "SUCCESS"
+    assert "Opened Notes" in body["answer"]
+    assert fake_open.calls == [["open", "-a", "Notes"]]
+
+
+def test_open_then_email_does_both_and_confirms(client, ids, fake_open, fake_composio):
+    body = chat(
+        client,
+        "open Notes then send an email to alex@example.com subject hi body hello",
+        ids,
+    )
+    assert body["engine"] == "action"
+    assert body["action_type"] == "send_email"
+    assert body["task_status"] == "PENDING"
+    assert body["confirm_required"] is True
+    assert "Opened Notes" in body["answer"]
+    assert "alex@example.com" in body["answer"]
+    assert fake_open.calls == [["open", "-a", "Notes"]]
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert out["confirm_required"] is False
+    assert "Sent the email to alex@example.com" in out["answer"]
+
+
+def test_two_emails_queue_second_after_confirm(client, ids, fake_composio):
+    body = chat(
+        client,
+        "send an email to alex@example.com subject one body aaa then "
+        "send an email to sam@example.com subject two body bbb",
+        ids,
+    )
+    assert body["task_status"] == "PENDING"
+    assert body["action_type"] == "send_email"
+    assert "alex@example.com" in body["answer"]
+    rows = action_rows(ids)
+    queued = payload(rows[0]).get("queue") or []
+    assert len(queued) == 1
+    assert queued[0]["resolved_params"]["recipient"] == "sam@example.com"
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["confirm_required"] is True
+    assert out["task_status"] == "PENDING"
+    assert out["task_id"] != body["task_id"]
+    assert "sam@example.com" in out["answer"]
+
+
 def test_open_app_then_bare_name_continues(client, ids, fake_open):
     """If the first turn misses the app, a bare name like 'Notes' must continue
     the paused action — not get dropped as a topic change (live log bug)."""
@@ -430,6 +480,64 @@ def test_email_missing_params_awaiting_then_pending_same_task(client, ids):
     rows = action_rows(ids)
     assert len(rows) == 1  # continued, not replaced
     assert rows[0]["status"] == "PENDING"
+
+
+def test_awaiting_email_includes_resolved_params(client, ids):
+    body = chat(client, EMAIL_PARTIAL, ids)
+    assert body["task_status"] == "AWAITING_INPUT"
+    assert body["resolved_params"]["recipient"] == "alex"
+
+
+def test_composer_style_followup_goes_pending(client, ids):
+    body = chat(client, "send an email", ids)
+    assert body["task_status"] == "AWAITING_INPUT"
+    follow = chat(
+        client, "to alex@example.com subject hi body hello", ids
+    )
+    assert follow["task_id"] == body["task_id"]
+    assert follow["task_status"] == "PENDING"
+    assert follow["resolved_params"]["recipient"] == "alex@example.com"
+    assert follow["resolved_params"]["subject"] == "hi"
+    assert follow["resolved_params"]["body"] == "hello"
+
+
+def test_draft_body_does_not_mutate_open_action(client, ids):
+    body = chat(client, "send an email", ids)
+    before = fetch_row(body["task_id"])
+    resp = client.post(
+        "/action/draft_body",
+        json={
+            "recipient": "alex@example.com",
+            "subject": "hi",
+            **ids,
+        },
+    )
+    assert resp.status_code == 200
+    assert isinstance(resp.json().get("body"), str)
+    assert fetch_row(body["task_id"]) == before
+
+
+def test_attachments_ride_along_on_email_confirm(client, ids, fake_composio, tmp_path):
+    attached = tmp_path / "note.txt"
+    attached.write_text("hi", encoding="utf-8")
+    body = chat(client, "send an email", ids)
+    assert body["task_status"] == "AWAITING_INPUT"
+    follow = client.post(
+        "/chat",
+        json={
+            "text": "to alex@example.com subject hi body hello",
+            "conversation_id": ids["conversation_id"],
+            "user_id": ids["user_id"],
+            "attachments": [str(attached)],
+        },
+    ).json()
+    assert follow["task_status"] == "PENDING"
+    assert follow["resolved_params"]["attachments"] == [str(attached)]
+    out = confirm(client, ids, follow["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert fake_composio.calls == [
+        ("send_email", {**EMAIL_PARAMS, "attachments": [str(attached)]})
+    ]
 
 
 # --- Criterion 7: /action/confirm confirm executes, cancel never does --------
@@ -635,6 +743,43 @@ def test_no_composio_key_confirm_fails_gracefully(client, ids, monkeypatch):
     row = fetch_row(body["task_id"])
     assert row["status"] == "FAILED"
     assert payload(row)["error"] == "composio_not_connected"
+
+
+def test_confirm_includes_gmail_connect_link(client, ids, monkeypatch):
+    fake = FakeComposio(
+        result={
+            "ok": False,
+            "detail": "no connected account",
+            "error": "composio_not_connected",
+            "connect_link": "https://connect.composio.dev/link/test",
+        }
+    )
+    monkeypatch.setitem(actions._EXECUTORS, "composio", fake)
+    body = make_pending_email(client, ids)
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "FAILED"
+    assert "https://connect.composio.dev/link/test" in out["answer"]
+    assert "Sent the email" not in out["answer"]
+
+
+def test_for_you_consumer_key_is_not_a_platform_key(monkeypatch):
+    monkeypatch.setenv("COMPOSIO_API_KEY", "ck_not_a_platform_project_key")
+    assert actions.platform_api_key() is None
+    result = actions.ComposioExecutor().execute("send_email", EMAIL_PARAMS)
+    assert result["ok"] is False
+    assert result["error"] == "composio_not_connected"
+    assert "For You" in result["detail"]
+
+
+def test_for_you_consumer_key_confirm_fails_gracefully(client, ids, monkeypatch):
+    monkeypatch.setenv("COMPOSIO_API_KEY", "ck_not_a_platform_project_key")
+    body = make_pending_email(client, ids)
+
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "FAILED"
+    assert out["answer"] == main.COMPOSIO_NOT_CONNECTED_REPLY
+    assert "Sent the email" not in out["answer"]
+    assert payload(fetch_row(body["task_id"]))["error"] == "composio_not_connected"
 
 
 # --- Criterion 14: startup sweep — no replay, terminal rows byte-identical ---

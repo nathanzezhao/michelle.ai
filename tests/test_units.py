@@ -11,6 +11,7 @@ from intent import (
     analyze_action_request,
     classify_intent,
     classify_memory_confirmation,
+    parse_mixed_utterance,
     usable_memory_facts,
 )
 import intent
@@ -207,6 +208,31 @@ def test_llm_empty_params_still_extracts_notes(monkeypatch):
     assert analysis["missing_params"] == []
 
 
+def test_llm_open_app_label_does_not_steal_email(monkeypatch):
+    """Live bug: 'send an email to you@example.com …' came back as open_app."""
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_analyze_action_with_llm",
+        lambda *a, **k: {
+            "action_type": "open_app",
+            "resolved_params": {},
+            "missing_params": ["app_name"],
+            "related": True,
+            "confidence": 0.9,
+        },
+    )
+    analysis = analyze_action_request(
+        "send an email to you@example.com subject hi body hello"
+    )
+    assert analysis["action_type"] == "send_email"
+    assert analysis["resolved_params"]["recipient"] == "you@example.com"
+    assert analysis["resolved_params"]["subject"] == "hi"
+    assert analysis["resolved_params"]["body"] == "hello"
+    assert analysis["missing_params"] == []
+
+
 def test_llm_chat_label_still_promotes_open_order(monkeypatch):
     """Live bug: llama3.2 returned kind=CHAT for 'open Notes'."""
     monkeypatch.setenv("INTENT_MODE", "llm")
@@ -227,3 +253,35 @@ def test_llm_chat_label_still_promotes_open_order(monkeypatch):
     result = classify_intent("open Notes")
     assert result["intent"] == "ACTION"
     assert result["kind"] == "ACTION"
+
+
+@pytest.mark.parametrize(
+    "text,chat,actions",
+    [
+        ("open Notes", "", ["open Notes"]),
+        ("hey how are you, open Notes", "hey how are you", ["open Notes"]),
+        (
+            "whats up. also send an email to nate@example.com subject hi body hello",
+            "whats up",
+            ["send an email to nate@example.com subject hi body hello"],
+        ),
+        (
+            "open Notes then send an email to alex@example.com subject hi body hello",
+            "",
+            [
+                "open Notes",
+                "send an email to alex@example.com subject hi body hello",
+            ],
+        ),
+        (
+            "send an email to alex@example.com, subject hi, body hello",
+            "",
+            ["send an email to alex@example.com, subject hi, body hello"],
+        ),
+    ],
+)
+def test_parse_mixed_utterance(text, chat, actions):
+    parsed = parse_mixed_utterance(text)
+    assert parsed["chat"] == chat
+    assert parsed["actions"] == actions
+    assert classify_intent(text)["intent"] == "ACTION"

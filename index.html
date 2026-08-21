@@ -84,7 +84,8 @@
 
   body.collapsed #title,
   body.collapsed #content,
-  body.collapsed #input-area {
+  body.collapsed #input-area,
+  body.collapsed #composer-dock {
     display: none !important;
   }
 
@@ -117,6 +118,7 @@
     color: #151515;
     max-width: 80%;
     font-family: 'IBM Plex Mono', monospace;
+    flex-shrink: 0;
   }
 
   #input-area {
@@ -127,6 +129,28 @@
     flex-shrink: 0;
     min-width: 0;
     width: 100%;
+  }
+
+  #composer-dock {
+    display: none;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 12px;
+    flex-shrink: 0;
+    min-width: 0;
+    width: 100%;
+  }
+
+  #composer-dock.open {
+    display: flex;
+  }
+
+  #composer-dock .dock-row {
+    display: flex;
+    gap: 8px;
+    min-width: 0;
+    width: 100%;
+    align-items: center;
   }
 
   input {
@@ -158,6 +182,7 @@
     gap: 8px;
     max-width: 80%;
     margin-top: -4px;
+    flex-shrink: 0;
   }
 
   .action-row button {
@@ -175,6 +200,153 @@
     opacity: 0.4;
     cursor: default;
   }
+
+  @keyframes composer-drop {
+    from { opacity: 0; transform: translateY(-8px) scaleY(0.92); }
+    to   { opacity: 1; transform: translateY(0) scaleY(1); }
+  }
+
+  .composer {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    flex-shrink: 0;
+    border-radius: 12px;
+    background: rgba(255, 253, 253, 0.28);
+    border: 1px solid rgba(255,255,255,0.35);
+    overflow: hidden;
+    transform-origin: top center;
+    animation: composer-drop 320ms ease-out;
+    font-family: 'IBM Plex Mono', monospace;
+    color: #151515;
+  }
+
+  .composer-head,
+  .composer-body {
+    padding: 10px 12px;
+  }
+
+  .composer textarea {
+    min-height: 72px;
+    max-height: 28vh;
+    resize: vertical;
+  }
+
+  #composer-dock .icon-btn,
+  #composer-dock .gen-btn {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 16px;
+    border-radius: 10px;
+    border: none;
+    font-size: 13px;
+    cursor: pointer;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  #composer-dock .icon-btn {
+    background: rgba(255, 253, 253, 0.5);
+    color: #151515;
+    border: 1px solid rgba(0,0,0,0.15);
+  }
+
+  #composer-dock .gen-btn {
+    margin-left: auto;
+    background: #555;
+    color: rgb(211, 211, 211);
+  }
+
+  #composer-dock .icon-btn svg,
+  #composer-dock .gen-btn svg {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    display: block;
+  }
+
+  .composer-head {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 6px 8px;
+    align-items: center;
+    border-bottom: 1px solid rgba(0,0,0,0.12);
+  }
+
+  .composer .lbl {
+    font-size: 11px;
+    color: #333;
+    opacity: 0.7;
+  }
+
+  .composer input,
+  .composer textarea {
+    width: 100%;
+    border: none;
+    background: transparent;
+    outline: none;
+    font-family: inherit;
+    font-size: 12px;
+    color: #151515;
+  }
+
+  .composer .urgent {
+    grid-row: 1 / span 2;
+    grid-column: 3;
+    align-self: start;
+    padding: 5px 8px;
+    border-radius: 8px;
+    border: 1px solid rgba(0,0,0,0.15);
+    background: rgba(255,253,253,0.45);
+    color: #151515;
+    font-size: 11px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+
+  .composer .urgent.on {
+    background: #555;
+    color: rgb(211, 211, 211);
+    border-color: transparent;
+  }
+
+  .composer-files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 12px 8px;
+  }
+
+  .file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 4px 8px;
+    border-radius: 8px;
+    background: rgba(255,253,253,0.5);
+    border: 1px solid rgba(0,0,0,0.12);
+    font-size: 11px;
+  }
+
+  .file-chip span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .file-chip button {
+    border: none;
+    background: transparent;
+    color: #151515;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    padding: 0;
+    line-height: 1;
+  }
 </style>
 </head>
 <body>
@@ -188,9 +360,32 @@
   <div class="bubble" id="greeting-bubble">…</div>
 </div>
 
+<div id="composer-dock">
+  <div class="composer-files" id="composer-files" hidden></div>
+  <div class="dock-row">
+    <input type="file" id="composer-file-input" multiple hidden />
+    <button type="button" class="icon-btn" id="composer-attach" title="attach files" aria-label="files">
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/>
+        <path d="M14 2v5a1 1 0 0 0 1 1h5"/>
+      </svg>
+      files
+    </button>
+    <button type="button" class="gen-btn" id="composer-gen" title="generate body" aria-label="generate">
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"/>
+        <path d="M20 2v4"/>
+        <path d="M22 4h-4"/>
+        <circle cx="4" cy="20" r="2"/>
+      </svg>
+      generate
+    </button>
+  </div>
+</div>
+
 <div id="input-area">
-  <input type="text" placeholder="Ask me anything..." />
-  <button>Send</button>
+  <input id="chat-input" type="text" placeholder="Ask me anything..." />
+  <button id="send-btn" type="button">Send</button>
 </div>
 
 <script>
@@ -199,6 +394,11 @@
   const title = document.getElementById('title')
   const content = document.getElementById('content')
   const inputArea = document.getElementById('input-area')
+  const composerDock = document.getElementById('composer-dock')
+  const composerAttach = document.getElementById('composer-attach')
+  const composerGen = document.getElementById('composer-gen')
+  const composerFileInput = document.getElementById('composer-file-input')
+  const composerFiles = document.getElementById('composer-files')
   const body = document.querySelector('body')
   
 
@@ -270,6 +470,7 @@
       btn.classList.add('circle')
       content.style.display = 'none'
       inputArea.style.display = 'none'
+      composerDock.classList.remove('open')
       title.style.opacity = '0'
       body.style.background = 'transparent'
       body.style.border = 'none'
@@ -286,6 +487,7 @@
       content.style.display = 'flex'
       inputArea.style.display = 'flex'
       inputArea.style.marginTop = 'auto'
+      if (activeComposer) composerDock.classList.add('open')
       body.style.background = 'rgba(233, 233, 246, 0.35)'
       body.style.removeProperty('border')
       body.style.removeProperty('box-shadow')
@@ -306,13 +508,14 @@
 
     anime({ targets: title, opacity: 0, duration: 200, easing: 'linear' })
     anime({
-      targets: [content, inputArea],
+      targets: [content, inputArea, composerDock],
       opacity: 0,
       duration: 200,
       easing: 'linear',
       complete: () => {
         content.style.display = 'none'
         inputArea.style.display = 'none'
+        composerDock.classList.remove('open')
       }
     })
     anime({
@@ -377,6 +580,7 @@
         body.style.height = '56px'
         content.style.opacity = '0'
         inputArea.style.opacity = '0'
+        composerDock.style.opacity = '0'
         title.style.opacity = '0'
 
         anime({
@@ -387,7 +591,7 @@
           complete: () => { body.style.removeProperty('height') }
         })
         anime({ targets: title, opacity: 1, duration: 300, delay: 200, easing: 'linear' })
-        anime({ targets: [content, inputArea], opacity: 1, duration: 300, delay: 200, easing: 'linear' })
+        anime({ targets: [content, inputArea, composerDock], opacity: 1, duration: 300, delay: 200, easing: 'linear' })
       } else if (collapsed) {
         syncCollapsedHitTest()
       }
@@ -398,8 +602,8 @@
 
 
 
-const sendButton = document.querySelector('button');
-const inputBox = document.querySelector('input');
+const sendButton = document.getElementById('send-btn');
+const inputBox = document.getElementById('chat-input');
 const chatContainer = document.getElementById('content');
 
 // Handle sending messages and thinking animation for bot responses.
@@ -453,6 +657,7 @@ function revealScramble(element, finalString) {
 // Only one action can be pending at a time, so only one row ever lives.
 
 let activeActionRow = null;
+let activeComposer = null;
 
 function removeActionButtons() {
   if (!activeActionRow) return;
@@ -460,9 +665,200 @@ function removeActionButtons() {
   activeActionRow = null;
 }
 
+function removeComposer() {
+  if (!activeComposer) return;
+  activeComposer.remove();
+  activeComposer = null;
+  composerDock.classList.remove("open");
+  composerFiles.hidden = true;
+  composerFiles.innerHTML = "";
+  composerFileInput.value = "";
+}
+
+function attachComposer(bubble, data) {
+  if (data.action_type !== "send_email" || data.task_status !== "AWAITING_INPUT") return;
+  removeComposer();
+  removeActionButtons();
+
+  const resolved = data.resolved_params || {};
+  const composer = document.createElement("div");
+  composer.className = "composer";
+  composer.innerHTML = `
+    <div class="composer-head">
+      <span class="lbl">to</span>
+      <input type="text" class="composer-to" placeholder="name or email" />
+      <button type="button" class="urgent">urgent?</button>
+      <span class="lbl">subject</span>
+      <input type="text" class="composer-subject" placeholder="what's this about" />
+    </div>
+    <div class="composer-body">
+      <div class="lbl" style="margin-bottom:6px">body</div>
+      <textarea class="composer-body-text" placeholder="write it here, or tap generate"></textarea>
+    </div>
+  `;
+
+  const toInput = composer.querySelector(".composer-to");
+  const subjectInput = composer.querySelector(".composer-subject");
+  const bodyInput = composer.querySelector(".composer-body-text");
+  const urgentBtn = composer.querySelector(".urgent");
+  const attached = [];
+
+  toInput.value = resolved.recipient || "";
+  subjectInput.value = resolved.subject || "";
+  bodyInput.value = resolved.body || "";
+  if (/^\[urgent\]/i.test(subjectInput.value)) urgentBtn.classList.add("on");
+
+  urgentBtn.addEventListener("click", () => {
+    urgentBtn.classList.toggle("on");
+    if (urgentBtn.classList.contains("on")) {
+      if (!/^\[urgent\]/i.test(subjectInput.value)) {
+        subjectInput.value = subjectInput.value
+          ? "[urgent] " + subjectInput.value
+          : "[urgent] ";
+      }
+    } else {
+      subjectInput.value = subjectInput.value.replace(/^\[urgent\]\s*/i, "");
+    }
+  });
+
+  function renderFiles() {
+    composerFiles.hidden = attached.length === 0;
+    composerFiles.innerHTML = "";
+    attached.forEach((file, i) => {
+      const chip = document.createElement("div");
+      chip.className = "file-chip";
+      const name = document.createElement("span");
+      name.textContent = file.name;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "×";
+      remove.addEventListener("click", () => {
+        attached.splice(i, 1);
+        renderFiles();
+      });
+      chip.appendChild(name);
+      chip.appendChild(remove);
+      composerFiles.appendChild(chip);
+    });
+  }
+
+  function readDraft() {
+    return {
+      to: toInput.value.trim(),
+      subject: subjectInput.value.trim(),
+      body: bodyInput.value.trim(),
+      paths: attached.map((f) => f.path).filter(Boolean)
+    };
+  }
+
+  composer._readDraft = readDraft;
+  composer._attached = attached;
+  composer._renderFiles = renderFiles;
+  composer._toInput = toInput;
+  composer._subjectInput = subjectInput;
+  composer._bodyInput = bodyInput;
+  composer._focusMissing = function () {
+    if (!toInput.value.trim()) toInput.focus();
+    else if (!subjectInput.value.trim()) subjectInput.focus();
+    else bodyInput.focus();
+  };
+
+  bodyInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submitComposer();
+    }
+  });
+
+  bubble.insertAdjacentElement("afterend", composer);
+  content.scrollTop = content.scrollHeight;
+  activeComposer = composer;
+  composerDock.classList.add("open");
+  toInput.focus();
+}
+
+composerAttach.addEventListener("click", () => {
+  if (!activeComposer) return;
+  composerFileInput.click();
+});
+composerFileInput.addEventListener("change", () => {
+  if (!activeComposer || !activeComposer._attached) return;
+  activeComposer._attached.push(...Array.from(composerFileInput.files || []));
+  composerFileInput.value = "";
+  activeComposer._renderFiles();
+});
+composerGen.addEventListener("click", () => {
+  if (!activeComposer || composerGen.disabled) return;
+  composerGen.disabled = true;
+  fetch("http://127.0.0.1:8000/action/draft_body", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      recipient: activeComposer._toInput.value.trim(),
+      subject: activeComposer._subjectInput.value.trim(),
+      conversation_id: conversationId,
+      user_id: userId
+    })
+  })
+    .then((r) => r.json())
+    .then((out) => {
+      if (out.body && activeComposer && activeComposer._bodyInput) {
+        activeComposer._bodyInput.value = out.body;
+      }
+    })
+    .finally(() => { composerGen.disabled = false; });
+});
+
+
+function submitComposer() {
+  if (!activeComposer || !activeComposer._readDraft) return false;
+  const draft = activeComposer._readDraft();
+  if (!draft.to || !draft.subject || !draft.body) {
+    activeComposer._focusMissing();
+    return true;
+  }
+  const text =
+    "to " + draft.to + " subject " + draft.subject + " body " + draft.body;
+  removeComposer();
+  const botBubble = addBubble("", "bot");
+  botBubble.innerHTML = '<div class="loading-dot"></div>';
+  fetch("http://127.0.0.1:8000/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text: text,
+      conversation_id: conversationId,
+      user_id: userId,
+      attachments: draft.paths
+    })
+  })
+    .then((response) => response.json())
+    .then((data) => {
+      if (data.conversation_id) {
+        conversationId = data.conversation_id;
+        localStorage.setItem(CONVERSATION_STORAGE_KEY, conversationId);
+      }
+      if (data.user_id) {
+        userId = data.user_id;
+        localStorage.setItem(USER_STORAGE_KEY, data.user_id);
+      }
+      setTimeout(() => {
+        revealScramble(botBubble, data.answer);
+        attachConfirmButtons(botBubble, data);
+        attachComposer(botBubble, data);
+      }, 1200);
+    })
+    .catch((error) => {
+      console.error("Composer submit failed:", error);
+      revealScramble(botBubble, "Something went wrong.");
+    });
+  return true;
+}
+
 function attachConfirmButtons(bubble, data) {
   if (data.confirm_required !== true || !data.task_id) return;
   removeActionButtons();
+  removeComposer();
 
   const taskId = data.task_id;
   const row = document.createElement('div');
@@ -532,10 +928,16 @@ function attachConfirmButtons(bubble, data) {
 
 function handleSend() {
   const userText = inputBox.value;
-  if (userText.trim() === '') return;
+  if (userText.trim() === "") {
+    if (activeComposer) {
+      submitComposer();
+      return;
+    }
+    return;
+  }
 
-  // Any newer message kills a pending confirm — backend cancels it too (§9.1).
   removeActionButtons();
+  removeComposer();
 
   addBubble(userText, 'user');
   inputBox.value = '';
@@ -569,6 +971,7 @@ function handleSend() {
         let botReply = data.answer;
         revealScramble(botBubble, botReply);
         attachConfirmButtons(botBubble, data);
+        attachComposer(botBubble, data);
       }, 1200);
     })
 
