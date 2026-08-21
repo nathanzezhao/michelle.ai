@@ -37,13 +37,17 @@ LLMs:
 - **CHAT** → normal reply from Ollama/Gemini/mock
 - **RETRIEVE** → search files in `docs/` (SQLite FTS), then answer from snippets
 - **REMEMBER** → keep something / recall something already saved
-- **ACTION** → not live yet (next). Tool requests currently fall through as CHAT.
+- **ACTION** → do a task: `open_app` (opens a Mac app immediately) or `send_email` (Confirm/Cancel buttons, sent via Composio). Everything else is refused. Every attempt is audited in the `actions_log` table.
 
 With `INTENT_MODE=llm`, REMEMBER is meaning-based (“keep in mind”, “don’t forget”, “note that…”, etc.), not only the words “remember this”.
 
 If she’s unsure something should be saved forever, she’ll ask **yes/no** next; yes → long-term memory.
 
 Examples: `keep in mind that I'm 22` · `remember I prefer short replies`
+
+### `COMPOSIO_API_KEY` (`.env`, optional)
+
+Auth for the Composio email executor. Without it the backend still boots and the whole email flow works up to Confirm, which then replies that email isn't connected yet (no crash, no pretend success). Set the key to enable real sends (Gmail via Composio).
 
 ### Intent modes (`.env`)
 

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -63,6 +64,36 @@ def init_db() -> None:
         )
 
 
+# LLM nulls become the string "None" if we str() them — never treat those as a name.
+JUNK_NAME_VALUES = {
+    "none",
+    "null",
+    "nil",
+    "n/a",
+    "na",
+    "n.a.",
+    "(none)",
+    "unknown",
+    "anonymous",
+    "undefined",
+    "missing",
+    "user",
+    "michelle",
+    "chelle",
+    "michelle.ai",
+}
+
+
+def is_valid_name(value: object) -> bool:
+    """True only for a real person name — not null, None, n/a, or Michelle."""
+    if value is None:
+        return False
+    cleaned = str(value).strip().strip("()[]").strip()
+    if not cleaned or cleaned.lower() in JUNK_NAME_VALUES:
+        return False
+    return bool(re.search(r"[A-Za-z]", cleaned))
+
+
 def _normalize_fact_value(key: str, value: str) -> str:
     """Canonicalize values — names are always title-cased (nathan → Nathan)."""
     value = value.strip()
@@ -84,15 +115,21 @@ def get_facts(user_id: str) -> list[dict]:
             (user_id,),
         ).fetchall()
 
-    return [
-        {
-            "key": row["fact_key"],
-            "value": _normalize_fact_value(row["fact_key"], row["fact_value"]),
-            "confidence": row["confidence"],
-            "priority": row["priority"],
-        }
-        for row in rows
-    ]
+    facts = []
+    for row in rows:
+        key = row["fact_key"]
+        value = _normalize_fact_value(key, row["fact_value"])
+        if key == "name" and not is_valid_name(value):
+            continue
+        facts.append(
+            {
+                "key": key,
+                "value": value,
+                "confidence": row["confidence"],
+                "priority": row["priority"],
+            }
+        )
+    return facts
 
 
 def get_fact(user_id: str, fact_key: str) -> str | None:
@@ -108,7 +145,10 @@ def get_fact(user_id: str, fact_key: str) -> str | None:
         ).fetchone()
     if not row:
         return None
-    return _normalize_fact_value(key, row["fact_value"])
+    value = _normalize_fact_value(key, row["fact_value"])
+    if key == "name" and not is_valid_name(value):
+        return None
+    return value
 
 
 def upsert_fact(
@@ -118,14 +158,25 @@ def upsert_fact(
     confidence: float = 0.5,
     priority: str = "high",
     conversation_id: str | None = None,
+    replace: bool = False,
 ) -> None:
-    """Save or update a long-term fact for this user (keyed by fact_key)."""
+    """Save or update a long-term fact for this user (keyed by fact_key).
+
+    Names: junk values (None/null) are dropped. A real name is not overwritten
+    unless replace=True (user explicitly said their name).
+    """
     key = fact_key.strip().lower().replace(" ", "_")
-    value = _normalize_fact_value(key, fact_value)
+    if fact_value is None:
+        return
+    value = _normalize_fact_value(key, str(fact_value))
     if not key or not value:
         return
-    if key == "name" and value.lower() in {"michelle", "chelle", "michelle.ai"}:
-        return
+    if key == "name":
+        if not is_valid_name(value):
+            return
+        existing = get_fact(user_id, "name")
+        if existing and existing.lower() != value.lower() and not replace:
+            return
 
     priority = (priority or "high").strip().lower()
     if priority not in ("high", "medium", "low"):

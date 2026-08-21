@@ -8,6 +8,7 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+.test-venv/
 
 # MacOS garbage
 .DS_Store
@@ -16,6 +17,5 @@ venv/
 .env
 
 # Ignore local Michelle memory database (chats stay on this laptop)
-michelle.db
-michelle.db-wal
-michelle.db-shm
+# Wildcard also covers -wal/-shm and dated .backup copies
+michelle.db*

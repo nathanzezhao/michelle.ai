@@ -152,6 +152,29 @@
     cursor: pointer;
     font-family: 'IBM Plex Mono', monospace;
   }
+
+  .action-row {
+    display: flex;
+    gap: 8px;
+    max-width: 80%;
+    margin-top: -4px;
+  }
+
+  .action-row button {
+    padding: 6px 14px;
+    font-size: 12px;
+  }
+
+  .action-row button.cancel {
+    background: rgba(255, 253, 253, 0.5);
+    color: #151515;
+    border: 1px solid rgba(0,0,0,0.15);
+  }
+
+  .action-row button:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
 </style>
 </head>
 <body>
@@ -426,11 +449,93 @@ function revealScramble(element, finalString) {
   }, 10); 
 }
 
+// Confirm/Cancel buttons for high-risk actions (SPEC-PIPELINE §9).
+// Only one action can be pending at a time, so only one row ever lives.
+
+let activeActionRow = null;
+
+function removeActionButtons() {
+  if (!activeActionRow) return;
+  activeActionRow.remove();
+  activeActionRow = null;
+}
+
+function attachConfirmButtons(bubble, data) {
+  if (data.confirm_required !== true || !data.task_id) return;
+  removeActionButtons();
+
+  const taskId = data.task_id;
+  const row = document.createElement('div');
+  row.classList.add('action-row');
+
+  const confirmBtn = document.createElement('button');
+  confirmBtn.innerText = 'Confirm';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.classList.add('cancel');
+  cancelBtn.innerText = 'Cancel';
+
+  // Removes this row only — never a newer row installed by a later /chat turn.
+  function removeThisRow() {
+    row.remove();
+    if (activeActionRow === row) activeActionRow = null;
+  }
+
+  function sendDecision(decision) {
+    if (confirmBtn.disabled) return;
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+
+    const botBubble = addBubble('', 'bot');
+    botBubble.innerHTML = '<div class="loading-dot"></div>';
+
+    fetch('http://127.0.0.1:8000/action/confirm', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          task_id: taskId,
+          decision: decision,
+          conversation_id: conversationId,
+          user_id: userId
+        })
+      })
+      .then(response => {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return response.json();
+      })
+      .then(result => {
+        removeThisRow();
+        setTimeout(() => {
+          revealScramble(botBubble, result.answer);
+          attachConfirmButtons(botBubble, result);
+        }, 1200);
+      })
+      .catch(error => {
+        console.error('Action confirm failed:', error);
+        removeThisRow();
+        revealScramble(botBubble, 'Something went wrong.');
+      });
+  }
+
+  confirmBtn.addEventListener('click', () => sendDecision('confirm'));
+  cancelBtn.addEventListener('click', () => sendDecision('cancel'));
+
+  row.appendChild(confirmBtn);
+  row.appendChild(cancelBtn);
+  bubble.insertAdjacentElement('afterend', row);
+  content.scrollTop = content.scrollHeight;
+  activeActionRow = row;
+}
+
 // Function to handle sending user messages and fetching bot responses.
 
 function handleSend() {
   const userText = inputBox.value;
   if (userText.trim() === '') return;
+
+  // Any newer message kills a pending confirm — backend cancels it too (§9.1).
+  removeActionButtons();
 
   addBubble(userText, 'user');
   inputBox.value = '';
@@ -463,6 +568,7 @@ function handleSend() {
       setTimeout(()=>{
         let botReply = data.answer;
         revealScramble(botBubble, botReply);
+        attachConfirmButtons(botBubble, data);
       }, 1200);
     })
 

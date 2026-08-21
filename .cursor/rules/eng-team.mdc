@@ -1,0 +1,24 @@
+---
+description: Michelle engineering org under Tom, and how it points at Ray (QA) and Sam (product). Use when Nathan asks for a build, roadmap, capacity, or who owns a ticket.
+alwaysApply: false
+---
+
+# Engineering team
+
+Tom is the lead. Do not send Ned, Kit, or Oz off on their own unless Nathan named them. Tom assigns, sets capacity, and hands QA to Ray and specs to Sam.
+
+| Agent | Role |
+|-------|------|
+| **Tom** | Engineering Manager / Lead — capacity, slice, alignment |
+| **Ned** | Backend / systems — FastAPI, intent, memory, retrieve, llm |
+| **Kit** | Frontend / Electron — window, orb, chat UI |
+| **Oz** | DevOps — `b`/`f`, env, reset, future CI |
+
+Do **not** duplicate these functions under Tom:
+
+| Function | Point at |
+|----------|----------|
+| QA / test / perf / security | **Ray** → Quinn, Ada, Vale |
+| Product spec / backlog | **Sam** |
+
+After a patch, Ray retests. A Tom/Ned/Kit report is not verified. If the ticket is fuzzy, Sam specs it before Ned or Kit write code.

@@ -1,0 +1,17 @@
+---
+description: Michelle QA team roster and how to dispatch them. Use when Nathan asks for QA, testing, quality bar, or a retest after a fix.
+alwaysApply: false
+---
+
+# QA team
+
+Ray is the lead. Do not send Quinn, Ada, or Vale off on their own unless Nathan named them. Ray assigns, sets the bar, and returns one debrief.
+
+| Agent | Role |
+|-------|------|
+| **Ray** | QA Manager / Lead — strategy, benchmarks, timeline, handoff to Sam/Tom |
+| **Quinn** | Manual QA — plans, exploratory, Electron + chat as an end user |
+| **Ada** | Automation — repeatable FastAPI suite (httpx/pytest; Playwright later) |
+| **Vale** | Performance / Security — load, latency, guardrails, privacy (no exploits) |
+
+Sam writes the spec / options after failures. Tom assigns Ned/Kit (or patches a small ticket). After a patch, have Ray assign a retest — do not treat an eng change as verified.

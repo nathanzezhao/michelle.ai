@@ -1,16 +1,17 @@
 import json
 import os
 import re
+from pathlib import Path
 from typing import Optional
 
 import httpx
 from google import genai
 
-# ACTION is next (tools + confirm). Parked for now — do not classify it.
-INTENTS = ("CHAT", "RETRIEVE", "REMEMBER")
-RESERVED_INTENTS = ("ACTION",)  # planned; map to CHAT until built
+from actions import ACTION_WHITELIST
+from long_term_memory import is_valid_name
+
+INTENTS = ("CHAT", "RETRIEVE", "REMEMBER", "ACTION")
 PRIORITIES = ("high", "medium", "low")
-BLOCKED_NAME_VALUES = {"michelle", "chelle", "michelle.ai"}
 
 # Only HIGH-priority facts with strong confidence get written.
 # Default is strict so casual chat does not pollute long-term memory.
@@ -107,34 +108,66 @@ def _gemini_json(prompt: str) -> dict:
     return json.loads(_strip_json_fences(response.text or ""))
 
 
-def classify_intent(text: str, history: Optional[list[dict]] = None) -> dict:
-    """Classify what the user wants: chat, lookup, action, or explicit remember.
+def classify_intent(
+    text: str,
+    history: Optional[list[dict]] = None,
+    existing_facts: Optional[list[dict]] = None,
+) -> dict:
+    """Classify via a question-first tree, then a typed bucket.
 
-    In llm mode the chat provider (Ollama or Gemini) decides REMEMBER from meaning
-    (keep in mind, don't forget, etc.) — not only exact "remember this" wording.
-    Rules/mock still use phrase heuristics as a fallback.
+    1. Is this a question? (meaning, not punctuation)
+    2. If yes: what kind — REMEMBER (recall), RETRIEVE (docs), or CHAT
+    3. If no: CHAT, REMEMBER (store), RETRIEVE (imperative lookup), or ACTION
+       (an order to do a task — open an app, send an email).
+    Orders ("look this up", "retrieve this") are not questions.
     """
     history = history or []
+    existing_facts = existing_facts or []
     mode = os.getenv("INTENT_MODE", "llm").lower()
 
     # Bare name after "what's your name?" is always chat, never a doc lookup.
     if capture_introduced_name(text, history):
-        return {"intent": "CHAT", "confidence": 0.95}
+        return {
+            "intent": "CHAT",
+            "confidence": 0.95,
+            "is_question": False,
+            "kind": "CHAT",
+        }
 
     if mode == "rules":
-        return _classify_with_rules(text)
+        return _normalize_intent_result(_classify_with_rules(text), text)
     if mode == "mock":
-        return _classify_mock(text)
+        return _normalize_intent_result(_classify_mock(text), text)
 
-    # INTENT_MODE=llm → use Ollama or Gemini (same as LLM_PROVIDER).
     if _intent_backend() == "rules":
-        return _classify_with_rules(text)
+        return _normalize_intent_result(_classify_with_rules(text), text)
 
     try:
-        return _classify_with_llm(text, history)
+        result = _normalize_intent_result(
+            _classify_with_llm(text, history, existing_facts), text
+        )
     except Exception as e:
         print(f"Intent LLM failed ({e}), falling back to rules")
-        return _classify_with_rules(text)
+        return _normalize_intent_result(_classify_with_rules(text), text)
+
+    # llama3.2 often labels "open Notes" as CHAT. If the utterance is clearly
+    # an order, promote — same idea as maybe_promote_to_remember.
+    if result.get("intent") == "CHAT" and _looks_like_action_order(text):
+        print("intent_promoted=ACTION (classifier missed an order)")
+        result["intent"] = "ACTION"
+        result["kind"] = "ACTION"
+    return result
+
+
+def _normalize_intent_result(result: dict, text: str) -> dict:
+    """Ensure every classify path exposes the question-first tree fields."""
+    out = dict(result)
+    out.setdefault("is_question", _looks_like_question(text))
+    out.setdefault("kind", out.get("intent") or "CHAT")
+    out.setdefault("memory_score", 0.0)
+    out.setdefault("docs_score", 0.0)
+    out.setdefault("chat_score", 0.0)
+    return out
 
 
 def classify_memory_confirmation(text: str) -> str | None:
@@ -232,10 +265,354 @@ def analyze_remember_request(
         return _analyze_remember_with_rules(text, history, existing_facts)
 
 
+# --- ACTION param extraction (SPEC-PIPELINE §3.2) ---------------------------
+
+_EMAIL_ADDR_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+# Leading chatter is allowed; app names are NEVER a closed list — whatever
+# they said after the verb is the app (including slang / gibberish names).
+_LEADING_FILLER = (
+    r"(?:(?:yo|hey|hi|sup|bruh|pls|please|like|ok|okay|uhm|uh)\s+)*"
+    r"(?:(?:can|could|would|will)\s+(?:you|u|ya)\s+)?"
+    r"(?:(?:please|pls|gonna|wanna|go\s+ahead\s+and)\s+)?"
+)
+_OPEN_VERBS = (
+    r"(?:open|launch|start|run|pull\s+up|fire\s+up|hop\s+(?:in(?:to)?|on)|"
+    r"bring\s+up|boot\s+up|pop\s+open|crank\s+up)"
+)
+_TRAILING_FILLER = r"(?:\s+(?:rq|pls|please|thx|thanks|real\s+quick|for\s+me))*[.!?]*"
+
+_OPEN_APP_EXTRACT_RE = re.compile(
+    rf"^{_LEADING_FILLER}{_OPEN_VERBS}(?:\s+up)?"
+    rf"\s+(?:the\s+)?(.+?){_TRAILING_FILLER}$",
+    re.IGNORECASE,
+)
+_EMAIL_CMD_RE = re.compile(
+    r"^(?:please\s+)?(?:can you\s+|could you\s+)?"
+    r"(?:send\s+(?:an?\s+)?e-?mail\b|e-?mail)\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_SUBJECT_RE = re.compile(
+    r"\bsubject\s*[:=]?\s*(.+?)(?=[,;]?\s+(?:and\s+)?body\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_BODY_RE = re.compile(r"\bbody\s*[:=]?\s*(.+)$", re.IGNORECASE | re.DOTALL)
+_RECIPIENT_NAME_RE = re.compile(r"\bto\s+([A-Za-z][\w.'-]*)", re.IGNORECASE)
+
+# Placeholder-ish app names that mean the user never said which app.
+_GENERIC_APP_WORDS = {"app", "an app", "the app", "it", "that", "something", "a new app"}
+
+
+def analyze_action_request(
+    text: str,
+    history: Optional[list[dict]] = None,
+    task_context: Optional[dict] = None,
+) -> dict:
+    """After intent=ACTION (or while an action is AWAITING_INPUT): what task,
+    with what params? Runs ONLY on those turns — no other turn pays for it.
+
+    task_context is the open actions_log row ({action_type, resolved_params,
+    missing_params}) when continuing a paused action; the analyzer then also
+    decides related (supplying the missing info) vs. unrelated (topic change).
+
+    Returns:
+        {
+            "action_type": whitelist key | "unsupported",
+            "resolved_params": {...},   # grounded in the message/history only
+            "missing_params": [...],    # recomputed in code from the whitelist
+            "confidence": float,
+            "related": bool,            # meaningful when task_context given
+        }
+    """
+    history = history or []
+    mode = os.getenv("INTENT_MODE", "llm").lower()
+
+    if mode in ("rules", "mock") or _intent_backend() == "rules":
+        raw = _analyze_action_with_rules(text, task_context)
+    else:
+        try:
+            raw = _analyze_action_with_llm(text, history, task_context)
+        except Exception as e:
+            print(f"Action analyze LLM failed ({e}), falling back to rules")
+            raw = _analyze_action_with_rules(text, task_context)
+        else:
+            # llama often returns open_app with empty resolved_params, or
+            # related=false on a bare app name. Fill gaps from the rules
+            # extractor — never invent values, only recover what the user typed.
+            raw = _fill_action_from_rules(
+                raw, _analyze_action_with_rules(text, task_context)
+            )
+
+    return _finalize_action_analysis(raw, text, history, task_context)
+
+
+def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
+    """Merge deterministic extracts into a flaky LLM analyzer result."""
+    out = dict(raw) if isinstance(raw, dict) else {}
+    rules = rules or {}
+    raw_type = str(out.get("action_type") or "").strip().lower()
+    rules_type = str(rules.get("action_type") or "").strip().lower()
+    if raw_type not in ACTION_WHITELIST and rules_type in ACTION_WHITELIST:
+        out["action_type"] = rules_type
+        raw_type = rules_type
+
+    resolved = dict(out.get("resolved_params") or {})
+    if not str(resolved.get("app_name") or "").strip():
+        for alias in ("app", "application", "name", "appName"):
+            if str(resolved.get(alias) or "").strip():
+                resolved["app_name"] = str(resolved[alias]).strip()
+                break
+    for key, value in (rules.get("resolved_params") or {}).items():
+        if not str(resolved.get(key) or "").strip() and str(value or "").strip():
+            resolved[key] = value
+    out["resolved_params"] = resolved
+    if rules.get("related"):
+        out["related"] = True
+        if raw_type not in ACTION_WHITELIST and rules_type in ACTION_WHITELIST:
+            out["action_type"] = rules_type
+    return out
+
+
+def _finalize_action_analysis(
+    raw: dict,
+    text: str,
+    history: list[dict],
+    task_context: Optional[dict],
+) -> dict:
+    """Code-side validation (§3.2): the LLM never gets to invent an executable
+    action type, and params must be grounded in the user's own words."""
+    action_type = str(raw.get("action_type") or "").strip().lower()
+    related = bool(raw.get("related", False))
+    try:
+        confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.5) or 0.5)))
+    except (TypeError, ValueError):
+        confidence = 0.5
+
+    prior_params: dict = {}
+    if task_context and related:
+        # Continuations keep the stored task's type; prior params were already
+        # grounded when they were first saved.
+        if action_type in ("", "unsupported", "none", "null"):
+            action_type = str(task_context.get("action_type") or "")
+        if action_type == task_context.get("action_type"):
+            prior_params = dict(task_context.get("resolved_params") or {})
+        else:
+            prior_params = {}
+
+    # Whitelist validation happens HERE, in code, after the model call.
+    if action_type not in ACTION_WHITELIST:
+        return {
+            "action_type": "unsupported",
+            "resolved_params": {},
+            "missing_params": [],
+            "confidence": confidence,
+            "related": False,
+        }
+
+    grounded = _ground_action_params(raw.get("resolved_params"), text, history)
+    resolved = {**prior_params, **grounded}
+    required = ACTION_WHITELIST[action_type]["required_params"]
+    resolved = {k: v for k, v in resolved.items() if k in required}
+    missing = [p for p in required if not str(resolved.get(p) or "").strip()]
+
+    return {
+        "action_type": action_type,
+        "resolved_params": resolved,
+        "missing_params": missing,
+        "confidence": confidence,
+        "related": related if task_context else True,
+    }
+
+
+def _ground_action_params(params, text: str, history: list[dict]) -> dict:
+    """Same spirit as _fact_supported_by_text: the extractor must not invent
+    an email address, subject, or body the user never typed."""
+    if not isinstance(params, dict):
+        return {}
+    blob = " ".join(
+        [text or ""] + [str(turn.get("content") or "") for turn in history]
+    ).lower()
+    grounded = {}
+    # Full addresses actually present in the text — substring matching is not
+    # enough for emails ("notalex@example.com" contains "alex@example.com",
+    # a different mailbox).
+    known_addresses = set(_EMAIL_ADDR_RE.findall(blob))
+    for key, raw_value in params.items():
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+        if _EMAIL_ADDR_RE.fullmatch(value):
+            if value.lower() in known_addresses:
+                grounded[str(key)] = value
+            continue
+        if value.lower() in blob:
+            grounded[str(key)] = value
+            continue
+        if "@" in value:
+            # Email addresses must appear verbatim — never guessed.
+            continue
+        tokens = [t for t in re.split(r"[^a-z0-9]+", value.lower()) if len(t) >= 3]
+        if tokens and sum(1 for t in tokens if t in blob) * 2 >= len(tokens):
+            grounded[str(key)] = value
+    return grounded
+
+
+def _extract_email_params(text: str) -> dict:
+    params: dict = {}
+    addr = _EMAIL_ADDR_RE.search(text)
+    subject = _SUBJECT_RE.search(text)
+    body = _BODY_RE.search(text)
+    if addr:
+        params["recipient"] = addr.group(0)
+    else:
+        named = _RECIPIENT_NAME_RE.search(text)
+        if named and named.group(1).lower() not in {"the", "a", "an", "my"}:
+            params["recipient"] = named.group(1)
+    if subject:
+        value = subject.group(1).strip().strip("\"'").strip()
+        if value:
+            params["subject"] = value
+    if body:
+        value = body.group(1).strip().strip("\"'").strip()
+        if value:
+            params["body"] = value
+    return params
+
+
+def _clean_app_name(raw: str) -> str:
+    app = (raw or "").strip().strip("\"'").strip()
+    app = re.sub(
+        r"\s+(?:rq|pls|please|thx|thanks|real\s+quick|for\s+me)+$",
+        "",
+        app,
+        flags=re.IGNORECASE,
+    ).strip()
+    app = re.sub(r"\s+app$", "", app, flags=re.IGNORECASE).strip()
+    if app.lower() in _GENERIC_APP_WORDS:
+        return ""
+    return app
+
+
+def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
+    """Regex extractor for the two v1 actions — offline QA parity (§3.2)."""
+    stripped = (text or "").strip()
+
+    open_match = _OPEN_APP_EXTRACT_RE.match(stripped)
+    if open_match and _ACTION_OPEN_RE.match(stripped):
+        app = _clean_app_name(open_match.group(1))
+        return {
+            "action_type": "open_app",
+            "resolved_params": {"app_name": app} if app else {},
+            "confidence": 0.9,
+            "related": bool(
+                task_context and task_context.get("action_type") == "open_app"
+            ),
+        }
+
+    if _ACTION_EMAIL_RE.match(stripped):
+        return {
+            "action_type": "send_email",
+            "resolved_params": _extract_email_params(stripped),
+            "confidence": 0.9,
+            "related": bool(
+                task_context and task_context.get("action_type") == "send_email"
+            ),
+        }
+
+    if task_context:
+        # Paused action: does this message supply the missing params?
+        action_type = task_context.get("action_type")
+        missing = task_context.get("missing_params") or []
+        supplied: dict = {}
+        if action_type == "send_email":
+            supplied = {
+                k: v
+                for k, v in _extract_email_params(stripped).items()
+                if k in missing
+            }
+        elif action_type == "open_app" and "app_name" in missing:
+            bare = re.fullmatch(r"[A-Za-z][\w .'+-]{0,40}", stripped)
+            if bare and not _looks_like_question(stripped):
+                app = _clean_app_name(stripped)
+                if app:
+                    supplied = {"app_name": app}
+        if supplied:
+            return {
+                "action_type": action_type,
+                "resolved_params": supplied,
+                "confidence": 0.85,
+                "related": True,
+            }
+        return {
+            "action_type": "unsupported",
+            "resolved_params": {},
+            "confidence": 0.7,
+            "related": False,
+        }
+
+    return {
+        "action_type": "unsupported",
+        "resolved_params": {},
+        "confidence": 0.6,
+        "related": False,
+    }
+
+
+def _analyze_action_with_llm(
+    text: str,
+    history: list[dict],
+    task_context: Optional[dict],
+) -> dict:
+    recent = history[-10:]
+    context = "\n".join(f"{turn['role']}: {turn['content']}" for turn in recent)
+    catalog = "\n".join(
+        f'- "{name}": requires {", ".join(entry["required_params"])}'
+        for name, entry in ACTION_WHITELIST.items()
+    )
+    task_block = ""
+    if task_context:
+        task_block = (
+            "\nThe user was in the middle of this paused task:\n"
+            f"- action_type: {task_context.get('action_type')}\n"
+            f"- already provided: {json.dumps(task_context.get('resolved_params') or {})}\n"
+            f"- still missing: {json.dumps(task_context.get('missing_params') or [])}\n"
+            'Set "related": true ONLY if this message supplies missing info for that '
+            "task or clearly continues it. If they changed topic, related is false.\n"
+        )
+
+    prompt = f"""The user gave Michelle an order to do a task. Extract the task.
+
+Supported action types (anything else → "unsupported"):
+{catalog}
+{task_block}
+Rules:
+- resolved_params may ONLY contain values the user actually stated in the
+  message or the recent conversation. NEVER invent an email address, subject,
+  body, or app name. If a required value was not given, list it in
+  missing_params instead.
+- "unsupported" for any task that is not exactly one of the supported types
+  (booking, deleting files, reminders, browsing, etc.).
+
+Recent conversation:
+{context or "(none)"}
+
+User message: {text}
+
+Reply with ONLY valid JSON, no markdown:
+{{"action_type": "open_app"|"send_email"|"unsupported", "related": true|false, "resolved_params": {{}}, "missing_params": [], "confidence": 0.0 to 1.0}}"""
+
+    result = _llm_json(prompt)
+    if not isinstance(result, dict):
+        raise ValueError("action analyzer returned non-object JSON")
+    return result
+
+
 def _looks_like_remember_command(text: str) -> bool:
     lower = text.strip().lower()
     # Questions about memory / reminders to do a task are not REMEMBER saves.
     if "remind me" in lower:
+        return False
+    # "hey rmbr my name?" is recall, not a store command.
+    if _looks_like_question(text) and re.search(r"\b(remember|rmbr|recall)\b", lower):
         return False
     if re.search(
         r"\b(do you remember|did you remember|what do you remember|can you remember)\b",
@@ -254,6 +631,7 @@ def assess_memory_worthiness(
     text: str,
     history: Optional[list[dict]] = None,
     existing_facts: Optional[list[dict]] = None,
+    is_question: bool | None = None,
 ) -> dict:
     """Second tracker: should this message become long-term memory?
 
@@ -273,12 +651,25 @@ def assess_memory_worthiness(
     """
     history = history or []
     existing_facts = existing_facts or []
+    question = (
+        is_question if is_question is not None else _looks_like_question(text)
+    )
     mode = os.getenv("INTENT_MODE", "llm").lower()
 
     if mode == "rules" or mode == "mock" or _intent_backend() == "rules":
         if mode == "mock":
-            return _assess_memory_mock(text, history)
-        return _assess_memory_with_rules(text, history)
+            result = _assess_memory_mock(text, history)
+        else:
+            result = _assess_memory_with_rules(text, history)
+        if question:
+            return {
+                "important": False,
+                "ask_user": False,
+                "confidence": result.get("confidence", 0.0),
+                "priority": "low",
+                "facts": [],
+            }
+        return result
 
     try:
         result = _assess_memory_with_llm(text, history, existing_facts)
@@ -286,11 +677,20 @@ def assess_memory_worthiness(
         if not result["important"] and not result.get("ask_user"):
             rules = _assess_memory_with_rules(text, history)
             if rules.get("ask_user") and rules.get("facts"):
-                return rules
-        return result
+                result = rules
     except Exception as e:
         print(f"Memory assessor LLM failed ({e}), falling back to rules")
-        return _assess_memory_with_rules(text, history)
+        result = _assess_memory_with_rules(text, history)
+
+    if question:
+        return {
+            "important": False,
+            "ask_user": False,
+            "confidence": result.get("confidence", 0.0),
+            "priority": "low",
+            "facts": [],
+        }
+    return result
 
 
 def _json_bool(value) -> bool:
@@ -317,95 +717,214 @@ def _looks_like_question(text: str) -> bool:
     )
 
 
-def _classify_with_llm(text: str, history: list[dict]) -> dict:
-    # Prior turns are unused: llama3.2 copies the last label and then
-    # misses ordinary lookups and store requests.
+def _memory_shelf(existing_facts: list[dict]) -> str:
+    if not existing_facts:
+        return "(empty — nothing saved about this user yet)"
+    return "\n".join(
+        f"- {fact['key']}: {fact['value']}" for fact in existing_facts
+    )
+
+
+def _docs_shelf() -> str:
+    folder = Path(os.getenv("MICHELLE_DOCS_DIR", "docs"))
+    if not folder.is_dir():
+        return "(empty)"
+    names = sorted(
+        path.name
+        for path in folder.iterdir()
+        if path.suffix.lower() in {".md", ".txt", ".markdown"}
+    )
+    if not names:
+        return "(empty)"
+    return "\n".join(f"- {name}" for name in names)
+
+
+def _classify_with_llm(
+    text: str,
+    history: list[dict],
+    existing_facts: Optional[list[dict]] = None,
+) -> dict:
+    # Prior turns unused: llama3.2 copies the last label and misses this turn.
     _ = history
+    existing_facts = existing_facts or []
+    memory_shelf = _memory_shelf(existing_facts)
+    docs_shelf = _docs_shelf()
 
-    prompt = f"""Answer three independent meaning questions about THIS message only.
+    prompt = f"""You are routing one message through Michelle's library.
 
-wants_recall: true if they are asking you to recall something they already told you,
-  or their own name/prefs in memory. That is NOT a document lookup.
+Step 1 — is_question (meaning, not punctuation or wording):
+true = they want an answer.
+false = telling, greeting, acknowledging, or an order/command.
+Orders are not questions even with a "?".
 
-wants_store: true if they want future chats to keep a fact or preference they are
-  giving you now — including how you should reply, what they like, or who they are —
-  however they word that request.
-  false if they are only asking whether you already remember something.
-  false if they are asking you to do a task (email, remind, tickets).
+Step 2 — if is_question is true, SCORE the two libraries plus chat.
+Do not jump to docs because the wording looks like "what is …", or because
+one shelf is empty. An empty shelf is not a reason to pick the other one.
+Weigh which shelf the ANSWER belongs on.
 
-wants_lookup: true if they want information looked up in docs/knowledge.
-  Ordinary policy/product/procedure questions count. Made-up subjects count.
-  false for greetings, slang, opinions, tasks, recall questions, and store requests.
+Memory library (personal facts about this user):
+{memory_shelf}
+Score memory_score 0-1: the answer is about this person — identity, prefs,
+things they told her. Stay high even if that card is not filed yet.
+
+Docs library (shared knowledge files; she may write into these later):
+{docs_shelf}
+Score docs_score 0-1: the answer lives in those files (policy, product,
+handbook, company knowledge). Stay low if the question is about the user.
+
+Score chat_score 0-1: social / opinion / neither library.
+
+Pick kind as the highest of those three: REMEMBER, RETRIEVE, or CHAT.
+
+Step 2b — if is_question is false, set kind without the scores:
+  REMEMBER = keep a personal fact/pref
+  RETRIEVE = order a doc lookup
+  CHAT = greetings, small talk, acknowledgements — NEVER an order to open an app
+  ACTION = they want a task done on the computer or an external service.
+    Opening/launching ANY app is ACTION, including slang and made-up names:
+    "open Notes", "yo pull up chrome", "fire up vs code rq", "hop into discord",
+    "pls launch xyzzyqorp". Sending email is ACTION. Not a memory instruction,
+    not a doc lookup. App names are whatever they said — there is no fixed list.
+Set unused scores to 0.
 
 User message: {text}
 
 Reply with ONLY valid JSON, no markdown:
-{{"wants_recall": true|false, "wants_store": true|false, "wants_lookup": true|false, "confidence": 0.0 to 1.0}}"""
+{{"is_question": true|false, "memory_score": 0.0, "docs_score": 0.0, "chat_score": 0.0, "kind": "CHAT"|"RETRIEVE"|"REMEMBER"|"ACTION", "confidence": 0.0 to 1.0}}"""
 
     result = _llm_json(prompt)
-    recall = _json_bool(result.get("wants_recall"))
-    store = _json_bool(result.get("wants_store"))
-    lookup = _json_bool(result.get("wants_lookup"))
-    question = _looks_like_question(text)
+    is_question = _json_bool(result.get("is_question"))
+    kind = str(result.get("kind") or "").strip().upper()
 
-    # Exclusive resolve in code. Recall beats lookup; statements are not doc misses.
-    if recall:
-        intent = "CHAT"
-    elif store and lookup:
-        intent = "RETRIEVE" if question else "REMEMBER"
-    elif store:
-        intent = "REMEMBER"
-    elif lookup and question:
-        intent = "RETRIEVE"
-    else:
-        intent = "CHAT"
+    def _score(key: str) -> float:
+        try:
+            return max(0.0, min(1.0, float(result.get(key, 0) or 0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    memory_score = _score("memory_score")
+    docs_score = _score("docs_score")
+    chat_score = _score("chat_score")
+
+    # Question path: pick the winning shelf. Do not keep a raw RETRIEVE
+    # just because the model also filled kind.
+    if is_question:
+        scores = {
+            "REMEMBER": memory_score,
+            "RETRIEVE": docs_score,
+            "CHAT": chat_score,
+        }
+        best_val = max(scores.values())
+        winners = [name for name, value in scores.items() if value == best_val]
+        if best_val > 0:
+            if len(winners) == 1:
+                kind = winners[0]
+            elif kind not in winners:
+                kind = winners[0]
+        elif kind not in ("CHAT", "RETRIEVE", "REMEMBER"):
+            kind = "CHAT"
+    elif kind not in ("CHAT", "RETRIEVE", "REMEMBER", "ACTION"):
+        kind = "CHAT"
+
+    # ACTION is live (SPEC-PIPELINE §3.1): no demotion to CHAT anymore.
+    intent = kind
 
     confidence = float(result.get("confidence", 0.5))
     print(
-        f"intent_recall={recall} intent_store={store} intent_lookup={lookup} "
-        f"question={question} intent={intent}"
+        f"intent_is_question={is_question} "
+        f"memory={memory_score:.2f} docs={docs_score:.2f} chat={chat_score:.2f} "
+        f"intent_kind={kind} intent={intent}"
     )
-    return {"intent": intent, "confidence": max(0.0, min(1.0, confidence))}
+    return {
+        "intent": intent,
+        "confidence": max(0.0, min(1.0, confidence)),
+        "is_question": is_question,
+        "kind": kind,
+        "memory_score": memory_score,
+        "docs_score": docs_score,
+        "chat_score": chat_score,
+    }
 
 
 def looks_like_question(text: str) -> bool:
     return _looks_like_question(text)
 
 
-def usable_memory_facts(facts: list[dict] | None) -> list[dict]:
-    """Drop blocked/junk facts (e.g. name=Michelle) before save or yes/no."""
+def usable_memory_facts(
+    facts: list[dict] | None,
+    text: str | None = None,
+) -> list[dict]:
+    """Drop blocked/junk facts (e.g. name=Michelle) before save or yes/no.
+
+    If text is given, also drop facts the current message never mentioned
+    (stops the assessor from copying old indigo/Nate onto "all good").
+    """
     usable = []
     for fact in facts or []:
         key = str(fact.get("key") or "").strip().lower()
         value = str(fact.get("value") or "").strip()
         if not key or not value:
             continue
-        if key == "name" and value.lower() in BLOCKED_NAME_VALUES:
+        if key == "name" and not is_valid_name(value):
+            continue
+        if text is not None and not _fact_supported_by_text(fact, text):
             continue
         usable.append(fact)
     return usable
+
+
+def _fact_supported_by_text(fact: dict, text: str) -> bool:
+    """Assessor/analyzer facts must come from THIS message, not prior chat."""
+    value = str(fact.get("value") or "").strip().lower()
+    blob = (text or "").strip().lower()
+    if not value or not blob:
+        return False
+    if value in blob:
+        return True
+    tokens = [t for t in re.split(r"[^a-z0-9]+", value) if len(t) >= 4]
+    return bool(tokens) and any(token in blob for token in tokens)
 
 
 def maybe_promote_to_remember(
     intent: str,
     text: str,
     memory_result: dict,
+    is_question: bool | None = None,
 ) -> str:
     """If chat missed an explicit store, promote when the assessor already has a fact.
 
     llama3.2 often leaves wants_store false on retain-instructions. Do not promote
     questions (those are recall/lookup) and do not wait on a second analyzer call.
+    Facts must be grounded in THIS message so "all good" cannot become a store.
     """
     if intent != "CHAT":
         return intent
-    if _looks_like_question(text):
+    if is_question if is_question is not None else _looks_like_question(text):
         return intent
     if not (memory_result.get("ask_user") or memory_result.get("important")):
         return intent
-    if not usable_memory_facts(memory_result.get("facts")):
+    if not usable_memory_facts(memory_result.get("facts"), text):
         return intent
     print("intent_promoted=REMEMBER (assessor facts)")
     return "REMEMBER"
+
+
+# Deterministic ACTION detection for rules/mock modes (SPEC-PIPELINE §3.1).
+# Verbs/slang only — app names are not a closed list.
+_ACTION_OPEN_RE = re.compile(
+    rf"^{_LEADING_FILLER}{_OPEN_VERBS}(?:\s+up)?\s+\S",
+    re.IGNORECASE,
+)
+_ACTION_EMAIL_RE = re.compile(
+    rf"^{_LEADING_FILLER}"
+    r"(?:send\s+(?:an?\s+)?e-?mail\b|e-?mail\s+\S)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_action_order(text: str) -> bool:
+    stripped = (text or "").strip()
+    return bool(_ACTION_OPEN_RE.match(stripped) or _ACTION_EMAIL_RE.match(stripped))
 
 
 def _classify_with_rules(text: str) -> dict:
@@ -414,12 +933,16 @@ def _classify_with_rules(text: str) -> dict:
     if _looks_like_remember_command(text):
         return {"intent": "REMEMBER", "confidence": 0.95}
 
-    # Asking what Michelle already knows → chat (uses long-term facts), not docs.
+    # Asking what Michelle already knows → REMEMBER recall, not docs.
     if re.search(
-        r"\b(do you remember|what(?:'s| is) my name|how old am i|what(?:'s| is) my age)\b",
+        r"\b(do you remember|rmbr|what(?:'s| is) my name|how old am i|what(?:'s| is) my age)\b",
         lower,
     ):
-        return {"intent": "CHAT", "confidence": 0.85}
+        return {"intent": "REMEMBER", "confidence": 0.85}
+
+    # Orders to do a task (open an app, send an email) — even with a "?".
+    if _looks_like_action_order(text):
+        return {"intent": "ACTION", "confidence": 0.9}
 
     retrieve_starts = (
         "what is",
@@ -449,6 +972,9 @@ def _classify_with_rules(text: str) -> dict:
         return {"intent": "CHAT", "confidence": 0.9}
 
     if "?" in text:
+        # Complaints about Michelle's last reply are chat, not a doc lookup.
+        if re.match(r"^(?:hey\s+)?(?:why|whyd|how'd|howd|how come)\b", lower):
+            return {"intent": "CHAT", "confidence": 0.8}
         return {"intent": "RETRIEVE", "confidence": 0.5}
 
     return {"intent": "CHAT", "confidence": 0.5}
@@ -459,10 +985,12 @@ def _classify_mock(text: str) -> dict:
     if _looks_like_remember_command(text):
         return {"intent": "REMEMBER", "confidence": 0.95}
     if re.search(
-        r"\b(do you remember|what(?:'s| is) my name|how old am i|what(?:'s| is) my age)\b",
+        r"\b(do you remember|rmbr|what(?:'s| is) my name|how old am i|what(?:'s| is) my age)\b",
         lower,
     ):
-        return {"intent": "CHAT", "confidence": 0.9}
+        return {"intent": "REMEMBER", "confidence": 0.9}
+    if _looks_like_action_order(text):
+        return {"intent": "ACTION", "confidence": 0.9}
     if "?" in text or any(w in lower for w in ("policy", "look up", "find")):
         return {"intent": "RETRIEVE", "confidence": 0.9}
     return {"intent": "CHAT", "confidence": 0.9}
@@ -577,7 +1105,12 @@ def _normalize_fact_list(items: list, *, priority: str = "high") -> list[dict]:
         if not isinstance(item, dict):
             continue
         key = str(item.get("key", "")).strip().lower().replace(" ", "_")
-        value = str(item.get("value", "")).strip()
+        raw_value = item.get("value")
+        if raw_value is None:
+            continue
+        value = str(raw_value).strip()
+        if key == "name" and not is_valid_name(value):
+            continue
         if not key or not value or key in junk_keys:
             continue
         if value.lower() in {"short", "short value", "snake_case"}:
@@ -597,7 +1130,7 @@ def _analyze_remember_with_llm(
     context = "\n".join(f"{turn['role']}: {turn['content']}" for turn in recent)
     known = "\n".join(
         f"- {fact['key']}: {fact['value']}" for fact in existing_facts
-    ) or "(none)"
+    ) or "(no facts saved)"
 
     prompt = f"""Michelle already classified this as related to memory. Dig deeper.
 Ignore unrelated document-lookup turns in Recent conversation. Use THIS user message.
@@ -617,7 +1150,8 @@ Examples:
 - "remember what I said about your responses?" → is_question=true, mode=recall
   (matched_facts from Known, e.g. reply_style: shorter replies)
 - "keep in mind that I prefer short replies" → is_question=false, mode=store
-- "what's my name?" is usually not this path, but if seen → recall on name
+- "what's my name?" / "hey rmbr my name?" → is_question=true, mode=recall
+  If no name is in Known facts, do not invent one and do not store None/null.
 
 Known long-term facts:
 {known}
@@ -733,10 +1267,15 @@ def _normalize_memory_result(result: dict) -> dict:
         if not isinstance(item, dict):
             continue
         key = str(item.get("key", "")).strip().lower().replace(" ", "_")
-        value = str(item.get("value", "")).strip()
+        raw_value = item.get("value")
+        if raw_value is None:
+            continue
+        value = str(raw_value).strip()
         item_priority = str(item.get("priority", overall_priority)).strip().lower()
         if item_priority not in PRIORITIES:
             item_priority = overall_priority
+        if key == "name" and not is_valid_name(value):
+            continue
         if key and value:
             facts.append({"key": key, "value": value, "priority": item_priority})
 
@@ -790,7 +1329,7 @@ def _assess_memory_with_llm(
     context = "\n".join(f"{turn['role']}: {turn['content']}" for turn in recent)
     known = "\n".join(
         f"- {fact['key']}: {fact['value']}" for fact in existing_facts
-    ) or "(none)"
+    ) or "(no facts saved)"
 
     prompt = f"""You score whether this user message should enter LONG-TERM memory.
 Default to NOT saving. Most messages are temporary chat and must stay out.
@@ -817,6 +1356,10 @@ DO NOT SAVE and ask_user=false for:
 - temporary mood / weather / "I'm busy right now"
 - secrets (passwords, API keys, credit cards, SSN)
 - anything already in Known facts unless the user is clearly correcting it
+- never invent a name. If you do not know their name, omit the name fact.
+  Do not use None, null, unknown, or n/a as a name.
+- questions and acknowledgements ("all good", "ok", "hey rmbr my name?") —
+  important=false, ask_user=false, empty facts. Do not copy Known facts into facts.
 
 Known facts already saved:
 {known}
@@ -862,7 +1405,7 @@ def capture_introduced_name(text: str, history: Optional[list[dict]] = None) -> 
 
     if not candidate:
         return None
-    if candidate.lower() in BLOCKED_NAME_VALUES:
+    if not is_valid_name(candidate):
         return None
     return " ".join(part.capitalize() for part in candidate.split())
 
@@ -880,7 +1423,7 @@ def _extract_rule_facts(text: str, history: Optional[list[dict]] = None) -> list
     )
     if name_match:
         value = name_match.group(1).capitalize()
-        if value.lower() not in BLOCKED_NAME_VALUES:
+        if is_valid_name(value):
             facts.append(
                 {
                     "key": "name",
@@ -891,7 +1434,7 @@ def _extract_rule_facts(text: str, history: Optional[list[dict]] = None) -> list
     elif _assistant_just_asked_for_name(history):
         # Bare reply like "Nathan" after Michelle asked for a name.
         bare = re.fullmatch(r"([A-Za-z][A-Za-z'\-]{1,30})", stripped)
-        if bare and bare.group(1).lower() not in BLOCKED_NAME_VALUES:
+        if bare and is_valid_name(bare.group(1)):
             facts.append(
                 {
                     "key": "name",
