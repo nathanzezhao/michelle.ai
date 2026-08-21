@@ -2,17 +2,7 @@ Uses Electron to create a desktop window hosting an AI agent.
 
 Project roadmap and checklist: [ROADMAP.md](ROADMAP.md)
 
-VIDEO DEMOS:
-
-Video demo 07/02/2026:
-
-[https://github.com/user-attachments/assets/36f5f3f5-7986-40b3-92b2-21973c9dfdfb](https://github.com/user-attachments/assets/36f5f3f5-7986-40b3-92b2-21973c9dfdfb)
-
-Video demo 07/17/2026 (memory.py, intent.py, llm.py, michelle.db):
-
-[https://github.com/user-attachments/assets/201dd571-df6e-40d5-bfd9-fc0a9b7425e9](https://github.com/user-attachments/assets/201dd571-df6e-40d5-bfd9-fc0a9b7425e9)
-
-LLMs:
+## LLMs:
 
 - Ollama
   - Local backend AI **with** short-term chat memory + long-term facts + doc retrieve
@@ -66,7 +56,7 @@ This app loads `.env`, not `.env.local`. For You consumer keys (`ck_...`) are ig
 
 First-time CLI alternative: `composio login` then `composio dev init` in this repo. That writes a project key to `.env.local`; copy `COMPOSIO_API_KEY` into `.env`.
 
-### Intent modes (`.env`)
+## Intent modes (`.env`)
 
 ```
 INTENT_MODE=llm      ← default; uses the SAME model as LLM_PROVIDER (Ollama or Gemini)
