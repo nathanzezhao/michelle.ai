@@ -7,6 +7,7 @@ import pytest
 import long_term_memory
 import retrieve
 from intent import (
+    _looks_like_composer_dismiss,
     _looks_like_question,
     analyze_action_request,
     classify_intent,
@@ -43,6 +44,17 @@ def test_confirmation_no(text):
 )
 def test_confirmation_none(text):
     assert classify_memory_confirmation(text) is None
+
+
+def test_confirmation_llm_reads_typos(monkeypatch):
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(intent, "_llm_json", lambda prompt: {"answer": "yes"})
+    assert classify_memory_confirmation("yeha") == "yes"
+    monkeypatch.setattr(intent, "_llm_json", lambda prompt: {"answer": "no"})
+    assert classify_memory_confirmation("naw im good") == "no"
+    monkeypatch.setattr(intent, "_llm_json", lambda prompt: {"answer": "other"})
+    assert classify_memory_confirmation("what's the refund policy") is None
 
 
 # --- _looks_like_question ---------------------------------------------------
@@ -278,6 +290,16 @@ def test_llm_chat_label_still_promotes_open_order(monkeypatch):
             "",
             ["send an email to alex@example.com, subject hi, body hello"],
         ),
+        (
+            "send another email for me",
+            "",
+            ["send another email for me"],
+        ),
+        (
+            "you already sent that i want you to send another email",
+            "you already sent that i want you to",
+            ["send another email"],
+        ),
     ],
 )
 def test_parse_mixed_utterance(text, chat, actions):
@@ -285,3 +307,84 @@ def test_parse_mixed_utterance(text, chat, actions):
     assert parsed["chat"] == chat
     assert parsed["actions"] == actions
     assert classify_intent(text)["intent"] == "ACTION"
+
+
+def test_new_email_does_not_reuse_last_send_from_history(monkeypatch):
+    """Reload keeps the old send in the thread. A bare 'send another' must
+    not Confirm that same mail again (live log: last Gmail reused)."""
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_analyze_action_with_llm",
+        lambda *a, **k: {
+            "action_type": "send_email",
+            "resolved_params": {
+                "recipient": "nathan.ze.zhao@gmail.com",
+                "subject": "[urgent]",
+                "body": "Hey Nathan, we are behind schedule.",
+            },
+            "missing_params": [],
+            "related": True,
+            "confidence": 0.9,
+        },
+    )
+    history = [
+        {
+            "role": "user",
+            "content": (
+                "to nathan.ze.zhao@gmail.com subject [urgent] body "
+                "Hey Nathan, we are behind schedule."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "Sent the email to nathan.ze.zhao@gmail.com.",
+        },
+    ]
+    out = analyze_action_request("send another email for me", history)
+    assert out["action_type"] == "send_email"
+    assert out["resolved_params"] == {}
+    assert set(out["missing_params"]) == {"recipient", "subject", "body"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["nevermind", "never mind", "nvm", "forget it", "scratch that", "don't send"],
+)
+def test_composer_dismiss_phrases(text):
+    assert _looks_like_composer_dismiss(text)
+    out = analyze_action_request(
+        text,
+        task_context={
+            "action_type": "send_email",
+            "resolved_params": {},
+            "missing_params": ["recipient", "subject", "body"],
+        },
+    )
+    assert out["dismiss"] is True
+    assert out["related"] is False
+
+
+def test_composer_dismiss_llm_similar_phrase(monkeypatch):
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_llm_json",
+        lambda prompt: {"dismiss": True},
+    )
+    assert intent.classify_composer_dismiss("yeah I'm good on that email")
+
+
+def test_composer_followup_is_not_dismiss():
+    out = analyze_action_request(
+        "subject hi body hello",
+        task_context={
+            "action_type": "send_email",
+            "resolved_params": {"recipient": "alex"},
+            "missing_params": ["subject", "body"],
+        },
+    )
+    assert out["dismiss"] is False
+    assert out["related"] is True

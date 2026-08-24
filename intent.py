@@ -47,6 +47,20 @@ def _intent_backend() -> str:
     return "rules"
 
 
+def _intent_llm_on() -> bool:
+    mode = os.getenv("INTENT_MODE", "llm").lower()
+    return mode not in ("rules", "mock") and _intent_backend() != "rules"
+
+
+# Shared instruction for every follow-up classifier. Rules still win on
+# exact phrases; the model covers typos, slang, and figures of speech.
+_SLOPPY_REPLY_HINT = (
+    "The user types loosely: typos, slang, and figures of speech. "
+    "Read the meaning, not the spelling. yeha=yes, naw=no, nvmind=nevermind, "
+    "snd an emial=send an email, bet/for sure=yes, I'm good=abandoning."
+)
+
+
 def _strip_json_fences(raw: str) -> str:
     raw = (raw or "").strip()
     if raw.startswith("```"):
@@ -170,11 +184,7 @@ def _normalize_intent_result(result: dict, text: str) -> dict:
     return out
 
 
-def classify_memory_confirmation(text: str) -> str | None:
-    """If the user is answering Michelle's 'want me to remember that?' ask.
-
-    Returns 'yes', 'no', or None if this message is not a confirmation.
-    """
+def _confirmation_with_rules(text: str) -> str | None:
     lower = text.strip().lower().strip(".!?")
     yes = {
         "yes",
@@ -212,6 +222,81 @@ def classify_memory_confirmation(text: str) -> str | None:
     if lower in no or lower.startswith("no ") or lower.startswith("don't"):
         return "no"
     return None
+
+
+def classify_memory_confirmation(text: str) -> str | None:
+    """Yes/no for memory ask, save-draft ask, or typed reply at Confirm.
+
+    Exact phrases use rules. In INTENT_MODE=llm, anything else goes through
+    the model so typos and slang still count.
+    """
+    ruled = _confirmation_with_rules(text)
+    if ruled is not None:
+        return ruled
+    if not _intent_llm_on():
+        return None
+    try:
+        result = _llm_json(
+            f"{_SLOPPY_REPLY_HINT}\n"
+            "Michelle asked a yes/no question. Is this message yes, no, or "
+            "something else (a new topic, a question, filling a form)?\n"
+            f"User message: {text}\n"
+            'Reply with ONLY JSON: {"answer": "yes"|"no"|"other"}'
+        )
+        ans = str((result or {}).get("answer") or "").strip().lower()
+        if ans in ("yes", "no"):
+            return ans
+        return None
+    except Exception as e:
+        print(f"confirmation LLM failed ({e})")
+        return None
+
+
+_COMPOSER_DISMISS_RE = re.compile(
+    r"^\s*(?:(?:please|pls|yeah|nah|ok|okay|um+|uh)\s+)?"
+    r"(?:never\s*mind|nvm|forget\s+(?:it|that|this)|scratch\s+that|"
+    r"don'?t\s+(?:send|bother)(?:\s+it)?|do\s+not\s+send|"
+    r"cancel\s+(?:that|it|the\s+email)|not\s+now|"
+    r"stop(?:\s+that)?)"
+    r"(?:\s+(?:lol|thanks|thx|then|for\s+now))*[\s.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_composer_dismiss(text: str) -> bool:
+    """Deterministic nevermind / scratch-that — LLM covers similar phrasing."""
+    return bool(_COMPOSER_DISMISS_RE.match((text or "").strip()))
+
+
+def classify_composer_dismiss(text: str) -> bool:
+    """True when the user is abandoning the open email composer.
+
+    Obvious phrases use rules. Anything vaguer goes to the same LLM as intent
+    when INTENT_MODE=llm — no draft is stored either way.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if _looks_like_composer_dismiss(stripped):
+        return True
+    if _extract_email_params(stripped):
+        return False
+    if not _intent_llm_on():
+        return False
+    try:
+        result = _llm_json(
+            f"{_SLOPPY_REPLY_HINT}\n"
+            "The user has an email composer open. Is this message them "
+            "abandoning the email (nevermind, forget it, don't send, not now, "
+            "scratch that, I'm good, don't bother) rather than filling to / "
+            "subject / body or talking about something else?\n"
+            f"Message: {stripped}\n"
+            'Reply with ONLY JSON: {"dismiss": true|false}'
+        )
+        return bool(isinstance(result, dict) and result.get("dismiss"))
+    except Exception as e:
+        print(f"composer dismiss LLM failed ({e})")
+        return False
 
 
 def extract_remember_facts(
@@ -317,7 +402,7 @@ def analyze_action_request(
     Returns:
         {
             "action_type": whitelist key | "unsupported",
-            "resolved_params": {...},   # grounded in the message/history only
+            "resolved_params": {...},   # grounded in THIS message (+ open task)
             "missing_params": [...],    # recomputed in code from the whitelist
             "confidence": float,
             "related": bool,            # meaningful when task_context given
@@ -380,6 +465,9 @@ def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
         out["related"] = True
         if raw_type not in ACTION_WHITELIST and rules_type in ACTION_WHITELIST:
             out["action_type"] = rules_type
+    if rules.get("dismiss"):
+        out["dismiss"] = True
+        out["related"] = False
     return out
 
 
@@ -419,11 +507,21 @@ def _finalize_action_analysis(
             "related": False,
         }
 
-    grounded = _ground_action_params(raw.get("resolved_params"), text, history)
+    # This utterance only. Chat history is how the last sent email leaked
+    # back in on reload ("send an email" → Confirm the old one again).
+    grounded = _ground_action_params(raw.get("resolved_params"), text)
     resolved = {**prior_params, **grounded}
     required = ACTION_WHITELIST[action_type]["required_params"]
     resolved = {k: v for k, v in resolved.items() if k in required}
     missing = [p for p in required if not str(resolved.get(p) or "").strip()]
+
+    dismiss = False
+    if task_context and task_context.get("action_type") == "send_email":
+        dismiss = bool(raw.get("dismiss")) or _looks_like_composer_dismiss(text)
+        if dismiss and _extract_email_params(text) and not _looks_like_composer_dismiss(text):
+            dismiss = False
+        if dismiss:
+            related = False
 
     return {
         "action_type": action_type,
@@ -431,17 +529,22 @@ def _finalize_action_analysis(
         "missing_params": missing,
         "confidence": confidence,
         "related": related if task_context else True,
+        "dismiss": dismiss,
     }
 
 
-def _ground_action_params(params, text: str, history: list[dict]) -> dict:
+def _ground_action_params(params, text: str, history: Optional[list[dict]] = None) -> dict:
     """Same spirit as _fact_supported_by_text: the extractor must not invent
-    an email address, subject, or body the user never typed."""
+    an email address, subject, or body the user never typed in THIS message.
+
+    history is ignored. Prior emails live in the thread after reload; using
+    them as a grounding blob lets "send another" re-Confirm the last send.
+    An open task keeps its own fields via task_context, not via chat history.
+    """
     if not isinstance(params, dict):
         return {}
-    blob = " ".join(
-        [text or ""] + [str(turn.get("content") or "") for turn in history]
-    ).lower()
+    del history  # accepted so older call sites don't break
+    blob = (text or "").lower()
     grounded = {}
     # Full addresses actually present in the text — substring matching is not
     # enough for emails ("notalex@example.com" contains "alex@example.com",
@@ -506,6 +609,19 @@ def _clean_app_name(raw: str) -> str:
 def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
     """Regex extractor for the two v1 actions — offline QA parity (§3.2)."""
     stripped = (text or "").strip()
+
+    if (
+        task_context
+        and task_context.get("action_type") == "send_email"
+        and _looks_like_composer_dismiss(stripped)
+    ):
+        return {
+            "action_type": "send_email",
+            "resolved_params": {},
+            "confidence": 0.95,
+            "related": False,
+            "dismiss": True,
+        }
 
     open_match = _OPEN_APP_EXTRACT_RE.match(stripped)
     if open_match and _ACTION_OPEN_RE.match(stripped):
@@ -588,18 +704,24 @@ def _analyze_action_with_llm(
             f"- still missing: {json.dumps(task_context.get('missing_params') or [])}\n"
             'Set "related": true ONLY if this message supplies missing info for that '
             "task or clearly continues it. If they changed topic, related is false.\n"
+            'If they are abandoning the email (nevermind, nvm, forget it, don\'t send, '
+            "scratch that, not now, I'm good — including typos), set \"dismiss\": true "
+            "and related false.\n"
         )
 
     prompt = f"""The user gave Michelle an order to do a task. Extract the task.
+
+{_SLOPPY_REPLY_HINT}
 
 Supported action types (anything else → "unsupported"):
 {catalog}
 {task_block}
 Rules:
-- resolved_params may ONLY contain values the user actually stated in the
-  message or the recent conversation. NEVER invent an email address, subject,
-  body, or app name. If a required value was not given, list it in
-  missing_params instead.
+- resolved_params may ONLY contain values the user stated in THIS User
+  message. Do not copy to/subject/body from an earlier email in the
+  conversation. "send an email" / "send another email" with no details →
+  empty resolved_params. NEVER invent an email address, subject, body, or
+  app name. If a required value was not given, list it in missing_params.
 - "unsupported" for any task that is not exactly one of the supported types
   (booking, deleting files, reminders, browsing, etc.).
 
@@ -609,7 +731,7 @@ Recent conversation:
 User message: {text}
 
 Reply with ONLY valid JSON, no markdown:
-{{"action_type": "open_app"|"send_email"|"unsupported", "related": true|false, "resolved_params": {{}}, "missing_params": [], "confidence": 0.0 to 1.0}}"""
+{{"action_type": "open_app"|"send_email"|"unsupported", "related": true|false, "dismiss": false, "resolved_params": {{}}, "missing_params": [], "confidence": 0.0 to 1.0}}"""
 
     result = _llm_json(prompt)
     if not isinstance(result, dict):
@@ -762,6 +884,8 @@ def _classify_with_llm(
     docs_shelf = _docs_shelf()
 
     prompt = f"""You are routing one message through Michelle's library.
+
+{_SLOPPY_REPLY_HINT}
 
 Step 1 — is_question (meaning, not punctuation or wording):
 true = they want an answer.
@@ -926,9 +1050,13 @@ _ACTION_OPEN_RE = re.compile(
     rf"^{_LEADING_FILLER}{_OPEN_VERBS}(?:\s+up)?\s+\S",
     re.IGNORECASE,
 )
+# send email / send an email / send another email / send a new email /
+# or "email alex@…"
+_EMAIL_VERB = (
+    r"(?:send\s+(?:(?:an?|another|a\s+new)\s+)?e-?mail\b|e-?mail\s+\S)"
+)
 _ACTION_EMAIL_RE = re.compile(
-    rf"^{_LEADING_FILLER}"
-    r"(?:send\s+(?:an?\s+)?e-?mail\b|e-?mail\s+\S)",
+    rf"^{_LEADING_FILLER}{_EMAIL_VERB}",
     re.IGNORECASE,
 )
 
@@ -943,8 +1071,7 @@ def _clause_is_action(clause: str) -> bool:
 
 
 _ACTION_START_RE = re.compile(
-    rf"(?:{_LEADING_FILLER})(?:{_OPEN_VERBS}(?:\s+up)?\s+\S|"
-    r"(?:send\s+(?:an?\s+)?e-?mail\b|e-?mail\s+\S))",
+    rf"(?:{_LEADING_FILLER})(?:{_OPEN_VERBS}(?:\s+up)?\s+\S|{_EMAIL_VERB})",
     re.IGNORECASE,
 )
 _TRAILING_CONNECTOR_RE = re.compile(
@@ -1184,6 +1311,7 @@ def _analyze_remember_with_llm(
     ) or "(no facts saved)"
 
     prompt = f"""Michelle already classified this as related to memory. Dig deeper.
+{_SLOPPY_REPLY_HINT}
 Ignore unrelated document-lookup turns in Recent conversation. Use THIS user message.
 
 Step 1 — is_question: true if the user is asking / checking whether you remember
@@ -1383,6 +1511,7 @@ def _assess_memory_with_llm(
     ) or "(no facts saved)"
 
     prompt = f"""You score whether this user message should enter LONG-TERM memory.
+{_SLOPPY_REPLY_HINT}
 Default to NOT saving. Most messages are temporary chat and must stay out.
 
 Priority levels (pick one overall priority for the message):
@@ -1453,6 +1582,21 @@ def capture_introduced_name(text: str, history: Optional[list[dict]] = None) -> 
     else:
         bare = re.fullmatch(r"([A-Za-z][A-Za-z'\-]{1,30})", stripped)
         candidate = bare.group(1) if bare else None
+
+    if not candidate and _intent_llm_on():
+        try:
+            result = _llm_json(
+                f"{_SLOPPY_REPLY_HINT}\n"
+                "Michelle just asked for the user's name. Extract the name "
+                "they are giving. If they are not giving a name, use null.\n"
+                f"User message: {stripped}\n"
+                'Reply with ONLY JSON: {"name": "Nathan"|null}'
+            )
+            raw = (result or {}).get("name")
+            if raw:
+                candidate = str(raw).strip().split()[0]
+        except Exception as e:
+            print(f"name capture LLM failed ({e})")
 
     if not candidate:
         return None

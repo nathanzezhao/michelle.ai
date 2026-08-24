@@ -215,6 +215,25 @@ def test_grounding_rejects_lookalike_substring_address():
     assert grounded == {}
 
 
+def test_grounding_ignores_prior_email_in_history():
+    history = [
+        {
+            "role": "user",
+            "content": "to alex@example.com subject hi body hello",
+        }
+    ]
+    grounded = intent._ground_action_params(
+        {
+            "recipient": "alex@example.com",
+            "subject": "hi",
+            "body": "hello",
+        },
+        "send another email",
+        history,
+    )
+    assert grounded == {}
+
+
 # --- Probe 4: cross-user confirm ----------------------------------------------
 
 

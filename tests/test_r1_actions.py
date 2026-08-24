@@ -563,6 +563,31 @@ def test_cancel_never_executes(client, ids, fake_composio):
     assert fetch_row(body["task_id"])["status"] == "CANCELLED"
 
 
+def test_send_another_after_cancel_starts_blank(client, ids, fake_composio):
+    """After Cancel, 'send another email' is a new draft — not the cancelled one."""
+    body = make_pending_email(client, ids)
+    confirm(client, ids, body["task_id"], "cancel")
+    nxt = chat(client, "send another email for me", ids)
+    assert nxt["engine"] == "action"
+    assert nxt["action_type"] == "send_email"
+    assert nxt["task_id"] != body["task_id"]
+    assert nxt["task_status"] == "AWAITING_INPUT"
+    assert nxt["resolved_params"] == {}
+    assert set(nxt["missing_params"]) == {"recipient", "subject", "body"}
+    assert fake_composio.calls == []
+
+
+def test_send_another_after_success_starts_blank(client, ids, fake_composio):
+    """Same conversation after a real send (reload case): don't re-offer it."""
+    body = make_pending_email(client, ids)
+    confirm(client, ids, body["task_id"], "confirm")
+    nxt = chat(client, "send an email for me", ids)
+    assert nxt["engine"] == "action"
+    assert nxt["task_status"] == "AWAITING_INPUT"
+    assert nxt["resolved_params"] == {}
+    assert nxt["task_id"] != body["task_id"]
+
+
 # --- Criterion 8: stale/invalid confirms are graceful, no state change -------
 
 
@@ -663,6 +688,30 @@ def test_yes_with_action_and_memory_both_pending(client, ids, fake_composio):
 
 
 # --- Criterion 11: unrelated message cancels the open action quietly ---------
+
+
+def test_nevermind_dismisses_composer_and_asks_to_save_draft(client, ids):
+    body = chat(client, "send an email", ids)
+    assert body["task_status"] == "AWAITING_INPUT"
+
+    out = chat(client, "nevermind", ids)
+    assert out["asked_to_save_draft"] is True
+    assert out["answer"] == main.SAVE_DRAFT_ASK
+    assert_no_task_fields(out)
+    assert fetch_row(body["task_id"])["status"] == "CANCELLED"
+
+    yes = chat(client, "yes", ids)
+    assert yes["answer"] == main.SAVE_DRAFT_YES_REPLY
+    assert yes.get("asked_to_save_draft") is False
+    assert_no_task_fields(yes)
+
+
+def test_nevermind_save_draft_no(client, ids):
+    chat(client, "send an email", ids)
+    chat(client, "nvm", ids)
+    out = chat(client, "no", ids)
+    assert out["answer"] == main.SAVE_DRAFT_NO_REPLY
+    assert_no_task_fields(out)
 
 
 def test_awaiting_input_unrelated_message_drops(client, ids):

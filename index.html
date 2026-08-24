@@ -937,7 +937,6 @@ function handleSend() {
   }
 
   removeActionButtons();
-  removeComposer();
 
   addBubble(userText, 'user');
   inputBox.value = '';
@@ -971,7 +970,11 @@ function handleSend() {
         let botReply = data.answer;
         revealScramble(botBubble, botReply);
         attachConfirmButtons(botBubble, data);
-        attachComposer(botBubble, data);
+        if (data.asked_to_save_draft || data.task_status !== "AWAITING_INPUT") {
+          removeComposer();
+        } else {
+          attachComposer(botBubble, data);
+        }
       }, 1200);
     })
 

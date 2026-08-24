@@ -13,6 +13,7 @@ from intent import (
     analyze_remember_request,
     assess_memory_worthiness,
     capture_introduced_name,
+    classify_composer_dismiss,
     classify_intent,
     classify_memory_confirmation,
     maybe_promote_to_remember,
@@ -115,6 +116,12 @@ UNSUPPORTED_ACTION_REPLY = (
     "that's about it."
 )
 USE_BUTTONS_REPLY = "Use the Confirm or Cancel buttons below to send or cancel it."
+SAVE_DRAFT_ASK = "Want to save that draft?"
+SAVE_DRAFT_YES_REPLY = "Can't stash drafts yet — I'll just drop it."
+SAVE_DRAFT_NO_REPLY = "All good — it's gone."
+
+# In-memory only. No draft body is stored — yes just acknowledges the ask.
+_pending_draft_asks: set[tuple[str, str]] = set()
 
 _MISSING_PARAM_WORDS = {
     "app_name": "which app to open",
@@ -447,6 +454,37 @@ def handle_chat(incoming_data: UserMessage):
             )
             long_term_facts = long_term_memory.get_facts(user_id)
 
+        draft_key = (user_id, conversation_id)
+        if draft_key in _pending_draft_asks:
+            confirmation = classify_memory_confirmation(user_text)
+            if confirmation == "yes":
+                _pending_draft_asks.discard(draft_key)
+                save_message(conversation_id, "user", user_text)
+                save_message(conversation_id, "assistant", SAVE_DRAFT_YES_REPLY)
+                return {
+                    "answer": SAVE_DRAFT_YES_REPLY,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "intent": "CHAT",
+                    "remembered": [],
+                    "asked_to_save_draft": False,
+                    "engine": "chat",
+                }
+            if confirmation == "no":
+                _pending_draft_asks.discard(draft_key)
+                save_message(conversation_id, "user", user_text)
+                save_message(conversation_id, "assistant", SAVE_DRAFT_NO_REPLY)
+                return {
+                    "answer": SAVE_DRAFT_NO_REPLY,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "intent": "CHAT",
+                    "remembered": [],
+                    "asked_to_save_draft": False,
+                    "engine": "chat",
+                }
+            _pending_draft_asks.discard(draft_key)
+
         # If Michelle asked "want me to remember that?", handle yes/no first.
         if pending:
             confirmation = classify_memory_confirmation(user_text)
@@ -611,6 +649,41 @@ def handle_chat(incoming_data: UserMessage):
                 analysis = analyze_action_request(
                     user_text, reply_history, task_context=open_action
                 )
+                dismissed = bool(analysis.get("dismiss"))
+                if (
+                    not dismissed
+                    and open_action["action_type"] == "send_email"
+                    and not analysis.get("related")
+                    and classify_composer_dismiss(user_text)
+                ):
+                    dismissed = True
+                if (
+                    dismissed
+                    and open_action["action_type"] == "send_email"
+                ):
+                    actions.cancel_action(open_action["action_id"])
+                    _pending_draft_asks.add((user_id, conversation_id))
+                    save_message(conversation_id, "user", user_text, kind="action")
+                    save_message(
+                        conversation_id, "assistant", SAVE_DRAFT_ASK, kind="action"
+                    )
+                    print(
+                        f"[{provider}] [{conversation_id[:8]}] "
+                        f"action {open_action['action_id'][:8]} dismissed → "
+                        "save-draft ask"
+                    )
+                    return {
+                        "answer": SAVE_DRAFT_ASK,
+                        "conversation_id": conversation_id,
+                        "user_id": user_id,
+                        "intent": "CHAT",
+                        "is_question": False,
+                        "kind": "CHAT",
+                        "remembered": [],
+                        "asked_to_remember": False,
+                        "asked_to_save_draft": True,
+                        "engine": "chat",
+                    }
                 if (
                     analysis.get("related")
                     and analysis["action_type"] == open_action["action_type"]
