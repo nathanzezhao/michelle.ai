@@ -289,11 +289,62 @@ def _ask_mock(
     )
 
 
+# Voice/tap email body: not Michelle, not memory, not a chat reply.
+EMAIL_BODY_POLISH_SYSTEM = (
+    "You are a grammar editor for an email body. "
+    "You are not a chatbot and you are not Michelle. "
+    "Do not use any memory, database, names, or facts about anyone. "
+    "If the text includes a name, keep it as part of the email — "
+    "do not say you already know them. "
+    "Do not summarize. Do not reply to the speaker. Do not greet them. "
+    "Keep their words and meaning. Fix grammar, punctuation, and fillers "
+    "(um, uh, like). Fill only tiny missing words in between. "
+    "Output the email body only — no subject line, no markdown, no preface."
+)
+
+
+def polish_email_body(source: str) -> str:
+    """Clean a transcript or draft. No chat history, no long-term facts."""
+    source = (source or "").strip()
+    if not source:
+        raise RuntimeError("nothing to polish")
+    provider = os.getenv("LLM_PROVIDER", "mock").lower()
+    if provider == "mock":
+        return source
+    wrapped = (
+        "Clean the email body between the lines. Keep the speaker's words "
+        "and meaning. Fix grammar, punctuation, and fillers only. "
+        "Do not answer them. Do not add a greeting or sign-off they did not say.\n"
+        "-----\n"
+        f"{source}\n"
+        "-----\n"
+        "Output the cleaned body only."
+    )
+    if provider == "ollama":
+        return _ask_ollama(
+            wrapped,
+            [],
+            [],
+            system_prompt=EMAIL_BODY_POLISH_SYSTEM,
+            temperature=0.0,
+        )
+    if provider == "gemini":
+        return _ask_gemini(
+            wrapped,
+            [],
+            [],
+            system_prompt=EMAIL_BODY_POLISH_SYSTEM,
+            temperature=0.0,
+        )
+    raise ValueError(f"Unknown LLM_PROVIDER: {provider}. Use mock, ollama, or gemini.")
+
+
 def _ask_ollama(
     prompt: str,
     history: list[dict],
     long_term_facts: list[dict],
     system_prompt: Optional[str] = None,
+    temperature: Optional[float] = None,
 ) -> str:
     model = os.getenv("OLLAMA_MODEL", "llama3.2")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
@@ -307,9 +358,13 @@ def _ask_ollama(
     messages += [{"role": turn["role"], "content": turn["content"]} for turn in history]
     messages.append({"role": "user", "content": prompt})
 
+    payload = {"model": model, "messages": messages, "stream": False}
+    if temperature is not None:
+        payload["options"] = {"temperature": temperature}
+
     response = httpx.post(
         f"{base_url}/api/chat",
-        json={"model": model, "messages": messages, "stream": False},
+        json=payload,
         timeout=300.0,
     )
     response.raise_for_status()
@@ -324,6 +379,7 @@ def _ask_gemini(
     history: list[dict],
     long_term_facts: list[dict],
     system_prompt: Optional[str] = None,
+    temperature: Optional[float] = None,
 ) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -340,12 +396,16 @@ def _ask_gemini(
         contents.append({"role": role, "parts": [{"text": turn["content"]}]})
     contents.append({"role": "user", "parts": [{"text": prompt}]})
 
+    config_kwargs = {
+        "system_instruction": system_prompt or _build_system_prompt(long_term_facts),
+    }
+    if temperature is not None:
+        config_kwargs["temperature"] = temperature
+
     response = client.models.generate_content(
         model=model,
         contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt or _build_system_prompt(long_term_facts),
-        ),
+        config=types.GenerateContentConfig(**config_kwargs),
     )
     text = (response.text or "").strip()
     if not text:

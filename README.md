@@ -31,7 +31,15 @@ Project roadmap and checklist: [ROADMAP.md](ROADMAP.md)
   - `open_app` — runs now (`open -a` on macOS)
   - `send_email` — glass composer (to / subject / body, urgent, attach, generate body) then **Confirm / Cancel**. Sent via Composio Gmail. Everything else is refused. Every attempt is audited in `actions_log`.
 
-Say *send an email* (even without the details). Michelle asks for what’s missing and the composer drops under her message. Fill it, press **Send** with the chat box empty (or Enter in the body), then Confirm. Files and generate sit in the same bottom bar as Send.
+Say *send an email* (even without the details). Michelle asks for what’s missing and the composer drops under her message. Fill it, press **Send** with the chat box empty (or Enter in the body), then Confirm. Send posts the fields as an email draft — it does not run the body through chat, intent, or memory. Files and generate sit in the same bottom bar as Send.
+
+**Tap — microphone.** Tap **tap** to record the body; tap again to stop. Whisper transcribes what you said, then the LLM only fixes grammar and fillers — it does not chat as Michelle, does not read long-term memory, and does not rewrite the letter. Voice is body-only: it never sends mail. **Confirm** is still required.
+
+On first hold, macOS may ask for the microphone. That press does not send (and does not tap-draft). Allow, then hold again.
+
+Local Whisper `base` runs in the same venv as `b`. First download is a few hundred MB; later holds reuse the cache. Set `WHISPER_MODEL` in `.env` (default `base`). On CPU it uses `int8` (`WHISPER_COMPUTE_TYPE`) so you should not see a float16 warning. Install `faster-whisper` into that venv (`pip install -r requirements.txt` after `source venv/bin/activate`). Restart `f` after `index.html` or `main.js` changes (Electron does not hot-reload).
+
+Do not put specs or runbooks in [`docs/`](docs/) — that folder is Michelle’s RAG KB.
 
 With `INTENT_MODE=llm`, REMEMBER is meaning-based (“keep in mind”, “don’t forget”, “note that…”, etc.), not only the words “remember this”.
 
@@ -101,10 +109,10 @@ A fresh git clone has no `michelle.db`, so it’s already clean.
 
 ## UI
 
-- Run `f` in terminal to start Electron. Restart `f` after `index.html` changes (the backend `b` hot-reloads; Electron does not).
+- Run `f` in terminal to start Electron. Restart `f` after `index.html` or `main.js` changes (the backend `b` hot-reloads; Electron does not).
 
 Click top left square → Collapse animation → Square into circle  
 
 Click floating circle → Expand animation
 
-Email composer: to / subject / body in the chat card; **files** and **generate** stay pinned above Send (same bottom bar, same size). Chat history in that pane scrolls. Confirm / Cancel still appear once the draft is complete.
+Email composer: to / subject / body in the chat card; **files**, **undo**, and **tap** (mic) stay pinned above Send. Tap the mic to record the body, tap again to stop. Chat history in that pane scrolls. Confirm / Cancel still appear once the draft is complete.

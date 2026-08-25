@@ -245,6 +245,43 @@ def test_llm_open_app_label_does_not_steal_email(monkeypatch):
     assert analysis["missing_params"] == []
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "send an emauil for me",
+        "send an emial for me",
+        "send an emaill for me",
+        "send an emal for me",
+    ],
+)
+def test_email_typos_are_send_email_not_chat_or_open_app(text):
+    """Live log: 'send an emauil for me' → open_app."""
+    assert parse_mixed_utterance(text)["actions"]
+    assert classify_intent(text)["intent"] == "ACTION"
+    analysis = analyze_action_request(text)
+    assert analysis["action_type"] == "send_email"
+    assert analysis["missing_params"] == ["recipient", "subject", "body"]
+
+
+def test_llm_open_app_label_does_not_steal_email_typo(monkeypatch):
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_analyze_action_with_llm",
+        lambda *a, **k: {
+            "action_type": "open_app",
+            "resolved_params": {},
+            "missing_params": ["app_name"],
+            "related": True,
+            "confidence": 0.95,
+        },
+    )
+    analysis = analyze_action_request("send an emauil for me")
+    assert analysis["action_type"] == "send_email"
+    assert "app_name" not in analysis["resolved_params"]
+
+
 def test_llm_chat_label_still_promotes_open_order(monkeypatch):
     """Live bug: llama3.2 returned kind=CHAT for 'open Notes'."""
     monkeypatch.setenv("INTENT_MODE", "llm")
@@ -300,13 +337,28 @@ def test_llm_chat_label_still_promotes_open_order(monkeypatch):
             "you already sent that i want you to",
             ["send another email"],
         ),
+        (
+            "to alex@example.com subject Project body sorry - email feature. "
+            "And this email is being said right now",
+            "to alex@example.com subject Project body sorry - email feature. "
+            "And this email is being said right now",
+            [],
+        ),
     ],
 )
 def test_parse_mixed_utterance(text, chat, actions):
     parsed = parse_mixed_utterance(text)
     assert parsed["chat"] == chat
     assert parsed["actions"] == actions
-    assert classify_intent(text)["intent"] == "ACTION"
+    if actions:
+        assert classify_intent(text)["intent"] == "ACTION"
+
+
+def test_email_word_in_prose_is_not_an_action_order():
+    text = "I'm using the email feature and this email is being said out loud."
+    parsed = parse_mixed_utterance(text)
+    assert parsed["actions"] == []
+    assert classify_intent(text)["intent"] != "ACTION"
 
 
 def test_new_email_does_not_reuse_last_send_from_history(monkeypatch):
@@ -388,3 +440,40 @@ def test_composer_followup_is_not_dismiss():
     )
     assert out["dismiss"] is False
     assert out["related"] is True
+
+
+def test_polish_email_body_mock_keeps_words():
+    import llm
+
+    spoken = "Hi my names Nathan thanks for lunch"
+    assert llm.polish_email_body(spoken) == spoken
+
+
+def test_polish_email_body_ollama_is_not_michelle_and_skips_memory(monkeypatch):
+    import llm
+
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"message": {"content": "Hi, my name is Nathan."}}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        return FakeResp()
+
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    out = llm.polish_email_body("Hi my names Nathan")
+    assert out == "Hi, my name is Nathan."
+    messages = captured["json"]["messages"]
+    system = messages[0]["content"]
+    assert messages[0]["role"] == "system"
+    assert "You are Michelle" not in system
+    assert "grammar editor" in system
+    assert len(messages) == 2
+    assert captured["json"]["options"]["temperature"] == 0.0
+    assert "Hi my names Nathan" in messages[1]["content"]

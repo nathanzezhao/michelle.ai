@@ -33,9 +33,11 @@ Coverage map (§13 criterion → tests):
        and criterion-4 tests (near-miss leaves no row)
 """
 
+import io
 import json
 import sqlite3
 import types
+import wave
 from uuid import uuid4
 
 import pytest
@@ -44,7 +46,11 @@ import actions
 import intent
 import long_term_memory
 import main
+import memory
+import whisper
 from conftest import chat
+
+_REAL_TRANSCRIBE = whisper.transcribe_wav
 
 GENERIC_ERROR = (
     "Sorry, I am having some trouble with this right now. Please try again later."
@@ -155,6 +161,17 @@ def _no_real_side_effects(monkeypatch):
 
     monkeypatch.setattr(actions.subprocess, "run", _blocked)
     monkeypatch.delenv("COMPOSIO_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_whisper(monkeypatch):
+    """CI must never download a Whisper model. JSON tests don't call
+    transcribe_wav; audio tests replace this with an explicit fake."""
+
+    def _blocked(*args, **kwargs):
+        raise AssertionError("real whisper.transcribe_wav reached during tests")
+
+    monkeypatch.setattr(whisper, "transcribe_wav", _blocked)
 
 
 @pytest.fixture
@@ -501,6 +518,77 @@ def test_composer_style_followup_goes_pending(client, ids):
     assert follow["resolved_params"]["body"] == "hello"
 
 
+COMPOSER_SPOKEN_BODY = (
+    "Hey Dad, send an email for me and remember my name is Nathan. "
+    "nevermind. sorry - email feature. And this email is being said "
+    "right now because I added voice input."
+)
+
+
+def test_submit_draft_keeps_spoken_body_off_chat_intent(client, ids, monkeypatch):
+    """Composer Send is not /chat. The body is opaque, even if it looks like
+    orders, memory, or nevermind."""
+    first = chat(client, "send an email", ids)
+    assert first["task_status"] == "AWAITING_INPUT"
+
+    def boom(*args, **kwargs):
+        raise AssertionError("submit_draft must not run chat / memory / intent")
+
+    monkeypatch.setattr(main, "classify_intent", boom)
+    monkeypatch.setattr(main, "ask_llm", boom)
+    monkeypatch.setattr(long_term_memory, "get_facts", boom)
+    monkeypatch.setattr(intent, "parse_mixed_utterance", boom)
+
+    resp = client.post(
+        "/action/submit_draft",
+        json={
+            "recipient": "alex@example.com",
+            "subject": "Project",
+            "body": COMPOSER_SPOKEN_BODY,
+            **ids,
+        },
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert "dropped" not in out["answer"].lower()
+    assert out.get("asked_to_save_draft") is not True
+    assert out["task_id"] == first["task_id"]
+    assert out["task_status"] == "PENDING"
+    assert out["resolved_params"]["body"] == COMPOSER_SPOKEN_BODY
+    assert len(action_rows(ids)) == 1
+    hist = memory.get_history(ids["conversation_id"], limit=50)
+    user_turns = [t["content"] for t in hist if t["role"] == "user"]
+    assert COMPOSER_SPOKEN_BODY not in user_turns
+    assert "Composer send." in user_turns
+
+
+def test_submit_draft_without_open_composer_does_not_create_email(client, ids):
+    resp = client.post(
+        "/action/submit_draft",
+        json={
+            "recipient": "alex@example.com",
+            "subject": "hi",
+            "body": "send an email to alex@example.com subject hi body hello",
+            **ids,
+        },
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["task_id"] is None
+    assert action_rows(ids) == []
+
+
+def _silence_wav(duration_s=1.0, rate=16000):
+    frames = int(rate * duration_s)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(b"\x00\x00" * frames)
+    return buf.getvalue()
+
+
 def test_draft_body_does_not_mutate_open_action(client, ids):
     body = chat(client, "send an email", ids)
     before = fetch_row(body["task_id"])
@@ -515,6 +603,263 @@ def test_draft_body_does_not_mutate_open_action(client, ids):
     assert resp.status_code == 200
     assert isinstance(resp.json().get("body"), str)
     assert fetch_row(body["task_id"]) == before
+
+
+def test_draft_body_json_transcript_fills_body_no_action_mutation(client, ids, monkeypatch):
+    body = chat(client, "send an email", ids)
+    before = fetch_row(body["task_id"])
+    spoken = "Please let Alex know I will be about twenty minutes late tonight."
+    monkeypatch.setattr(main, "polish_email_body", lambda source: "I'll be about twenty minutes late.")
+    resp = client.post(
+        "/action/draft_body",
+        json={
+            "recipient": "alex@example.com",
+            "subject": "running late",
+            "transcript": spoken,
+            "body_from_user": True,
+            **ids,
+        },
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["error"] is None
+    assert out["body"] == "I'll be about twenty minutes late."
+    assert out["transcript"] == spoken
+    assert fetch_row(body["task_id"]) == before
+
+
+def test_draft_body_junk_transcript_skips_llm_and_does_not_blank(client, ids, monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("polish_email_body must not run for junk transcripts")
+
+    monkeypatch.setattr(main, "polish_email_body", boom)
+    resp = client.post(
+        "/action/draft_body",
+        json={
+            "recipient": "alex@example.com",
+            "subject": "hi",
+            "body": "please leave this typed draft alone",
+            "transcript": "thank you",
+            **ids,
+        },
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["error"] == "heard_nothing"
+    assert out["body"] is None
+    assert out["body"] != ""
+    assert out["transcript"] == "thank you"
+
+
+def test_draft_body_speech_ignores_tap_leftover_when_not_from_user(client, ids, monkeypatch):
+    leftover = "GENERIC TAP FLUFF about quarterly synergetic alignment"
+    spoken = "Please tell Alex I will bring dessert to dinner on Friday night."
+    captured = {}
+
+    def capture(source):
+        captured["prompt"] = source
+        return "I'll bring dessert Friday."
+
+    monkeypatch.setattr(main, "polish_email_body", capture)
+    resp = client.post(
+        "/action/draft_body",
+        json={
+            "recipient": "alex@example.com",
+            "subject": "dinner",
+            "body": leftover,
+            "body_from_user": False,
+            "transcript": spoken,
+            **ids,
+        },
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["error"] is None
+    assert out["body"] == "I'll bring dessert Friday."
+    prompt = captured["prompt"]
+    assert spoken in prompt
+    assert leftover not in prompt
+
+
+def test_draft_body_multipart_audio_speech_wins_over_tap_body(client, ids, monkeypatch):
+    leftover = "GENERIC TAP FLUFF leftover from generate"
+    spoken = "Please tell Alex the meeting moved to Thursday afternoon this week."
+    captured = {}
+
+    monkeypatch.setattr(whisper, "transcribe_wav", lambda b: spoken)
+
+    def capture(source):
+        captured["prompt"] = source
+        return "Meeting moved to Thursday afternoon."
+
+    monkeypatch.setattr(main, "polish_email_body", capture)
+    resp = client.post(
+        "/action/draft_body",
+        data={
+            "recipient": "alex@example.com",
+            "subject": "meeting",
+            "body": leftover,
+            "body_from_user": "false",
+            **ids,
+        },
+        files={"audio": ("clip.wav", _silence_wav(1.0), "audio/wav")},
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["error"] is None
+    assert out["body"] == "Meeting moved to Thursday afternoon."
+    assert out["transcript"] == spoken
+    assert leftover not in captured["prompt"]
+    assert spoken in captured["prompt"]
+
+
+def test_draft_body_spoken_does_not_read_long_term_facts(client, ids, monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("draft_body must not read long_term_facts")
+
+    monkeypatch.setattr(long_term_memory, "get_facts", boom)
+    monkeypatch.setattr(main, "polish_email_body", lambda source: source)
+    resp = client.post(
+        "/action/draft_body",
+        json={
+            "recipient": "alex@example.com",
+            "subject": "hi",
+            "transcript": "Hi my name is Nathan I wanted to say thanks for lunch.",
+            "body_from_user": True,
+            **ids,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["error"] is None
+    assert "Hi my name is Nathan" in resp.json()["body"]
+
+
+def test_draft_body_does_not_call_chat_ask_llm(client, ids, monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("draft_body must not use the Michelle chat LLM")
+
+    monkeypatch.setattr(main, "ask_llm", boom)
+    monkeypatch.setattr(main, "polish_email_body", lambda source: source)
+    resp = client.post(
+        "/action/draft_body",
+        json={
+            "recipient": "alex@example.com",
+            "subject": "hi",
+            "transcript": "Hi my name is Nathan thanks for lunch yesterday.",
+            **ids,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["error"] is None
+
+
+def test_draft_body_whisper_busy_does_not_call_llm(client, ids, monkeypatch):
+    def busy(_wav):
+        raise whisper.WhisperBusy("busy")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("polish_email_body must not run when whisper is busy")
+
+    monkeypatch.setattr(whisper, "transcribe_wav", busy)
+    monkeypatch.setattr(main, "polish_email_body", boom)
+    resp = client.post(
+        "/action/draft_body",
+        data={"recipient": "alex@example.com", "subject": "hi", **ids},
+        files={"audio": ("clip.wav", _silence_wav(1.0), "audio/wav")},
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["error"] == "busy"
+    assert out["body"] is None
+
+
+def test_draft_body_whisper_downloading_does_not_call_llm(client, ids, monkeypatch):
+    def downloading(_wav):
+        raise whisper.WhisperDownloading("downloading")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("polish_email_body must not run while the model downloads")
+
+    monkeypatch.setattr(whisper, "transcribe_wav", downloading)
+    monkeypatch.setattr(main, "polish_email_body", boom)
+    resp = client.post(
+        "/action/draft_body",
+        data={"recipient": "alex@example.com", "subject": "hi", **ids},
+        files={"audio": ("clip.wav", _silence_wav(1.0), "audio/wav")},
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["error"] == "downloading"
+    assert out["body"] is None
+
+
+def test_draft_body_short_audio_is_heard_nothing(client, ids, monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("polish_email_body must not run for too-short audio")
+
+    monkeypatch.setattr(main, "polish_email_body", boom)
+    resp = client.post(
+        "/action/draft_body",
+        data={
+            "recipient": "alex@example.com",
+            "subject": "hi",
+            "body": "typed already",
+            "body_from_user": "true",
+            **ids,
+        },
+        files={"audio": ("clip.wav", _silence_wav(0.2), "audio/wav")},
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["error"] == "heard_nothing"
+    assert out["body"] is None
+
+
+def test_draft_body_llm_fail_is_draft_failed_not_empty_string(client, ids, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr(main, "polish_email_body", boom)
+    resp = client.post(
+        "/action/draft_body",
+        json={"recipient": "alex@example.com", "subject": "hi", **ids},
+    )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["error"] == "draft_failed"
+    assert out["body"] is None
+    assert out["body"] != ""
+
+
+def test_is_junk_transcript_gates_silence_and_thanks():
+    assert whisper.is_junk_transcript("")
+    assert whisper.is_junk_transcript(".")
+    assert whisper.is_junk_transcript("thank you")
+    assert whisper.is_junk_transcript("hi there")  # < 4 words
+    assert not whisper.is_junk_transcript(
+        "Please let Alex know I will be late to dinner."
+    )
+
+
+def test_transcribe_wav_missing_never_invents_text(monkeypatch):
+    monkeypatch.setattr(whisper, "_WhisperModel", None)
+    with pytest.raises(whisper.WhisperMissing):
+        _REAL_TRANSCRIBE(b"not-a-wav")
+
+
+def test_transcribe_wav_busy_and_downloading_do_not_block(monkeypatch):
+    monkeypatch.setattr(whisper, "_WhisperModel", object)
+    assert whisper._lock.acquire(blocking=False)
+    try:
+        whisper._loading = True
+        with pytest.raises(whisper.WhisperDownloading):
+            _REAL_TRANSCRIBE(b"xx")
+        whisper._loading = False
+        with pytest.raises(whisper.WhisperBusy):
+            _REAL_TRANSCRIBE(b"xx")
+    finally:
+        whisper._loading = False
+        whisper._lock.release()
 
 
 def test_attachments_ride_along_on_email_confirm(client, ids, fake_composio, tmp_path):

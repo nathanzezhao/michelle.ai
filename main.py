@@ -1,9 +1,10 @@
+import asyncio
 import os
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from uuid import UUID, uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -20,10 +21,16 @@ from intent import (
     parse_mixed_utterance,
     usable_memory_facts,
 )
-from llm import ask_llm, ask_llm_with_context, history_for_reply
+from llm import (
+    ask_llm,
+    ask_llm_with_context,
+    history_for_reply,
+    polish_email_body,
+)
 import long_term_memory
 from memory import get_history, init_db, save_message
 import retrieve
+import whisper
 
 load_dotenv()
 init_db()
@@ -60,8 +67,28 @@ class UserMessage(BaseModel):
 class DraftBodyRequest(BaseModel):
     recipient: str = ""
     subject: str = ""
+    body: str = ""
+    body_from_user: bool = True
+    transcript: Optional[str] = None
     conversation_id: Optional[str] = None
     user_id: Optional[str] = None
+
+
+class DraftBodyResponse(BaseModel):
+    body: Optional[str] = None
+    transcript: Optional[str] = None
+    error: Optional[str] = None
+
+
+class SubmitDraftRequest(BaseModel):
+    """Composer Send. Opaque fields — never run through /chat or the classifier."""
+
+    recipient: str = ""
+    subject: str = ""
+    body: str = ""
+    conversation_id: Optional[str] = None
+    user_id: Optional[str] = None
+    attachments: Optional[List[str]] = None
 
 
 class SessionStart(BaseModel):
@@ -910,28 +937,241 @@ def handle_chat(incoming_data: UserMessage):
         }
 
 
-@app.post("/action/draft_body")
-def draft_body(incoming_data: DraftBodyRequest):
-    """Fill the composer body without touching actions_log or /chat."""
-    user_id = _valid_uuid(incoming_data.user_id)
-    recipient = (incoming_data.recipient or "").strip()
-    subject = (incoming_data.subject or "").strip()
-    prompt = (
-        "Write only the body of a short email. No subject line, no markdown, "
-        "no 'Subject:' prefix. 2 to 6 sentences.\n"
-        f"To: {recipient or '(not given)'}\n"
-        f"Subject: {subject or '(not given)'}"
+def _draft_ok(body: str, transcript: Optional[str] = None) -> dict:
+    return {"body": body, "transcript": transcript, "error": None}
+
+
+def _draft_err(code: str, transcript: Optional[str] = None) -> dict:
+    return {"body": None, "transcript": transcript, "error": code}
+
+
+def _form_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _form_opt(value) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _as_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"", "null"}:
+        return default
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+async def _parse_draft_body_request(
+    request: Request,
+) -> Tuple[DraftBodyRequest, Optional[bytes]]:
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        audio_bytes = None
+        audio = form.get("audio")
+        if audio is not None and hasattr(audio, "read"):
+            audio_bytes = await audio.read()
+            if not audio_bytes:
+                audio_bytes = None
+        incoming = DraftBodyRequest(
+            recipient=_form_text(form.get("recipient")),
+            subject=_form_text(form.get("subject")),
+            body=_form_text(form.get("body")),
+            body_from_user=_as_bool(form.get("body_from_user"), default=True),
+            transcript=_form_opt(form.get("transcript")),
+            conversation_id=_form_opt(form.get("conversation_id")),
+            user_id=_form_opt(form.get("user_id")),
+        )
+        # Empty string on the transcript field still means "spoken pass".
+        if "transcript" in form and incoming.transcript is None:
+            incoming.transcript = ""
+        return incoming, audio_bytes
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        payload = {}
+    return DraftBodyRequest(**payload), None
+
+
+def _draft_body_source(
+    recipient: str,
+    subject: str,
+    current_body: str,
+    transcript: Optional[str],
+    body_from_user: bool,
+    spoken: bool,
+) -> str:
+    """Text the grammar editor sees. No chat persona. No memory.
+
+    Spoken: keep their words. Ignore leftover tap-generate fluff.
+    Tap: polish the current body, or a bare to/subject if the box is empty.
+    """
+    if spoken:
+        spoken_text = (transcript or "").strip()
+        if body_from_user and current_body.strip():
+            return (
+                f"Typed draft:\n{current_body.strip()}\n\n"
+                f"Spoken:\n{spoken_text}"
+            )
+        return spoken_text
+    if current_body.strip():
+        return current_body.strip()
+    bits = []
+    if recipient:
+        bits.append(f"To: {recipient}")
+    if subject:
+        bits.append(f"Subject: {subject}")
+    bits.append("(no body yet — write a short email body from to/subject only)")
+    return "\n".join(bits)
+
+
+def _run_draft_body(
+    incoming: DraftBodyRequest, audio_bytes: Optional[bytes]
+) -> dict:
+    """Fill the composer body. Never touches actions_log, /chat, or memory."""
+    recipient = (incoming.recipient or "").strip()
+    subject = (incoming.subject or "").strip()
+    current_body = incoming.body or ""
+    transcript = incoming.transcript
+    spoken = audio_bytes is not None or incoming.transcript is not None
+
+    if audio_bytes is not None:
+        duration = whisper.wav_duration_seconds(audio_bytes)
+        if duration < whisper.MIN_AUDIO_SECONDS:
+            return _draft_err("heard_nothing")
+        try:
+            transcript = whisper.transcribe_wav(audio_bytes)
+        except whisper.WhisperError as e:
+            return _draft_err(e.error_code)
+        spoken = True
+
+    if spoken and whisper.is_junk_transcript(transcript):
+        shown = (transcript or "").strip() or None
+        return _draft_err("heard_nothing", shown)
+
+    source = _draft_body_source(
+        recipient,
+        subject,
+        current_body,
+        transcript,
+        incoming.body_from_user,
+        spoken,
     )
     try:
-        body = ask_llm(
-            prompt,
-            history=[],
-            long_term_facts=long_term_memory.get_facts(user_id),
-        )
+        drafted = polish_email_body(source)
     except Exception as e:
         print(f"draft_body failed ({e})")
-        return {"body": ""}
-    return {"body": (body or "").strip()}
+        return _draft_err("draft_failed", (transcript or "").strip() or None)
+    drafted = (drafted or "").strip()
+    if not drafted:
+        return _draft_err("draft_failed", (transcript or "").strip() or None)
+    shown = (transcript or "").strip() or None if spoken else None
+    return _draft_ok(drafted, shown)
+
+
+@app.post("/action/draft_body", response_model=DraftBodyResponse)
+async def draft_body(request: Request):
+    """Fill the composer body without touching actions_log or /chat.
+
+    JSON (tap / tests) or multipart with `audio`. Errors are HTTP 200 with
+    `error` set so Kit can leave the old body in place.
+    """
+    incoming, audio_bytes = await _parse_draft_body_request(request)
+    return await asyncio.to_thread(_run_draft_body, incoming, audio_bytes)
+
+
+def _submit_draft_payload(answer: str, conversation_id: str, user_id: str, action: Optional[dict]) -> dict:
+    payload = {
+        "answer": answer,
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "intent": "ACTION",
+        "kind": "ACTION",
+        "remembered": [],
+        "asked_to_remember": False,
+        "asked_to_save_draft": False,
+        "engine": "action",
+    }
+    if action:
+        payload.update(_task_fields(action))
+    else:
+        payload.update(
+            {
+                "task_id": None,
+                "task_status": None,
+                "action_type": None,
+                "risk": None,
+                "confirm_required": False,
+                "missing_params": [],
+                "resolved_params": {},
+            }
+        )
+    return payload
+
+
+@app.post("/action/submit_draft")
+def submit_draft(incoming: SubmitDraftRequest):
+    """Composer Send. to/subject/body are opaque fields, not a chat message.
+
+    Does not classify intent, does not read memory, does not parse the body
+    for new orders. Voice/grammar already happened on /action/draft_body.
+    """
+    user_id = _valid_uuid(incoming.user_id)
+    conversation_id = _valid_uuid(incoming.conversation_id)
+    open_action = actions.get_open_action(user_id, conversation_id)
+    if (
+        open_action is None
+        or open_action["status"] != "AWAITING_INPUT"
+        or open_action["action_type"] != "send_email"
+    ):
+        return _submit_draft_payload(
+            "There's no email draft open to send.",
+            conversation_id,
+            user_id,
+            None,
+        )
+
+    required = actions.ACTION_WHITELIST["send_email"]["required_params"]
+    resolved = dict(open_action.get("resolved_params") or {})
+    recipient = (incoming.recipient or "").strip()
+    subject = (incoming.subject or "").strip()
+    body = incoming.body if incoming.body is not None else ""
+    body = body.strip()
+    if recipient:
+        resolved["recipient"] = recipient
+    if subject:
+        resolved["subject"] = subject
+    if body:
+        resolved["body"] = body
+    resolved = {
+        k: v for k, v in resolved.items() if k in required and str(v or "").strip()
+    }
+    missing = [p for p in required if not str(resolved.get(p) or "").strip()]
+    action = actions.update_action(
+        open_action["action_id"],
+        resolved_params=resolved,
+        missing_params=missing,
+    )
+    action = _merge_attachments(action, incoming.attachments) or action
+    action, answer = _settle_action(action, "")
+    save_message(conversation_id, "user", "Composer send.", kind="action")
+    save_message(conversation_id, "assistant", answer, kind="action")
+    print(
+        f"[submit_draft] [{conversation_id[:8]}] "
+        f"action {action['action_id'][:8]} → {action['status']}"
+    )
+    return _submit_draft_payload(answer, conversation_id, user_id, action)
 
 
 @app.post("/action/confirm")

@@ -366,6 +366,10 @@ _OPEN_VERBS = (
 )
 _TRAILING_FILLER = r"(?:\s+(?:rq|pls|please|thx|thanks|real\s+quick|for\s+me))*[.!?]*"
 
+# "email" with first and last letters pinned (e … l). Middle can be a typo:
+# emial, emauil, emaill, emal. Not "el"/"eel" (too short).
+_EMAIL_WORD = r"e-?[a-z]{2,6}l"
+
 _OPEN_APP_EXTRACT_RE = re.compile(
     rf"^{_LEADING_FILLER}{_OPEN_VERBS}(?:\s+up)?"
     rf"\s+(?:the\s+)?(.+?){_TRAILING_FILLER}$",
@@ -373,7 +377,7 @@ _OPEN_APP_EXTRACT_RE = re.compile(
 )
 _EMAIL_CMD_RE = re.compile(
     r"^(?:please\s+)?(?:can you\s+|could you\s+)?"
-    r"(?:send\s+(?:an?\s+)?e-?mail\b|e-?mail)\s*(.*)$",
+    rf"(?:send\s+(?:an?\s+)?{_EMAIL_WORD}\b|{_EMAIL_WORD})\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
 )
 _SUBJECT_RE = re.compile(
@@ -722,6 +726,8 @@ Rules:
   conversation. "send an email" / "send another email" with no details →
   empty resolved_params. NEVER invent an email address, subject, body, or
   app name. If a required value was not given, list it in missing_params.
+- "send" plus a word that starts with e and ends with l (email, emial,
+  emauil, emaill) is send_email, never open_app.
 - "unsupported" for any task that is not exactly one of the supported types
   (booking, deleting files, reminders, browsing, etc.).
 
@@ -1051,9 +1057,11 @@ _ACTION_OPEN_RE = re.compile(
     re.IGNORECASE,
 )
 # send email / send an email / send another email / send a new email /
-# or "email alex@…"
+# or "email alex@…" — including e…l typos (emauil, emial). Not a lone
+# "email" inside a body ("email feature") because that lacks send / an @.
 _EMAIL_VERB = (
-    r"(?:send\s+(?:(?:an?|another|a\s+new)\s+)?e-?mail\b|e-?mail\s+\S)"
+    rf"(?:send\s+(?:(?:an?|another|a\s+new)\s+)?{_EMAIL_WORD}\b|"
+    rf"{_EMAIL_WORD}\s+(?:to\s+)?\S+@\S+)"
 )
 _ACTION_EMAIL_RE = re.compile(
     rf"^{_LEADING_FILLER}{_EMAIL_VERB}",

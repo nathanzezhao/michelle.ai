@@ -1,4 +1,5 @@
 fastapi
+python-multipart
 uvicorn
 python-dotenv
 google-genai
@@ -7,3 +8,4 @@ pydantic
 pytest
 sqlite-vec
 composio
+faster-whisper

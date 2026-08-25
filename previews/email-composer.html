@@ -183,18 +183,38 @@
 
     .composer-body { padding-top: 8px; }
 
-    .composer-foot {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 8px;
+    .composer-heard {
+      margin-top: 8px;
+      font-size: 11px;
+      line-height: 1.3;
+      color: #333;
+      opacity: 0.7;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .composer-files {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
-      padding: 0 12px 8px;
+    }
+
+    #composer-dock {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-top: 12px;
+      flex-shrink: 0;
+      width: 100%;
+    }
+
+    #composer-dock .dock-row {
+      display: flex;
+      gap: 8px;
+      min-width: 0;
+      width: 100%;
+      align-items: center;
     }
 
     .file-chip {
@@ -231,34 +251,78 @@
       border: none;
       border-radius: 10px;
       cursor: pointer;
-      font-family: inherit;
-      transform: translateY(-8px)
-      
-    }
-
-    .icon-btn {
-      width: 36px;
-      height: 36px;
+      font-family: "IBM Plex Mono", monospace;
+      flex-shrink: 0;
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      gap: 8px;
+      padding: 10px 16px;
+      font-size: 13px;
+    }
+
+    .icon-btn {
       background: rgba(255,253,253,0.5);
       color: #151515;
       border: 1px solid rgba(0,0,0,0.15);
-      
     }
 
-    .icon-btn svg {
+    .icon-btn svg,
+    .gen-btn svg {
       width: 16px;
       height: 16px;
       display: block;
+      flex-shrink: 0;
     }
 
     .gen-btn {
-      padding: 8px 12px;
+      margin-left: auto;
       background: #555;
       color: rgb(211, 211, 211);
-      font-size: 11px;
+      touch-action: none;
+      user-select: none;
+    }
+
+    .icon-btn:focus-visible,
+    .gen-btn:focus-visible {
+      outline: 2px solid #333;
+      outline-offset: 2px;
+    }
+
+    .icon-btn:disabled,
+    .gen-btn:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+
+    .gen-btn .gen-pulse {
+      display: none;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: rgb(211, 211, 211);
+      animation: breathe 1.2s infinite ease-in-out;
+    }
+
+    .gen-btn.listening .gen-pulse {
+      display: inline-block;
+    }
+
+    .gen-btn.listening,
+    .gen-btn.transcribing,
+    .gen-btn.drafting {
+      animation: gen-listen 1.2s infinite ease-in-out;
+    }
+
+    @keyframes breathe {
+      0% { transform: scale(0.8); opacity: 0.1; }
+      50% { transform: scale(1.1); opacity: 1; }
+      100% { transform: scale(0.8); opacity: 0.1; }
+    }
+
+    @keyframes gen-listen {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.05); opacity: 0.72; }
     }
 
     #input-area {
@@ -314,19 +378,38 @@
           </div>
           <div class="composer-body">
             <div class="lbl" style="margin-bottom:6px">body</div>
-            <textarea placeholder="write it here, or tap generate"></textarea>
+            <textarea placeholder="write it here, or tap the mic"></textarea>
+            <div class="composer-heard" aria-live="polite">make it shorter and warmer</div>
           </div>
-          <div class="composer-files" id="files" hidden></div>
-          <div class="composer-foot">
-            <input type="file" id="file-input" multiple hidden />
-            <button type="button" class="icon-btn" id="attach" title="attach files" aria-label="attach files">
-              <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/>
-                <path d="M14 2v5a1 1 0 0 0 1 1h5"/>
-              </svg>
-            </button>
-            <button type="button" class="gen-btn" id="gen">generate body</button>
-          </div>
+        </div>
+      </div>
+      <div id="composer-dock">
+        <div class="composer-files" id="files" hidden></div>
+        <div class="dock-row">
+          <input type="file" id="file-input" multiple hidden />
+          <button type="button" class="icon-btn" id="attach" title="attach files" aria-label="files">
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/>
+              <path d="M14 2v5a1 1 0 0 0 1 1h5"/>
+            </svg>
+            files
+          </button>
+          <button type="button" class="icon-btn" id="undo" title="undo last generate" aria-label="undo" disabled>
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 7v6h6"/>
+              <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 2.9L3 13"/>
+            </svg>
+            undo
+          </button>
+          <button type="button" class="gen-btn" id="gen" title="tap to talk" aria-label="tap to talk">
+            <span class="gen-pulse" aria-hidden="true"></span>
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 19v3"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <rect x="9" y="2" width="6" height="13" rx="3"/>
+            </svg>
+            <span class="gen-label">tap</span>
+          </button>
         </div>
       </div>
       <div id="input-area">
@@ -381,11 +464,20 @@
       renderFiles();
     });
 
-    document.getElementById("gen").addEventListener("click", () => {
-      const box = document.querySelector("textarea");
-      if (!box.value.trim()) {
-        box.value = "(preview) Michelle would draft a body from the subject and who it's to — not wired yet.";
-      }
+    const gen = document.getElementById("gen");
+    const undo = document.getElementById("undo");
+    const box = document.querySelector("textarea");
+    let prevBody = null;
+    gen.addEventListener("click", () => {
+      prevBody = box.value;
+      undo.disabled = false;
+      box.value = "(preview) Michelle would draft a body from the subject and who it's to — not wired yet.";
+    });
+    undo.addEventListener("click", () => {
+      if (prevBody == null) return;
+      box.value = prevBody;
+      prevBody = null;
+      undo.disabled = true;
     });
   </script>
 </body>

@@ -257,6 +257,69 @@
     margin-left: auto;
     background: #555;
     color: rgb(211, 211, 211);
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  #composer-dock .icon-btn:focus-visible,
+  #composer-dock .gen-btn:focus-visible {
+    outline: 2px solid #333;
+    outline-offset: 2px;
+  }
+
+  #composer-dock .icon-btn:disabled,
+  #composer-dock .gen-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  #composer-dock .gen-btn .gen-pulse {
+    display: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: rgb(211, 211, 211);
+    flex-shrink: 0;
+    animation: breathe 1.2s infinite ease-in-out;
+  }
+
+  #composer-dock .gen-btn.listening .gen-pulse {
+    display: inline-block;
+  }
+
+  #composer-dock .gen-btn.listening,
+  #composer-dock .gen-btn.transcribing,
+  #composer-dock .gen-btn.drafting {
+    animation: gen-listen 1.2s infinite ease-in-out;
+  }
+
+  @keyframes gen-listen {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.05); opacity: 0.72; }
+  }
+
+  .composer-heard {
+    margin-top: 8px;
+    font-size: 11px;
+    line-height: 1.3;
+    color: #333;
+    opacity: 0.7;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .sr-live {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   #composer-dock .icon-btn svg,
@@ -371,16 +434,24 @@
       </svg>
       files
     </button>
-    <button type="button" class="gen-btn" id="composer-gen" title="generate body" aria-label="generate">
+    <button type="button" class="icon-btn" id="composer-undo" title="undo last generate" aria-label="undo" disabled>
       <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"/>
-        <path d="M20 2v4"/>
-        <path d="M22 4h-4"/>
-        <circle cx="4" cy="20" r="2"/>
+        <path d="M3 7v6h6"/>
+        <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 2.9L3 13"/>
       </svg>
-      generate
+      undo
+    </button>
+    <button type="button" class="gen-btn" id="composer-gen" title="tap to talk" aria-label="tap to talk">
+      <span class="gen-pulse" aria-hidden="true"></span>
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 19v3"/>
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+        <rect x="9" y="2" width="6" height="13" rx="3"/>
+      </svg>
+      <span class="gen-label">tap</span>
     </button>
   </div>
+  <span id="composer-live" class="sr-live" aria-live="polite"></span>
 </div>
 
 <div id="input-area">
@@ -396,7 +467,9 @@
   const inputArea = document.getElementById('input-area')
   const composerDock = document.getElementById('composer-dock')
   const composerAttach = document.getElementById('composer-attach')
+  const composerUndo = document.getElementById('composer-undo')
   const composerGen = document.getElementById('composer-gen')
+  const composerLive = document.getElementById('composer-live')
   const composerFileInput = document.getElementById('composer-file-input')
   const composerFiles = document.getElementById('composer-files')
   const body = document.querySelector('body')
@@ -659,6 +732,235 @@ function revealScramble(element, finalString) {
 let activeActionRow = null;
 let activeComposer = null;
 
+const DRAFT_TIMEOUT_MS = 120000
+let micGranted = false
+let micPromptOpen = false
+let genPress = null
+let draftAbort = null
+
+function setGenState(state) {
+  const label = composerGen.querySelector('.gen-label')
+  composerGen.classList.remove('listening', 'transcribing', 'drafting')
+  composerGen.removeAttribute('aria-pressed')
+  composerGen.removeAttribute('aria-busy')
+  const busy = state === 'transcribing' || state === 'drafting'
+  composerGen.disabled = busy
+  if (state === 'listening') {
+    composerGen.classList.add('listening')
+    composerGen.setAttribute('aria-pressed', 'true')
+    if (label) label.textContent = 'listening'
+  } else if (state === 'transcribing') {
+    composerGen.classList.add('transcribing')
+    composerGen.setAttribute('aria-busy', 'true')
+    if (label) label.textContent = 'transcribing'
+  } else if (state === 'drafting') {
+    composerGen.classList.add('drafting')
+    composerGen.setAttribute('aria-busy', 'true')
+    if (label) label.textContent = 'drafting'
+  } else if (label) {
+    label.textContent = state === 'default' ? 'tap' : state
+  }
+  if (composerLive) {
+    const spoken = state === 'default' ? '' : (label ? label.textContent : state)
+    composerLive.textContent = spoken
+  }
+}
+
+function resetGenUi() {
+  if (draftAbort) {
+    draftAbort.abort()
+    draftAbort = null
+  }
+  void stopMicCapture()
+  genPress = null
+  micPromptOpen = false
+  setGenState('default')
+  composerUndo.disabled = true
+}
+
+function stashUndo() {
+  if (!activeComposer || !activeComposer._bodyInput) return
+  activeComposer._undoBody = activeComposer._bodyInput.value
+  activeComposer._undoFromTap = !!activeComposer._bodyFromTapGenerate
+  composerUndo.disabled = false
+}
+
+function showHeard(text) {
+  if (!activeComposer || !activeComposer._heard) return
+  const line = String(text || '').replace(/\s+/g, ' ').trim()
+  activeComposer._heard.hidden = !line
+  activeComposer._heard.textContent = line
+}
+
+function draftFields() {
+  return {
+    recipient: activeComposer._toInput.value.trim(),
+    subject: activeComposer._subjectInput.value.trim(),
+    body: activeComposer._bodyInput.value,
+    body_from_user: !activeComposer._bodyFromTapGenerate,
+    conversation_id: conversationId,
+    user_id: userId
+  }
+}
+
+async function startMicCapture() {
+  const out = await ipcRenderer.invoke('mic-start')
+  if (out && out.ok) return
+  const err = new Error((out && out.message) || 'mic start failed')
+  err.name = (out && out.name) || 'Error'
+  throw err
+}
+
+async function stopMicCapture() {
+  try {
+    const buf = await ipcRenderer.invoke('mic-stop')
+    if (!buf || !buf.byteLength) return null
+    return new Blob([buf], { type: 'audio/wav' })
+  } catch (err) {
+    return null
+  }
+}
+
+async function fetchDraft(init) {
+  const ctrl = new AbortController()
+  draftAbort = ctrl
+  const timer = setTimeout(() => ctrl.abort(), DRAFT_TIMEOUT_MS)
+  try {
+    const r = await fetch('http://127.0.0.1:8000/action/draft_body', {
+      ...init,
+      signal: ctrl.signal
+    })
+    try {
+      return await r.json()
+    } catch (e) {
+      return { error: 'network' }
+    }
+  } catch (err) {
+    if (err && err.name === 'AbortError') return { error: 'timeout' }
+    return { error: 'network' }
+  } finally {
+    clearTimeout(timer)
+    if (draftAbort === ctrl) draftAbort = null
+  }
+}
+
+function applyDraftResult(out, fromVoice) {
+  if (!activeComposer || !activeComposer._bodyInput) {
+    setGenState('default')
+    return
+  }
+  if (out && out.error) {
+    if (out.error === 'heard_nothing') setGenState('heard nothing')
+    else if (out.error === 'downloading') setGenState('downloading')
+    else if (out.error === 'busy') setGenState('busy')
+    else if (out.error === 'whisper_missing') setGenState('whisper missing')
+    else setGenState('default')
+    return
+  }
+  if (out && typeof out.body === 'string' && out.body.length > 0) {
+    stashUndo()
+    activeComposer._bodyInput.value = out.body
+    activeComposer._bodyFromTapGenerate = !fromVoice
+    if (fromVoice) showHeard(out.transcript)
+    else showHeard('')
+  }
+  setGenState('default')
+}
+
+async function voiceDraft(blob) {
+  if (!activeComposer) {
+    setGenState('default')
+    return
+  }
+  setGenState('transcribing')
+  const fields = draftFields()
+  const form = new FormData()
+  form.append('recipient', fields.recipient)
+  form.append('subject', fields.subject)
+  form.append('body', fields.body)
+  form.append('body_from_user', fields.body_from_user ? 'true' : 'false')
+  form.append('conversation_id', fields.conversation_id || '')
+  form.append('user_id', fields.user_id || '')
+  form.append('audio', blob, 'hold.wav')
+  const out = await fetchDraft({ method: 'POST', body: form })
+  applyDraftResult(out, true)
+}
+
+async function finishListen() {
+  if (!genPress || genPress.closing) return
+  genPress.closing = true
+  genPress.live = false
+  const blob = await stopMicCapture()
+  genPress = null
+  if (blob) voiceDraft(blob)
+  else setGenState('heard nothing')
+}
+
+async function startListen() {
+  if (!activeComposer || composerGen.disabled || genPress) return
+  genPress = { live: true, steal: false, closing: false }
+  setGenState('listening')
+
+  if (!micGranted) {
+    const status = (() => {
+      try { return ipcRenderer.sendSync('microphone-status') || {} }
+      catch (err) { return {} }
+    })()
+    if (status.granted) {
+      micGranted = true
+    } else if (status.status === 'not-determined') {
+      micPromptOpen = true
+      let perm
+      try {
+        perm = await ipcRenderer.invoke('ask-microphone')
+      } catch (err) {
+        perm = { granted: false, prompted: true }
+      }
+      micPromptOpen = false
+      micGranted = !!perm.granted
+      genPress = null
+      setGenState(perm.granted ? 'default' : 'mic blocked')
+      return
+    } else {
+      genPress = null
+      setGenState('mic blocked')
+      return
+    }
+  }
+
+  try {
+    await startMicCapture()
+  } catch (err) {
+    const denied = err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')
+    void stopMicCapture()
+    genPress = null
+    if (denied) {
+      micGranted = false
+      setGenState('mic blocked')
+      return
+    }
+    setGenState('default')
+    return
+  }
+
+  if (!genPress || genPress.closing || !genPress.live) {
+    void finishListen()
+  }
+}
+
+function onGenTap(e) {
+  if (e.button != null && e.button !== 0) return
+  if (!activeComposer || composerGen.disabled) return
+  e.preventDefault()
+  if (micPromptOpen) return
+  if (genPress && genPress.live && !genPress.closing) {
+    void finishListen()
+    return
+  }
+  if (genPress) return
+  void startListen()
+}
+
 function removeActionButtons() {
   if (!activeActionRow) return;
   activeActionRow.remove();
@@ -673,6 +975,7 @@ function removeComposer() {
   composerFiles.hidden = true;
   composerFiles.innerHTML = "";
   composerFileInput.value = "";
+  resetGenUi();
 }
 
 function attachComposer(bubble, data) {
@@ -693,13 +996,15 @@ function attachComposer(bubble, data) {
     </div>
     <div class="composer-body">
       <div class="lbl" style="margin-bottom:6px">body</div>
-      <textarea class="composer-body-text" placeholder="write it here, or tap generate"></textarea>
+      <textarea class="composer-body-text" placeholder="write it here, or tap the mic"></textarea>
+      <div class="composer-heard" hidden aria-live="polite"></div>
     </div>
   `;
 
   const toInput = composer.querySelector(".composer-to");
   const subjectInput = composer.querySelector(".composer-subject");
   const bodyInput = composer.querySelector(".composer-body-text");
+  const heard = composer.querySelector(".composer-heard");
   const urgentBtn = composer.querySelector(".urgent");
   const attached = [];
 
@@ -757,6 +1062,14 @@ function attachComposer(bubble, data) {
   composer._toInput = toInput;
   composer._subjectInput = subjectInput;
   composer._bodyInput = bodyInput;
+  composer._heard = heard;
+  composer._bodyFromTapGenerate = false;
+  composer._undoBody = null;
+  composer._undoFromTap = false;
+
+  bodyInput.addEventListener("input", () => {
+    composer._bodyFromTapGenerate = false;
+  });
   composer._focusMissing = function () {
     if (!toInput.value.trim()) toInput.focus();
     else if (!subjectInput.value.trim()) subjectInput.focus();
@@ -787,26 +1100,19 @@ composerFileInput.addEventListener("change", () => {
   composerFileInput.value = "";
   activeComposer._renderFiles();
 });
-composerGen.addEventListener("click", () => {
-  if (!activeComposer || composerGen.disabled) return;
-  composerGen.disabled = true;
-  fetch("http://127.0.0.1:8000/action/draft_body", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      recipient: activeComposer._toInput.value.trim(),
-      subject: activeComposer._subjectInput.value.trim(),
-      conversation_id: conversationId,
-      user_id: userId
-    })
-  })
-    .then((r) => r.json())
-    .then((out) => {
-      if (out.body && activeComposer && activeComposer._bodyInput) {
-        activeComposer._bodyInput.value = out.body;
-      }
-    })
-    .finally(() => { composerGen.disabled = false; });
+composerUndo.addEventListener("click", () => {
+  if (!activeComposer || activeComposer._undoBody == null) return;
+  activeComposer._bodyInput.value = activeComposer._undoBody;
+  activeComposer._bodyFromTapGenerate = !!activeComposer._undoFromTap;
+  activeComposer._undoBody = null;
+  composerUndo.disabled = true;
+  showHeard('');
+});
+
+composerGen.addEventListener("click", onGenTap);
+composerGen.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  onGenTap(e);
 });
 
 
@@ -817,16 +1123,16 @@ function submitComposer() {
     activeComposer._focusMissing();
     return true;
   }
-  const text =
-    "to " + draft.to + " subject " + draft.subject + " body " + draft.body;
   removeComposer();
   const botBubble = addBubble("", "bot");
   botBubble.innerHTML = '<div class="loading-dot"></div>';
-  fetch("http://127.0.0.1:8000/chat", {
+  fetch("http://127.0.0.1:8000/action/submit_draft", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      text: text,
+      recipient: draft.to,
+      subject: draft.subject,
+      body: draft.body,
       conversation_id: conversationId,
       user_id: userId,
       attachments: draft.paths
