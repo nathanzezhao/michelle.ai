@@ -40,6 +40,18 @@ class _FakeRun:
 
     def __call__(self, argv, **kwargs):
         self.calls.append({"argv": argv, "kwargs": kwargs})
+        is_list = (
+            isinstance(argv, list)
+            and argv
+            and argv[0] == "osascript"
+            and any("every process" in str(part) for part in argv)
+        )
+        if is_list:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="Notes, Safari, Slack, Mail, Finder",
+                stderr="",
+            )
         return SimpleNamespace(returncode=self.returncode, stdout="", stderr="")
 
 
@@ -47,6 +59,7 @@ class _FakeRun:
 def fake_run(monkeypatch):
     rec = _FakeRun()
     monkeypatch.setattr(actions.subprocess, "run", rec)
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: [])
     return rec
 
 
@@ -183,6 +196,31 @@ def test_backticks_and_subshell_stay_inert(fake_run):
     assert argv == ["open", "-a", payload]
     assert not fake_run.calls[0]["kwargs"].get("shell")
     assert result["ok"] is False  # rc=1 → honest failure, nothing "opened"
+
+
+def test_close_metachars_never_reach_shell(client, ids, fake_run):
+    body = chat(client, "close Notes; rm -rf ~", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "close_app"
+    for rec in fake_run.calls:
+        assert isinstance(rec["argv"], list)
+        assert not rec["kwargs"].get("shell")
+    action_calls = [
+        rec for rec in fake_run.calls if "every process" not in str(rec["argv"])
+    ]
+    assert action_calls == []
+    assert body["task_status"] == "FAILED"
+
+
+def test_close_quotes_never_enter_osascript(fake_run):
+    result = actions.NativeExecutor().execute(
+        "close_app", {"app_names": ['Notes"; beep']}
+    )
+    assert result["ok"] is False
+    action_calls = [
+        rec for rec in fake_run.calls if "every process" not in str(rec["argv"])
+    ]
+    assert action_calls == []
 
 
 # --- Probe 3: param invention / grounding -------------------------------------

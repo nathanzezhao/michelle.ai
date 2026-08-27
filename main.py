@@ -21,7 +21,9 @@ from intent import (
     maybe_promote_to_remember,
     parse_mixed_utterance,
     usable_memory_facts,
+    _ACTION_CLOSE_RE,
     _ACTION_OPEN_RE,
+    _ACTION_QUIT_RE,
     _NEW_EMAIL_SEND_RE,
     _looks_like_resume_draft,
 )
@@ -171,6 +173,7 @@ _PICK_NONE_RE = re.compile(
 
 _MISSING_PARAM_WORDS = {
     "app_name": "which app to open",
+    "app_names": "which app",
     "recipient": "who it's going to",
     "subject": "the subject",
     "body": "the body",
@@ -178,7 +181,18 @@ _MISSING_PARAM_WORDS = {
 
 
 def _action_desc(action_type: str) -> str:
-    return "email draft" if action_type == "send_email" else "open-app request"
+    if action_type == "send_email":
+        return "email draft"
+    if action_type == "quit_app":
+        return "quit request"
+    if action_type == "close_app":
+        return "close-app request"
+    return "open-app request"
+
+
+def _named_apps(params: dict) -> str:
+    names = actions._app_names_from_params(params or {})
+    return actions._format_app_list(names)
 
 
 def _task_fields(action: dict) -> dict:
@@ -194,7 +208,12 @@ def _task_fields(action: dict) -> dict:
 
 
 def _missing_ask(action_type: str, missing: list) -> str:
-    wanted = [_MISSING_PARAM_WORDS.get(p, p) for p in missing]
+    labels = dict(_MISSING_PARAM_WORDS)
+    if action_type == "close_app":
+        labels["app_names"] = "which app to close"
+    elif action_type == "quit_app":
+        labels["app_names"] = "which apps to quit"
+    wanted = [labels.get(p, p) for p in missing]
     if len(wanted) > 1:
         listed = ", ".join(wanted[:-1]) + " and " + wanted[-1]
     else:
@@ -204,7 +223,11 @@ def _missing_ask(action_type: str, missing: list) -> str:
     return f"Sure — I just need {listed}."
 
 
-def _pending_summary(params: dict) -> str:
+def _pending_summary(action_type: str, params: dict) -> str:
+    if action_type == "quit_app":
+        names = _named_apps(params)
+        pronoun = "them" if len(actions._app_names_from_params(params or {})) != 1 else "it"
+        return f"Ready to quit {names}. Quit {pronoun}?"
     return (
         f"Ready to send: to {params.get('recipient')}, "
         f"subject \"{params.get('subject')}\", body \"{params.get('body')}\". "
@@ -213,9 +236,14 @@ def _pending_summary(params: dict) -> str:
 
 
 def _exec_reply(action_type: str, params: dict, status: str, exec_result: dict) -> str:
+    detail = str(exec_result.get("detail") or "").strip()
     if status == "SUCCESS":
         if action_type == "open_app":
             return f"Opened {params.get('app_name')}."
+        if action_type in ("close_app", "quit_app"):
+            return detail or (
+                f"{'Quit' if action_type == 'quit_app' else 'Closed'} {_named_apps(params)}."
+            )
         return f"Sent the email to {params.get('recipient')}."
     if exec_result.get("error") == "composio_not_connected":
         link = exec_result.get("connect_link")
@@ -230,7 +258,12 @@ def _exec_reply(action_type: str, params: dict, status: str, exec_result: dict) 
             f"I couldn't find an app called {params.get('app_name')} — "
             "nothing was opened."
         )
-    return f"That didn't work — {exec_result.get('detail') or 'the action failed'}."
+    if action_type in ("close_app", "quit_app"):
+        return detail or (
+            f"I couldn't find an app called {_named_apps(params)} — "
+            f"nothing was {'quit' if action_type == 'quit_app' else 'closed'}."
+        )
+    return f"That didn't work — {detail or 'the action failed'}."
 
 
 def _existing_files(paths) -> list[str]:
@@ -331,7 +364,7 @@ def _settle_action(action: dict, note: str) -> tuple[dict, str]:
         answer = note + _missing_ask(action_type, missing)
     elif risk == "high":
         action = actions.update_action(action["action_id"], status="PENDING")
-        answer = note + _pending_summary(resolved)
+        answer = note + _pending_summary(action_type, resolved)
     else:
         status, exec_result = actions.confirm_and_execute(action["action_id"])
         action = actions.get_action(action["action_id"])
@@ -566,7 +599,11 @@ def _try_pending_draft_pick(
     if _NEW_EMAIL_SEND_RE.search(user_text) and not _looks_like_resume_draft(user_text):
         _pending_draft_picks.pop(key, None)
         return None
-    if _ACTION_OPEN_RE.match(user_text.strip()):
+    if (
+        _ACTION_OPEN_RE.match(user_text.strip())
+        or _ACTION_CLOSE_RE.match(user_text.strip())
+        or _ACTION_QUIT_RE.match(user_text.strip())
+    ):
         _pending_draft_picks.pop(key, None)
         return None
     candidates = list(pending.get("candidates") or [])
@@ -1589,7 +1626,13 @@ def confirm_action(incoming_data: ActionDecision):
 
     if decision == "cancel":
         action = actions.cancel_action(action["action_id"])
-        answer = "Cancelled — I won't send it."
+        if action.get("action_type") == "quit_app":
+            answer = (
+                "Cancelled — I won't quit "
+                f"{_named_apps(action.get('resolved_params') or {})}."
+            )
+        else:
+            answer = "Cancelled — I won't send it."
     else:
         queued = list(action.get("queue") or [])
         status, exec_result = actions.confirm_and_execute(action["action_id"])

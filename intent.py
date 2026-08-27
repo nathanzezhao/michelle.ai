@@ -369,6 +369,11 @@ _OPEN_VERBS = (
     r"(?:open|launch|start|run|pull\s+up|fire\s+up|hop\s+(?:in(?:to)?|on)|"
     r"bring\s+up|boot\s+up|pop\s+open|crank\s+up)"
 )
+# First/last letter pinned like _EMAIL_WORD. close/clsoe/cloes; quit/quti/qiut.
+# "quite" is ordinary English — do not treat it as quit.
+_CLOSE_WORD = r"(?:c[a-z]{3}e|cloes|closed|shut)"
+_QUIT_WORD = r"(?:q[a-z]{2}t|quti|qiut|exit)"
+_CLOSE_TAIL = rf"{_CLOSE_WORD}(?:\s+(?:the\s+)?windows?(?:\s+(?:of|for))?)?"
 _TRAILING_FILLER = r"(?:\s+(?:rq|pls|please|thx|thanks|real\s+quick|for\s+me))*[.!?]*"
 
 # "email" with first and last letters pinned (e … l). Middle can be a typo:
@@ -377,6 +382,16 @@ _EMAIL_WORD = r"e-?[a-z]{2,6}l"
 
 _OPEN_APP_EXTRACT_RE = re.compile(
     rf"^{_LEADING_FILLER}{_OPEN_VERBS}(?:\s+up)?"
+    rf"\s+(?:the\s+)?(.+?){_TRAILING_FILLER}$",
+    re.IGNORECASE,
+)
+_CLOSE_APP_EXTRACT_RE = re.compile(
+    rf"^{_LEADING_FILLER}{_CLOSE_TAIL}"
+    rf"\s+(?:the\s+)?(.+?){_TRAILING_FILLER}$",
+    re.IGNORECASE,
+)
+_QUIT_APP_EXTRACT_RE = re.compile(
+    rf"^{_LEADING_FILLER}{_QUIT_WORD}"
     rf"\s+(?:the\s+)?(.+?){_TRAILING_FILLER}$",
     re.IGNORECASE,
 )
@@ -466,15 +481,17 @@ def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
         out["resolved_params"] = resolved
 
     resolved = dict(_params_dict(out.get("resolved_params")))
-    if not str(resolved.get("app_name") or "").strip():
+    if not str(resolved.get("app_name") or "").strip() and _param_empty(
+        resolved.get("app_names")
+    ):
         for alias in ("app", "application", "name", "appName"):
             if str(resolved.get(alias) or "").strip():
                 resolved["app_name"] = str(resolved[alias]).strip()
                 break
     for key, value in _params_dict(rules.get("resolved_params")).items():
-        if not str(resolved.get(key) or "").strip() and str(value or "").strip():
+        if _param_empty(resolved.get(key)) and not _param_empty(value):
             resolved[key] = value
-    out["resolved_params"] = resolved
+    out["resolved_params"] = _coerce_app_params(raw_type, resolved)
     if rules.get("related"):
         out["related"] = True
         if raw_type not in ACTION_WHITELIST and rules_type in ACTION_WHITELIST:
@@ -533,11 +550,15 @@ def _finalize_action_analysis(
 
     # This utterance only. Chat history is how the last sent email leaked
     # back in on reload ("send an email" → Confirm the old one again).
-    grounded = _ground_action_params(raw.get("resolved_params"), text)
+    incoming = _coerce_app_params(
+        action_type, _params_dict(raw.get("resolved_params"))
+    )
+    grounded = _ground_action_params(incoming, text)
+    prior_params = _coerce_app_params(action_type, prior_params)
     resolved = {**prior_params, **grounded}
     required = ACTION_WHITELIST[action_type]["required_params"]
     resolved = {k: v for k, v in resolved.items() if k in required}
-    missing = [p for p in required if not str(resolved.get(p) or "").strip()]
+    missing = [p for p in required if _param_empty(resolved.get(p))]
 
     dismiss = False
     if task_context and task_context.get("action_type") == "send_email":
@@ -583,23 +604,36 @@ def _ground_action_params(params, text: str, history: Optional[list[dict]] = Non
     # a different mailbox).
     known_addresses = set(_EMAIL_ADDR_RE.findall(blob))
     for key, raw_value in params.items():
+        if isinstance(raw_value, list):
+            items = []
+            for item in raw_value:
+                kept = _ground_one_param(str(item or "").strip(), blob, known_addresses)
+                if kept:
+                    items.append(kept)
+            if items:
+                grounded[str(key)] = items
+            continue
         value = str(raw_value or "").strip()
-        if not value:
-            continue
-        if _EMAIL_ADDR_RE.fullmatch(value):
-            if value.lower() in known_addresses:
-                grounded[str(key)] = value
-            continue
-        if value.lower() in blob:
-            grounded[str(key)] = value
-            continue
-        if "@" in value:
-            # Email addresses must appear verbatim — never guessed.
-            continue
-        tokens = [t for t in re.split(r"[^a-z0-9]+", value.lower()) if len(t) >= 3]
-        if tokens and sum(1 for t in tokens if t in blob) * 2 >= len(tokens):
-            grounded[str(key)] = value
+        kept = _ground_one_param(value, blob, known_addresses)
+        if kept:
+            grounded[str(key)] = kept
     return grounded
+
+
+def _ground_one_param(value: str, blob: str, known_addresses: set) -> str:
+    if not value:
+        return ""
+    if _EMAIL_ADDR_RE.fullmatch(value):
+        return value if value.lower() in known_addresses else ""
+    if value.lower() in blob:
+        return value
+    if "@" in value:
+        # Email addresses must appear verbatim — never guessed.
+        return ""
+    tokens = [t for t in re.split(r"[^a-z0-9]+", value.lower()) if len(t) >= 3]
+    if tokens and sum(1 for t in tokens if t in blob) * 2 >= len(tokens):
+        return value
+    return ""
 
 
 def _extract_email_params(text: str) -> dict:
@@ -624,6 +658,12 @@ def _extract_email_params(text: str) -> dict:
     return params
 
 
+def _param_empty(value) -> bool:
+    if isinstance(value, list):
+        return not any(str(v or "").strip() for v in value)
+    return not str(value or "").strip()
+
+
 def _clean_app_name(raw: str) -> str:
     app = (raw or "").strip().strip("\"'").strip()
     app = re.sub(
@@ -638,8 +678,48 @@ def _clean_app_name(raw: str) -> str:
     return app
 
 
+def _split_app_names(raw: str) -> list[str]:
+    blob = _clean_app_name(raw)
+    if not blob:
+        return []
+    parts = re.split(r"\s*(?:,|&|\band\b)\s*", blob, flags=re.IGNORECASE)
+    names = []
+    for part in parts:
+        name = _clean_app_name(re.sub(r"^(?:the\s+)", "", part, flags=re.IGNORECASE))
+        if name and name.lower() not in {"and", "also", "then", "plus"}:
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def _coerce_app_params(action_type: str, resolved: dict) -> dict:
+    out = dict(resolved or {})
+    if action_type not in ("close_app", "quit_app"):
+        return out
+    names = out.get("app_names")
+    if isinstance(names, str) and names.strip():
+        names = _split_app_names(names)
+    elif isinstance(names, list):
+        collected = []
+        for item in names:
+            collected.extend(_split_app_names(str(item or "")))
+        names = collected
+    else:
+        names = []
+    if not names:
+        one = str(out.get("app_name") or "").strip()
+        if one:
+            names = _split_app_names(one)
+    out.pop("app_name", None)
+    if names:
+        out["app_names"] = names
+    else:
+        out.pop("app_names", None)
+    return out
+
+
 def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
-    """Regex extractor for the two v1 actions — offline QA parity (§3.2)."""
+    """Regex extractor for whitelist actions — offline QA parity (§3.2)."""
     stripped = (text or "").strip()
 
     if (
@@ -663,6 +743,30 @@ def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
             "related": False,
             "resume": True,
             "resume_query": stripped,
+        }
+
+    close_match = _CLOSE_APP_EXTRACT_RE.match(stripped)
+    if close_match and _ACTION_CLOSE_RE.match(stripped):
+        names = _split_app_names(close_match.group(1))
+        return {
+            "action_type": "close_app",
+            "resolved_params": {"app_names": names} if names else {},
+            "confidence": 0.9,
+            "related": bool(
+                task_context and task_context.get("action_type") == "close_app"
+            ),
+        }
+
+    quit_match = _QUIT_APP_EXTRACT_RE.match(stripped)
+    if quit_match and _ACTION_QUIT_RE.match(stripped):
+        names = _split_app_names(quit_match.group(1))
+        return {
+            "action_type": "quit_app",
+            "resolved_params": {"app_names": names} if names else {},
+            "confidence": 0.9,
+            "related": bool(
+                task_context and task_context.get("action_type") == "quit_app"
+            ),
         }
 
     open_match = _OPEN_APP_EXTRACT_RE.match(stripped)
@@ -704,6 +808,15 @@ def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
                 app = _clean_app_name(stripped)
                 if app:
                     supplied = {"app_name": app}
+        elif action_type in ("close_app", "quit_app") and "app_names" in missing:
+            if not _looks_like_question(stripped):
+                names = _split_app_names(stripped)
+                if names and re.fullmatch(
+                    r"[A-Za-z][\w .'+-]*(?:\s*(?:,|&|and)\s*[A-Za-z][\w .'+-]*)*",
+                    stripped.strip().strip("\"'"),
+                    re.IGNORECASE,
+                ):
+                    supplied = {"app_names": names}
         if supplied:
             return {
                 "action_type": action_type,
@@ -770,8 +883,13 @@ Rules:
   that email, the one about X, "show me the draft about X" — set resume=true
   and resume_query to the describing words (e.g. "math tutor application").
   Still send_email. Do not invent to/subject/body.
-- Opening/launching a program is open_app. Sending or finishing mail is
-  never open_app.
+- Opening/launching a program is open_app. Closing windows (app stays
+  running) is close_app. Quitting/exiting a program is quit_app. Sending
+  or finishing mail is never open_app, close_app, or quit_app.
+- close_app and quit_app take resolved_params.app_names as an array of
+  the app names the user said (one or more). "close Notes and Safari" →
+  close_app with app_names ["Notes","Safari"]. Do not invent names.
+- "close the draft" / "close that email" is resume send_email, not close_app.
 - "unsupported" for any task that is not exactly one of the supported types
   (booking, deleting files, reminders, browsing, etc.).
 
@@ -781,7 +899,7 @@ Recent conversation:
 User message: {text}
 
 Reply with ONLY valid JSON, no markdown:
-{{"action_type": "open_app"|"send_email"|"unsupported", "resume": false, "resume_query": "", "related": true|false, "dismiss": false, "resolved_params": {{}}, "missing_params": [], "confidence": 0.0 to 1.0}}"""
+{{"action_type": "open_app"|"close_app"|"quit_app"|"send_email"|"unsupported", "resume": false, "resume_query": "", "related": true|false, "dismiss": false, "resolved_params": {{}}, "missing_params": [], "confidence": 0.0 to 1.0}}"""
 
     result = _llm_json(prompt)
     if not isinstance(result, dict):
@@ -1105,6 +1223,14 @@ _ACTION_OPEN_RE = re.compile(
     rf"^{_LEADING_FILLER}{_OPEN_VERBS}(?:\s+up)?\s+\S",
     re.IGNORECASE,
 )
+_ACTION_CLOSE_RE = re.compile(
+    rf"^{_LEADING_FILLER}{_CLOSE_TAIL}\s+\S",
+    re.IGNORECASE,
+)
+_ACTION_QUIT_RE = re.compile(
+    rf"^{_LEADING_FILLER}{_QUIT_WORD}\s+\S",
+    re.IGNORECASE,
+)
 # send email / send an email / send another email / send a new email /
 # or "email alex@…" — including e…l typos (emauil, emial). Not a lone
 # "email" inside a body ("email feature") because that lacks send / an @.
@@ -1122,6 +1248,7 @@ _ACTION_EMAIL_RE = re.compile(
 _RESUME_DRAFT_INNER = (
     r"(?:send|finish|continue|resume)\s+(?:that|the|this)\s+(?:\S+\s+){0,4}(?:draft|e-?mail)"
     r"|(?:show|open|pull\s+up|find|get)(?:\s+me)?\s+(?:the\s+)?(?:(?:e-?mail\s+)?draft|e-?mail)"
+    r"|(?:close|shut|clsoe|cloes|closed)\s+(?:the\s+|that\s+|this\s+)?(?:(?:e-?mail\s+)?draft|e-?mail|letter)"
     r"|(?:draft|e-?mail)\s+about"
     r"|(?:that|the)\s+one\s+about"
 )
@@ -1149,6 +1276,8 @@ def _clause_is_action(clause: str) -> bool:
     stripped = (clause or "").strip()
     return bool(
         _ACTION_OPEN_RE.match(stripped)
+        or _ACTION_CLOSE_RE.match(stripped)
+        or _ACTION_QUIT_RE.match(stripped)
         or _ACTION_EMAIL_RE.match(stripped)
         or _looks_like_resume_draft(stripped)
     )
@@ -1156,6 +1285,7 @@ def _clause_is_action(clause: str) -> bool:
 
 _ACTION_START_RE = re.compile(
     rf"(?:{_LEADING_FILLER})(?:{_RESUME_DRAFT_INNER}|{_EMAIL_VERB}|"
+    rf"{_CLOSE_TAIL}\s+\S|{_QUIT_WORD}\s+\S|"
     rf"{_OPEN_VERBS}(?:\s+up)?\s+\S)",
     re.IGNORECASE,
 )

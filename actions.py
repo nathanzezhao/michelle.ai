@@ -6,6 +6,7 @@ any time — create_action() enforces it by cancelling leftovers.
 """
 
 import base64
+import difflib
 import html
 import json
 import os
@@ -34,6 +35,16 @@ ACTION_WHITELIST = {
     "open_app": {
         "risk": "low",
         "required_params": ["app_name"],
+        "executor": "native",
+    },
+    "close_app": {
+        "risk": "low",
+        "required_params": ["app_names"],
+        "executor": "native",
+    },
+    "quit_app": {
+        "risk": "high",
+        "required_params": ["app_names"],
         "executor": "native",
     },
     "send_email": {
@@ -703,14 +714,174 @@ def startup_sweep() -> None:
 # --- Executors (§5) ---------------------------------------------------------
 # ExecResult: {"ok": bool, "detail": str, "error": str | None}
 
+_UNSAFE_APP_CHARS = re.compile(r"[\"'\n\r]")
+_LIST_RUNNING_SCRIPT = (
+    'tell application "System Events" to get name of every process '
+    "whose background only is false"
+)
+
+
+def _app_names_from_params(params: dict) -> list[str]:
+    raw = (params or {}).get("app_names")
+    if raw is None:
+        one = str((params or {}).get("app_name") or "").strip()
+        raw = [one] if one else []
+    if isinstance(raw, str):
+        raw = [raw]
+    names = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _app_name_allowed(name: str) -> bool:
+    return bool(name) and not _UNSAFE_APP_CHARS.search(name)
+
+
+def _format_app_list(names: list[str]) -> str:
+    clean = [n for n in names if n]
+    if not clean:
+        return "that app"
+    if len(clean) == 1:
+        return clean[0]
+    if len(clean) == 2:
+        return f"{clean[0]} and {clean[1]}"
+    return ", ".join(clean[:-1]) + f", and {clean[-1]}"
+
+
+def _list_running_app_names() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", _LIST_RUNNING_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    blob = (result.stdout or "").replace("\n", ",")
+    return [p.strip() for p in blob.split(",") if p.strip()]
+
+
+def _list_installed_app_names() -> list[str]:
+    names: list[str] = []
+    seen = set()
+    home_apps = Path.home() / "Applications"
+    for base in (Path("/Applications"), Path("/System/Applications"), home_apps):
+        try:
+            for path in base.glob("*.app"):
+                stem = path.stem
+                key = stem.lower()
+                if stem and key not in seen:
+                    seen.add(key)
+                    names.append(stem)
+        except OSError:
+            continue
+    return names
+
+
+def _alnum_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def _is_different_suffix_app(query: str, candidate: str) -> bool:
+    """Notes vs Notes+ share letters but are different apps."""
+    ql = (query or "").strip().lower()
+    cl = (candidate or "").strip().lower()
+    if not ql or cl == ql:
+        return False
+    return _alnum_key(ql) == _alnum_key(cl)
+
+
+def _is_letter_truncation(query: str, candidate: str) -> bool:
+    ql = (query or "").strip().lower()
+    cl = (candidate or "").strip().lower()
+    if len(ql) < 3 or not cl.startswith(ql):
+        return False
+    rest = cl[len(ql) :]
+    return rest.isalpha() and 1 <= len(rest) <= 2
+
+
+def _fuzzy_pick(query: str, candidates: list[str]) -> str | None:
+    q = (query or "").strip()
+    if not q:
+        return None
+    ql = q.lower()
+    exact = [c for c in candidates if c.lower() == ql]
+    if exact:
+        return exact[0]
+    usable = [c for c in candidates if not _is_different_suffix_app(q, c)]
+    prefixed = [c for c in usable if _is_letter_truncation(q, c)]
+    if len(prefixed) == 1:
+        return prefixed[0]
+    tokens_hit = []
+    for c in usable:
+        tokens = re.findall(r"[a-z0-9]+", c.lower())
+        if ql in tokens and tokens != [ql]:
+            tokens_hit.append(c)
+    if len(tokens_hit) == 1:
+        return tokens_hit[0]
+    lowered = {c.lower(): c for c in usable}
+    matches = difflib.get_close_matches(ql, list(lowered), n=1, cutoff=0.8)
+    if matches and not _is_different_suffix_app(q, lowered[matches[0]]):
+        return lowered[matches[0]]
+    return None
+
+
+def resolve_app_target(query: str) -> tuple[str, str | None]:
+    """Map a typed name to (running|not_running|unknown, canonical)."""
+    if not _app_name_allowed(query):
+        return ("unknown", None)
+    running = _list_running_app_names()
+    hit = _fuzzy_pick(query, running)
+    if hit:
+        return ("running", hit)
+    installed = _list_installed_app_names()
+    hit = _fuzzy_pick(query, installed)
+    if hit:
+        return ("not_running", hit)
+    if not running and not installed:
+        return ("running", query)
+    return ("unknown", None)
+
+
+def resolve_app_name(query: str) -> str | None:
+    """Running match only. None if the app is unknown or already quit."""
+    state, name = resolve_app_target(query)
+    return name if state == "running" else None
+
+
+def _run_osascript(script: str):
+    return subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
 
 class NativeExecutor:
     """Local macOS actions. Args are passed as a list — user input is never
     interpolated into a shell string."""
 
     def execute(self, action_type: str, params: dict) -> dict:
-        if action_type != "open_app":
-            return {"ok": False, "detail": "unsupported native action", "error": "unsupported"}
+        if action_type == "open_app":
+            return self._open_app(params)
+        if action_type == "close_app":
+            return self._close_or_quit(params, quit_app=False)
+        if action_type == "quit_app":
+            return self._close_or_quit(params, quit_app=True)
+        return {
+            "ok": False,
+            "detail": "unsupported native action",
+            "error": "unsupported",
+        }
+
+    def _open_app(self, params: dict) -> dict:
         app_name = str(params.get("app_name") or "").strip()
         try:
             result = subprocess.run(
@@ -728,6 +899,94 @@ class NativeExecutor:
             "detail": f"couldn't find an app called {app_name}",
             "error": "app_not_found",
         }
+
+    def _close_or_quit(self, params: dict, *, quit_app: bool) -> dict:
+        names = _app_names_from_params(params)
+        if not names:
+            return {
+                "ok": False,
+                "detail": f"which apps to {('quit' if quit_app else 'close')}",
+                "error": "missing_params",
+            }
+        lines = []
+        ok_names = []
+        already_names = []
+        fail_names = []
+        saw_unsafe = False
+        for typed in names:
+            if not _app_name_allowed(typed):
+                saw_unsafe = True
+                fail_names.append(typed)
+                lines.append(f"I couldn't find an app called {typed}.")
+                continue
+            state, canonical = resolve_app_target(typed)
+            if state == "unknown" or not canonical:
+                fail_names.append(typed)
+                lines.append(f"I couldn't find an app called {typed}.")
+                continue
+            if state == "not_running":
+                already_names.append(canonical)
+                if quit_app:
+                    lines.append(f"{canonical} is already quit.")
+                else:
+                    lines.append(f"{canonical} isn't open.")
+                continue
+            quoted = json.dumps(canonical)
+            script = (
+                f"tell application {quoted} to quit"
+                if quit_app
+                else f"tell application {quoted} to close every window"
+            )
+            try:
+                result = _run_osascript(script)
+            except Exception as e:
+                fail_names.append(typed)
+                lines.append(f"{canonical} didn't {('quit' if quit_app else 'close')}: {e}")
+                continue
+            if result.returncode == 0:
+                ok_names.append(canonical)
+                if quit_app:
+                    lines.append(f"Quit {canonical}.")
+                else:
+                    lines.append(f"Closed {canonical}.")
+            else:
+                fail_names.append(typed)
+                lines.append(f"I couldn't find an app called {typed}.")
+        if fail_names and not ok_names and not already_names:
+            listed = _format_app_list(fail_names or names)
+            error = "unsafe_name" if saw_unsafe and not any(
+                _app_name_allowed(n) for n in names
+            ) else "app_not_found"
+            nothing = "quit" if quit_app else "closed"
+            return {
+                "ok": False,
+                "detail": f"I couldn't find an app called {listed} — nothing was {nothing}.",
+                "error": error,
+            }
+        if fail_names:
+            return {
+                "ok": False,
+                "detail": " ".join(lines),
+                "error": "partial_failure",
+            }
+        if already_names and not ok_names:
+            listed = _format_app_list(already_names)
+            if quit_app:
+                copula = "is" if len(already_names) == 1 else "are"
+                detail = f"{listed} {copula} already quit."
+                error = "already_quit"
+            else:
+                copula = "isn't" if len(already_names) == 1 else "aren't"
+                detail = f"{listed} {copula} open."
+                error = "already_closed"
+            return {"ok": True, "detail": detail, "error": error}
+        if already_names:
+            return {"ok": True, "detail": " ".join(lines), "error": None}
+        if quit_app:
+            detail = f"Quit {_format_app_list(ok_names)}."
+        else:
+            detail = f"Closed {_format_app_list(ok_names)}."
+        return {"ok": True, "detail": detail, "error": None}
 
 
 def platform_api_key() -> str | None:

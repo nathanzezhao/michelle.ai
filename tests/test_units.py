@@ -368,6 +368,18 @@ def test_llm_chat_label_still_promotes_open_order(monkeypatch):
             "",
             ["can you pull up the email draft about going to the moon"],
         ),
+        ("close Notes", "", ["close Notes"]),
+        ("close Notes and Safari", "", ["close Notes and Safari"]),
+        (
+            "close Notes and quit Safari",
+            "",
+            ["close Notes", "quit Safari"],
+        ),
+        ("quit Chrome, Slack, and Notes", "", ["quit Chrome, Slack, and Notes"]),
+        ("clsoe Notes", "", ["clsoe Notes"]),
+        ("quti Safari", "", ["quti Safari"]),
+        ("close the draft", "", ["close the draft"]),
+        ("close that email", "", ["close that email"]),
     ],
 )
 def test_parse_mixed_utterance(text, chat, actions):
@@ -397,6 +409,10 @@ def test_resume_draft_is_not_a_new_send():
     assert _looks_like_resume_draft("pull up the email")
     assert _looks_like_resume_draft("find the draft about lunch")
     assert _looks_like_resume_draft("get me the draft")
+    assert _looks_like_resume_draft("close the draft")
+    assert _looks_like_resume_draft("close that email")
+    assert not _looks_like_resume_draft("close Notes")
+    assert not _looks_like_resume_draft("close Mail")
     assert _looks_like_resume_draft("draft about math tutor")
     assert _looks_like_resume_draft("email about the project")
     assert not _looks_like_resume_draft("send an email")
@@ -420,6 +436,74 @@ def test_resume_draft_is_not_a_new_send():
     assert classify_intent(
         "can you show me the draft about math tutor application"
     )["intent"] == "ACTION"
+    close_draft = analyze_action_request("close the draft")
+    assert close_draft["action_type"] == "send_email"
+    assert close_draft["resume"] is True
+    close_email = analyze_action_request("close that email")
+    assert close_email["action_type"] == "send_email"
+    assert close_email["resume"] is True
+
+
+def test_close_and_quit_extract_names():
+    close = analyze_action_request("close Notes")
+    assert close["action_type"] == "close_app"
+    assert close["resolved_params"]["app_names"] == ["Notes"]
+    assert close["missing_params"] == []
+    multi = analyze_action_request("close Notes and Safari")
+    assert multi["action_type"] == "close_app"
+    assert multi["resolved_params"]["app_names"] == ["Notes", "Safari"]
+    oxford = analyze_action_request("quit Chrome, Slack, and Notes")
+    assert oxford["action_type"] == "quit_app"
+    assert oxford["resolved_params"]["app_names"] == ["Chrome", "Slack", "Notes"]
+    typo = analyze_action_request("clsoe Notes")
+    assert typo["action_type"] == "close_app"
+    qtyp = analyze_action_request("quti Safari")
+    assert qtyp["action_type"] == "quit_app"
+    mail = analyze_action_request("close Mail")
+    assert mail["action_type"] == "close_app"
+    assert mail["resolved_params"]["app_names"] == ["Mail"]
+    assert classify_intent("that's quite nice")["intent"] != "ACTION"
+
+
+def test_fuzzy_app_name_prefers_running_and_skips_near_misses(monkeypatch):
+    monkeypatch.setattr(
+        actions, "_list_running_app_names", lambda: ["Notes", "Safari", "Notion"]
+    )
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: [])
+    assert actions.resolve_app_name("Safar") == "Safari"
+    assert actions.resolve_app_name("Notes") == "Notes"
+    assert actions.resolve_app_name("Zorbulon") is None
+
+
+def test_notes_does_not_resolve_to_notes_plus_when_notes_already_quit(monkeypatch):
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Notes+", "Safari"])
+    monkeypatch.setattr(
+        actions, "_list_installed_app_names", lambda: ["Notes", "Notes+", "Safari"]
+    )
+    assert actions.resolve_app_name("Notes") is None
+    assert actions.resolve_app_target("Notes") == ("not_running", "Notes")
+    assert actions.resolve_app_target("Notes+") == ("running", "Notes+")
+    assert actions._fuzzy_pick("Notes", ["Notes+"]) is None
+
+
+def test_llm_close_label_recovers_from_rules(monkeypatch):
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_analyze_action_with_llm",
+        lambda *a, **k: {
+            "action_type": "open_app",
+            "resolved_params": {},
+            "missing_params": ["app_name"],
+            "related": True,
+            "confidence": 0.9,
+        },
+    )
+    analysis = analyze_action_request("close Notes and Safari")
+    assert analysis["action_type"] == "close_app"
+    assert analysis["resolved_params"]["app_names"] == ["Notes", "Safari"]
+    assert analysis["missing_params"] == []
 
 
 def test_resume_draft_promotes_retrieve_to_action(monkeypatch):

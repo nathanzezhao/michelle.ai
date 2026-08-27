@@ -104,6 +104,19 @@ def payload(row):
     return json.loads(row["payload_json"])
 
 
+def native_action_calls(fake):
+    """open -a and close/quit osascript — not the running-process listing."""
+    out = []
+    for argv in fake.calls:
+        if not argv:
+            continue
+        if argv[:2] == ["open", "-a"]:
+            out.append(argv)
+        elif argv[:2] == ["osascript", "-e"] and "every process" not in argv[2]:
+            out.append(argv)
+    return out
+
+
 def assert_no_task_fields(body):
     for field in TASK_FIELDS:
         assert field not in body, f"non-action turn leaked task field {field!r}"
@@ -118,12 +131,22 @@ class FakeSubprocess:
     def __init__(self):
         self.calls = []
         self.returncode = 0
+        self.running = ["Notes", "Safari", "Google Chrome", "Slack", "Mail", "Finder"]
 
     def run(self, argv, **kwargs):
         # NativeExecutor must pass args as a list, never a shell string (§5).
         assert isinstance(argv, list)
-        assert argv[:2] == ["open", "-a"]
+        assert not kwargs.get("shell")
         self.calls.append(argv)
+        is_list = (
+            argv
+            and argv[0] == "osascript"
+            and any("every process" in str(part) for part in argv)
+        )
+        if is_list:
+            return types.SimpleNamespace(
+                returncode=0, stdout=", ".join(self.running), stderr=""
+            )
         return types.SimpleNamespace(
             returncode=self.returncode, stdout="", stderr=""
         )
@@ -271,6 +294,7 @@ def _no_real_whisper(monkeypatch):
 def fake_open(monkeypatch):
     fake = FakeSubprocess()
     monkeypatch.setattr(actions.subprocess, "run", fake.run)
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: [])
     return fake
 
 
@@ -465,6 +489,154 @@ def test_open_app_then_bare_name_continues(client, ids, fake_open):
     assert second["task_id"] == first["task_id"]
     assert second["task_status"] == "SUCCESS"
     assert fake_open.calls == [["open", "-a", "Notes"]]
+
+
+def test_close_app_success(client, ids, fake_open):
+    body = chat(client, "close Notes", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "close_app"
+    assert body["risk"] == "low"
+    assert body["confirm_required"] is False
+    assert body["task_status"] == "SUCCESS"
+    scripts = native_action_calls(fake_open)
+    assert scripts == [["osascript", "-e", 'tell application "Notes" to close every window']]
+    assert "Closed Notes" in body["answer"]
+
+
+def test_close_multiple_apps_one_action(client, ids, fake_open):
+    body = chat(client, "close Notes and Safari", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "close_app"
+    assert body["confirm_required"] is False
+    assert body["task_status"] == "SUCCESS"
+    assert body["resolved_params"]["app_names"] == ["Notes", "Safari"]
+    scripts = native_action_calls(fake_open)
+    assert scripts == [
+        ["osascript", "-e", 'tell application "Notes" to close every window'],
+        ["osascript", "-e", 'tell application "Safari" to close every window'],
+    ]
+    assert "Closed Notes and Safari" in body["answer"]
+
+
+def test_close_typo_verb_still_closes(client, ids, fake_open):
+    body = chat(client, "clsoe Notes", ids)
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Notes" to close every window']
+    ]
+
+
+def test_close_typo_name_fuzzy_matches(client, ids, fake_open):
+    body = chat(client, "close Safar", ids)
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Safari" to close every window']
+    ]
+    assert "Closed Safari" in body["answer"]
+
+
+def test_close_unknown_app_fails_honestly(client, ids, fake_open):
+    body = chat(client, "close Zorbulon", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "FAILED"
+    assert "couldn't find an app called Zorbulon" in body["answer"]
+    assert native_action_calls(fake_open) == []
+
+
+def test_quit_app_goes_pending(client, ids, fake_open):
+    body = chat(client, "quit Safari", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["risk"] == "high"
+    assert body["confirm_required"] is True
+    assert body["task_status"] == "PENDING"
+    assert "Ready to quit Safari" in body["answer"]
+    assert native_action_calls(fake_open) == []
+
+
+def test_quit_typo_verb_still_quits_after_confirm(client, ids, fake_open):
+    body = chat(client, "quti Safari", ids)
+    assert body["action_type"] == "quit_app"
+    assert body["confirm_required"] is True
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Safari" to quit']
+    ]
+    assert "Quit Safari" in out["answer"]
+
+
+def test_quit_multiple_one_confirm(client, ids, fake_open):
+    body = chat(client, "quit Chrome, Slack, and Notes", ids)
+    assert body["action_type"] == "quit_app"
+    assert body["confirm_required"] is True
+    assert body["resolved_params"]["app_names"] == ["Chrome", "Slack", "Notes"]
+    assert "Quit them?" in body["answer"]
+    assert native_action_calls(fake_open) == []
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Google Chrome" to quit'],
+        ["osascript", "-e", 'tell application "Slack" to quit'],
+        ["osascript", "-e", 'tell application "Notes" to quit'],
+    ]
+
+
+def test_close_then_quit_runs_close_and_confirms_quit(client, ids, fake_open):
+    body = chat(client, "close Notes and quit Safari", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["confirm_required"] is True
+    assert "Closed Notes" in body["answer"]
+    assert "Ready to quit Safari" in body["answer"]
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Notes" to close every window']
+    ]
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Notes" to close every window'],
+        ["osascript", "-e", 'tell application "Safari" to quit'],
+    ]
+
+
+def test_close_the_draft_is_resume_not_close_app(client, ids, fake_composio):
+    body = chat(client, "close the draft", ids)
+    assert body["engine"] == "action"
+    assert body["answer"] == main.RESUME_MISS_REPLY
+    assert body.get("task_id") is None
+    rows = [r for r in action_rows(ids) if r["action_type"] == "close_app"]
+    assert rows == []
+
+
+def test_quit_already_quit_does_not_hit_notes_plus(client, ids, fake_open, monkeypatch):
+    fake_open.running = ["Notes+", "Safari"]
+    monkeypatch.setattr(
+        actions, "_list_installed_app_names", lambda: ["Notes", "Notes+", "Safari"]
+    )
+    body = chat(client, "quit Notes", ids)
+    assert body["action_type"] == "quit_app"
+    assert body["confirm_required"] is True
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert "already quit" in out["answer"].lower()
+    assert "Notes+" not in out["answer"]
+    assert native_action_calls(fake_open) == []
+
+
+def test_close_already_closed_is_not_unknown(client, ids, fake_open, monkeypatch):
+    fake_open.running = ["Safari"]
+    monkeypatch.setattr(
+        actions, "_list_installed_app_names", lambda: ["Notes", "Safari"]
+    )
+    body = chat(client, "close Notes", ids)
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "SUCCESS"
+    assert "isn't open" in body["answer"].lower()
+    assert native_action_calls(fake_open) == []
 
 
 def test_llm_drops_app_name_but_extract_recovers(client, ids, fake_open, monkeypatch):
