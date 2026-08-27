@@ -396,6 +396,29 @@ def test_open_app_success(client, ids, fake_open):
     assert "Opened Notes" in body["answer"]
 
 
+def test_open_multiple_apps_one_action(client, ids, fake_open):
+    body = chat(client, "open Notes and Safari", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "open_app"
+    assert body["confirm_required"] is False
+    assert body["task_status"] == "SUCCESS"
+    assert body["resolved_params"]["app_names"] == ["Notes", "Safari"]
+    assert fake_open.calls == [["open", "-a", "Notes"], ["open", "-a", "Safari"]]
+    assert "Opened Notes and Safari" in body["answer"]
+
+
+def test_open_oxford_list(client, ids, fake_open):
+    body = chat(client, "open Chrome, Slack, and Notes", ids)
+    assert body["action_type"] == "open_app"
+    assert body["task_status"] == "SUCCESS"
+    assert body["resolved_params"]["app_names"] == ["Chrome", "Slack", "Notes"]
+    assert fake_open.calls == [
+        ["open", "-a", "Chrome"],
+        ["open", "-a", "Slack"],
+        ["open", "-a", "Notes"],
+    ]
+
+
 def test_open_app_unknown_app_fails_honestly(client, ids, fake_open):
     fake_open.returncode = 1
     body = chat(client, "open Zorbulon", ids)
@@ -636,6 +659,64 @@ def test_close_already_closed_is_not_unknown(client, ids, fake_open, monkeypatch
     assert body["action_type"] == "close_app"
     assert body["task_status"] == "SUCCESS"
     assert "isn't open" in body["answer"].lower()
+    assert native_action_calls(fake_open) == []
+
+
+def test_open_and_quit_keeps_quit_target(client, ids, fake_open):
+    """Live log: 'open music and quit messages' dropped app_names on quit."""
+    body = chat(client, "open Notes and quit Safari", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["confirm_required"] is True
+    assert body["resolved_params"]["app_names"] == ["Safari"]
+    assert "Opened Notes" in body["answer"]
+    assert "Ready to quit Safari" in body["answer"]
+    assert native_action_calls(fake_open) == [["open", "-a", "Notes"]]
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [
+        ["open", "-a", "Notes"],
+        ["osascript", "-e", 'tell application "Safari" to quit'],
+    ]
+
+
+def test_quit_missing_name_then_bare_name_is_not_close(client, ids, fake_open, monkeypatch):
+    """Live log: after quit lost the name, 'messages' ran as close_app."""
+    first = chat(client, "quit app", ids)
+    assert first["action_type"] == "quit_app"
+    assert first["task_status"] == "AWAITING_INPUT"
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_classify_with_llm",
+        lambda *a, **k: {
+            "intent": "ACTION",
+            "confidence": 0.9,
+            "is_question": False,
+            "kind": "ACTION",
+            "memory_score": 0.0,
+            "docs_score": 0.0,
+            "chat_score": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        intent,
+        "_analyze_action_with_llm",
+        lambda *a, **k: {
+            "action_type": "close_app",
+            "resolved_params": {"app_names": ["messages"]},
+            "missing_params": [],
+            "related": False,
+            "confidence": 0.9,
+        },
+    )
+    second = chat(client, "messages", ids)
+    assert second["engine"] == "action"
+    assert second["action_type"] == "quit_app"
+    assert second["task_id"] == first["task_id"]
+    assert second["confirm_required"] is True
+    assert second["resolved_params"]["app_names"] == ["messages"]
     assert native_action_calls(fake_open) == []
 
 
@@ -2022,6 +2103,7 @@ def test_which_one_followup_address_is_not_open_app(client, ids, fake_composio):
     assert out["task_status"] == "AWAITING_INPUT"
     assert out["resolved_params"]["recipient"] == "sd@nothing.com"
     assert out.get("missing_params") != ["app_name"]
+    assert out.get("missing_params") != ["app_names"]
 
 
 def test_which_one_none_clears_pick(client, ids, fake_composio):

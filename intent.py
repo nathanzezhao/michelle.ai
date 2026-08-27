@@ -434,28 +434,50 @@ def analyze_action_request(
     """
     history = history or []
     mode = os.getenv("INTENT_MODE", "llm").lower()
+    rules = _analyze_action_with_rules(text, task_context)
 
     if mode in ("rules", "mock") or _intent_backend() == "rules":
-        raw = _analyze_action_with_rules(text, task_context)
+        raw = rules
+    elif _rules_action_is_grounded(rules):
+        raw = rules
     else:
         try:
             raw = _analyze_action_with_llm(text, history, task_context)
         except Exception as e:
             print(f"Action analyze LLM failed ({e}), falling back to rules")
-            raw = _analyze_action_with_rules(text, task_context)
+            raw = rules
         else:
             # llama often returns open_app with empty resolved_params, or
             # related=false on a bare app name. Fill gaps from the rules
             # extractor — never invent values, only recover what the user typed.
-            raw = _fill_action_from_rules(
-                raw, _analyze_action_with_rules(text, task_context)
-            )
+            raw = _fill_action_from_rules(raw, rules)
 
     return _finalize_action_analysis(raw, text, history, task_context)
 
 
 def _params_dict(value) -> dict:
     return value if isinstance(value, dict) else {}
+
+
+def _rules_action_is_grounded(rules: dict) -> bool:
+    """Rules already extracted a real whitelist action — skip the analyzer LLM."""
+    if not isinstance(rules, dict):
+        return False
+    if rules.get("resume") or rules.get("dismiss"):
+        return True
+    action_type = str(rules.get("action_type") or "").strip().lower()
+    if action_type not in ACTION_WHITELIST:
+        return False
+    resolved = _params_dict(rules.get("resolved_params"))
+    if action_type == "open_app":
+        return not _param_empty(resolved.get("app_names")) or not _param_empty(
+            resolved.get("app_name")
+        )
+    if action_type in ("close_app", "quit_app"):
+        return not _param_empty(resolved.get("app_names"))
+    if action_type == "send_email":
+        return True
+    return False
 
 
 def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
@@ -489,6 +511,11 @@ def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
                 resolved["app_name"] = str(resolved[alias]).strip()
                 break
     for key, value in _params_dict(rules.get("resolved_params")).items():
+        # Typed app names from the regex beat llama guesses that later fail
+        # grounding ("quit messages" → empty → ask which app).
+        if key in ("app_name", "app_names") and not _param_empty(value):
+            resolved[key] = value
+            continue
         if _param_empty(resolved.get(key)) and not _param_empty(value):
             resolved[key] = value
     out["resolved_params"] = _coerce_app_params(raw_type, resolved)
@@ -694,7 +721,7 @@ def _split_app_names(raw: str) -> list[str]:
 
 def _coerce_app_params(action_type: str, resolved: dict) -> dict:
     out = dict(resolved or {})
-    if action_type not in ("close_app", "quit_app"):
+    if action_type not in ("open_app", "close_app", "quit_app"):
         return out
     names = out.get("app_names")
     if isinstance(names, str) and names.strip():
@@ -771,10 +798,10 @@ def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
 
     open_match = _OPEN_APP_EXTRACT_RE.match(stripped)
     if open_match and _ACTION_OPEN_RE.match(stripped):
-        app = _clean_app_name(open_match.group(1))
+        names = _split_app_names(open_match.group(1))
         return {
             "action_type": "open_app",
-            "resolved_params": {"app_name": app} if app else {},
+            "resolved_params": {"app_names": names} if names else {},
             "confidence": 0.9,
             "related": bool(
                 task_context and task_context.get("action_type") == "open_app"
@@ -802,12 +829,17 @@ def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
                 for k, v in _extract_email_params(stripped).items()
                 if k in missing
             }
-        elif action_type == "open_app" and "app_name" in missing:
-            bare = re.fullmatch(r"[A-Za-z][\w .'+-]{0,40}", stripped)
-            if bare and not _looks_like_question(stripped):
-                app = _clean_app_name(stripped)
-                if app:
-                    supplied = {"app_name": app}
+        elif action_type == "open_app" and (
+            "app_names" in missing or "app_name" in missing
+        ):
+            if not _looks_like_question(stripped):
+                names = _split_app_names(stripped)
+                if names and re.fullmatch(
+                    r"[A-Za-z][\w .'+-]*(?:\s*(?:,|&|and)\s*[A-Za-z][\w .'+-]*)*",
+                    stripped.strip().strip("\"'"),
+                    re.IGNORECASE,
+                ):
+                    supplied = {"app_names": names}
         elif action_type in ("close_app", "quit_app") and "app_names" in missing:
             if not _looks_like_question(stripped):
                 names = _split_app_names(stripped)
@@ -886,9 +918,9 @@ Rules:
 - Opening/launching a program is open_app. Closing windows (app stays
   running) is close_app. Quitting/exiting a program is quit_app. Sending
   or finishing mail is never open_app, close_app, or quit_app.
-- close_app and quit_app take resolved_params.app_names as an array of
-  the app names the user said (one or more). "close Notes and Safari" →
-  close_app with app_names ["Notes","Safari"]. Do not invent names.
+- open_app, close_app, and quit_app take resolved_params.app_names as an
+  array of the app names the user said (one or more). "open Notes and
+  Safari" → open_app with app_names ["Notes","Safari"]. Do not invent names.
 - "close the draft" / "close that email" is resume send_email, not close_app.
 - "unsupported" for any task that is not exactly one of the supported types
   (booking, deleting files, reminders, browsing, etc.).

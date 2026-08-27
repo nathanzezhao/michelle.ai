@@ -34,7 +34,7 @@ DB_PATH = Path(os.getenv("MICHELLE_DB_PATH", "michelle.db"))
 ACTION_WHITELIST = {
     "open_app": {
         "risk": "low",
-        "required_params": ["app_name"],
+        "required_params": ["app_names"],
         "executor": "native",
     },
     "close_app": {
@@ -882,22 +882,51 @@ class NativeExecutor:
         }
 
     def _open_app(self, params: dict) -> dict:
-        app_name = str(params.get("app_name") or "").strip()
-        try:
-            result = subprocess.run(
-                ["open", "-a", app_name],
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-        except Exception as e:
-            return {"ok": False, "detail": f"open failed: {e}", "error": "open_failed"}
-        if result.returncode == 0:
-            return {"ok": True, "detail": f"Opened {app_name}.", "error": None}
+        names = _app_names_from_params(params)
+        if not names:
+            return {
+                "ok": False,
+                "detail": "which apps to open",
+                "error": "missing_params",
+            }
+        lines = []
+        ok_names = []
+        fail_names = []
+        for typed in names:
+            try:
+                result = subprocess.run(
+                    ["open", "-a", typed],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+            except Exception as e:
+                fail_names.append(typed)
+                lines.append(f"{typed} didn't open: {e}")
+                continue
+            if result.returncode == 0:
+                ok_names.append(typed)
+                lines.append(f"Opened {typed}.")
+            else:
+                fail_names.append(typed)
+                lines.append(f"I couldn't find an app called {typed}.")
+        if ok_names and not fail_names:
+            return {
+                "ok": True,
+                "detail": f"Opened {_format_app_list(ok_names)}.",
+                "error": None,
+            }
+        if not ok_names:
+            listed = _format_app_list(fail_names or names)
+            return {
+                "ok": False,
+                "detail": f"I couldn't find an app called {listed} — nothing was opened.",
+                "error": "app_not_found",
+            }
         return {
             "ok": False,
-            "detail": f"couldn't find an app called {app_name}",
-            "error": "app_not_found",
+            "detail": " ".join(lines),
+            "error": "partial_failure",
         }
 
     def _close_or_quit(self, params: dict, *, quit_app: bool) -> dict:

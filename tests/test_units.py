@@ -195,12 +195,12 @@ def test_slang_open_is_action_order(text):
     assert classify_intent(text)["intent"] == "ACTION"
     analysis = analyze_action_request(text)
     assert analysis["action_type"] == "open_app"
-    assert analysis["resolved_params"].get("app_name")
+    assert analysis["resolved_params"].get("app_names")
 
 
 def test_app_names_are_not_a_closed_list():
     analysis = analyze_action_request("pls launch xyzzyqorp")
-    assert analysis["resolved_params"]["app_name"] == "xyzzyqorp"
+    assert analysis["resolved_params"]["app_names"] == ["xyzzyqorp"]
 
 
 def test_llm_empty_params_still_extracts_notes(monkeypatch):
@@ -219,7 +219,7 @@ def test_llm_empty_params_still_extracts_notes(monkeypatch):
     )
     analysis = analyze_action_request("open Notes")
     assert analysis["action_type"] == "open_app"
-    assert analysis["resolved_params"]["app_name"] == "Notes"
+    assert analysis["resolved_params"]["app_names"] == ["Notes"]
     assert analysis["missing_params"] == []
 
 
@@ -463,6 +463,40 @@ def test_close_and_quit_extract_names():
     assert mail["action_type"] == "close_app"
     assert mail["resolved_params"]["app_names"] == ["Mail"]
     assert classify_intent("that's quite nice")["intent"] != "ACTION"
+    mixed = parse_mixed_utterance("open music and quit messages")
+    assert mixed["actions"] == ["open music", "quit messages"]
+    quit_clause = analyze_action_request("quit messages")
+    assert quit_clause["action_type"] == "quit_app"
+    assert quit_clause["resolved_params"]["app_names"] == ["messages"]
+    assert quit_clause["missing_params"] == []
+    both = analyze_action_request("open Notes and Safari")
+    assert both["action_type"] == "open_app"
+    assert both["resolved_params"]["app_names"] == ["Notes", "Safari"]
+    oxford_open = analyze_action_request("open Chrome, Slack, and Notes")
+    assert oxford_open["resolved_params"]["app_names"] == ["Chrome", "Slack", "Notes"]
+
+
+def test_llm_empty_quit_names_do_not_stick(monkeypatch):
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    called = []
+
+    def boom(*a, **k):
+        called.append(True)
+        return {
+            "action_type": "quit_app",
+            "resolved_params": {},
+            "missing_params": ["app_names"],
+            "related": True,
+            "confidence": 0.9,
+        }
+
+    monkeypatch.setattr(intent, "_analyze_action_with_llm", boom)
+    analysis = analyze_action_request("quit messages")
+    assert analysis["action_type"] == "quit_app"
+    assert analysis["resolved_params"]["app_names"] == ["messages"]
+    assert analysis["missing_params"] == []
+    assert called == []
 
 
 def test_fuzzy_app_name_prefers_running_and_skips_near_misses(monkeypatch):

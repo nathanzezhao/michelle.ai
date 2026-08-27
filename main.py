@@ -213,6 +213,8 @@ def _missing_ask(action_type: str, missing: list) -> str:
         labels["app_names"] = "which app to close"
     elif action_type == "quit_app":
         labels["app_names"] = "which apps to quit"
+    elif action_type == "open_app":
+        labels["app_names"] = "which apps to open"
     wanted = [labels.get(p, p) for p in missing]
     if len(wanted) > 1:
         listed = ", ".join(wanted[:-1]) + " and " + wanted[-1]
@@ -238,12 +240,14 @@ def _pending_summary(action_type: str, params: dict) -> str:
 def _exec_reply(action_type: str, params: dict, status: str, exec_result: dict) -> str:
     detail = str(exec_result.get("detail") or "").strip()
     if status == "SUCCESS":
-        if action_type == "open_app":
-            return f"Opened {params.get('app_name')}."
-        if action_type in ("close_app", "quit_app"):
-            return detail or (
-                f"{'Quit' if action_type == 'quit_app' else 'Closed'} {_named_apps(params)}."
-            )
+        if action_type in ("open_app", "close_app", "quit_app"):
+            if action_type == "open_app":
+                default = f"Opened {_named_apps(params)}."
+            elif action_type == "quit_app":
+                default = f"Quit {_named_apps(params)}."
+            else:
+                default = f"Closed {_named_apps(params)}."
+            return detail or default
         return f"Sent the email to {params.get('recipient')}."
     if exec_result.get("error") == "composio_not_connected":
         link = exec_result.get("connect_link")
@@ -253,15 +257,10 @@ def _exec_reply(action_type: str, params: dict, status: str, exec_result: dict) 
                 f"Open this link to connect it: {link}"
             )
         return COMPOSIO_NOT_CONNECTED_REPLY
-    if action_type == "open_app":
-        return (
-            f"I couldn't find an app called {params.get('app_name')} — "
-            "nothing was opened."
-        )
-    if action_type in ("close_app", "quit_app"):
+    if action_type in ("open_app", "close_app", "quit_app"):
         return detail or (
             f"I couldn't find an app called {_named_apps(params)} — "
-            f"nothing was {'quit' if action_type == 'quit_app' else 'closed'}."
+            f"nothing was {'opened' if action_type == 'open_app' else 'quit' if action_type == 'quit_app' else 'closed'}."
         )
     return f"That didn't work — {detail or 'the action failed'}."
 
@@ -961,9 +960,75 @@ def handle_chat(incoming_data: UserMessage):
         )
 
         # --- ACTION engine (SPEC-PIPELINE §3.2, §4, §10) ---------------------
-        # One extra analyzer call, made ONLY on action turns — exactly like
-        # analyze_remember_request on REMEMBER turns.
+        # Continue a paused AWAITING_INPUT row before starting a new ACTION.
+        # Live bug: "quit messages" lost the name, then "messages" classified
+        # as ACTION/close and cancelled the quit.
         action_note = ""
+        if open_action and open_action["status"] == "AWAITING_INPUT":
+            analysis = analyze_action_request(
+                user_text, reply_history, task_context=open_action
+            )
+            dismissed = bool(analysis.get("dismiss"))
+            if (
+                not dismissed
+                and open_action["action_type"] == "send_email"
+                and not analysis.get("related")
+                and classify_composer_dismiss(user_text)
+            ):
+                dismissed = True
+            if dismissed and open_action["action_type"] == "send_email":
+                action, _ = actions.upsert_gmail_draft(open_action)
+                action = action or open_action
+                snapshot = {
+                    "action_id": action["action_id"],
+                    "resolved_params": dict(action.get("resolved_params") or {}),
+                    "gmail_draft_id": action.get("gmail_draft_id"),
+                }
+                actions.cancel_action(action["action_id"], discard_gmail=False)
+                _pending_draft_asks[(user_id, conversation_id)] = snapshot
+                save_message(conversation_id, "user", user_text, kind="action")
+                save_message(
+                    conversation_id, "assistant", SAVE_DRAFT_ASK, kind="action"
+                )
+                print(
+                    f"[{provider}] [{conversation_id[:8]}] "
+                    f"action {open_action['action_id'][:8]} dismissed → "
+                    "save-draft ask"
+                )
+                return {
+                    "answer": SAVE_DRAFT_ASK,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "intent": "CHAT",
+                    "is_question": False,
+                    "kind": "CHAT",
+                    "remembered": [],
+                    "asked_to_remember": False,
+                    "asked_to_save_draft": True,
+                    "engine": "chat",
+                }
+            if (
+                analysis.get("related")
+                and analysis["action_type"] == open_action["action_type"]
+            ):
+                action = actions.update_action(
+                    open_action["action_id"],
+                    resolved_params=analysis["resolved_params"],
+                    missing_params=analysis["missing_params"],
+                )
+                action, answer = _settle_action(action, "")
+                save_message(conversation_id, "user", user_text, kind="action")
+                save_message(conversation_id, "assistant", answer, kind="action")
+                print(
+                    f"[{provider}] [{conversation_id[:8]}] "
+                    f"action {action['action_id'][:8]} continued → "
+                    f"{action['status']}"
+                )
+                return _action_turn_payload(
+                    answer, conversation_id, user_id, action, intent_result,
+                    attachments=incoming_data.attachments,
+                )
+
         if intent == "ACTION":
             action, answer = _handle_action_intents(
                 user_text,
@@ -1022,75 +1087,6 @@ def handle_chat(incoming_data: UserMessage):
                 "engine": "chat",
             }
         if open_action:
-            if open_action["status"] == "AWAITING_INPUT":
-                # Paused action: the analyzer (given the task context) decides
-                # related vs. unrelated (§10-B).
-                analysis = analyze_action_request(
-                    user_text, reply_history, task_context=open_action
-                )
-                dismissed = bool(analysis.get("dismiss"))
-                if (
-                    not dismissed
-                    and open_action["action_type"] == "send_email"
-                    and not analysis.get("related")
-                    and classify_composer_dismiss(user_text)
-                ):
-                    dismissed = True
-                if (
-                    dismissed
-                    and open_action["action_type"] == "send_email"
-                ):
-                    action, _ = actions.upsert_gmail_draft(open_action)
-                    action = action or open_action
-                    snapshot = {
-                        "action_id": action["action_id"],
-                        "resolved_params": dict(action.get("resolved_params") or {}),
-                        "gmail_draft_id": action.get("gmail_draft_id"),
-                    }
-                    actions.cancel_action(action["action_id"], discard_gmail=False)
-                    _pending_draft_asks[(user_id, conversation_id)] = snapshot
-                    save_message(conversation_id, "user", user_text, kind="action")
-                    save_message(
-                        conversation_id, "assistant", SAVE_DRAFT_ASK, kind="action"
-                    )
-                    print(
-                        f"[{provider}] [{conversation_id[:8]}] "
-                        f"action {open_action['action_id'][:8]} dismissed → "
-                        "save-draft ask"
-                    )
-                    return {
-                        "answer": SAVE_DRAFT_ASK,
-                        "conversation_id": conversation_id,
-                        "user_id": user_id,
-                        "intent": "CHAT",
-                        "is_question": False,
-                        "kind": "CHAT",
-                        "remembered": [],
-                        "asked_to_remember": False,
-                        "asked_to_save_draft": True,
-                        "engine": "chat",
-                    }
-                if (
-                    analysis.get("related")
-                    and analysis["action_type"] == open_action["action_type"]
-                ):
-                    action = actions.update_action(
-                        open_action["action_id"],
-                        resolved_params=analysis["resolved_params"],
-                        missing_params=analysis["missing_params"],
-                    )
-                    action, answer = _settle_action(action, "")
-                    save_message(conversation_id, "user", user_text, kind="action")
-                    save_message(conversation_id, "assistant", answer, kind="action")
-                    print(
-                        f"[{provider}] [{conversation_id[:8]}] "
-                        f"action {action['action_id'][:8]} continued → "
-                        f"{action['status']}"
-                    )
-                    return _action_turn_payload(
-                        answer, conversation_id, user_id, action, intent_result,
-                        attachments=incoming_data.attachments,
-                    )
             # Unrelated turn: Michelle's open question dies quietly — cancel
             # the action, carry a one-line drop note, handle the new message
             # normally, never nag about it later (§10-B).
