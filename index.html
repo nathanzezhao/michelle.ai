@@ -511,6 +511,9 @@
         const greeting = data.greeting || "What's up?"
         if (greetingBubble) {
           revealScramble(greetingBubble, greeting)
+          if (data.action_type === "send_email" && data.task_status === "AWAITING_INPUT") {
+            attachComposer(greetingBubble, data)
+          }
         }
       })
       .catch(error => {
@@ -863,6 +866,7 @@ function applyDraftResult(out, fromVoice) {
     activeComposer._bodyFromTapGenerate = !fromVoice
     if (fromVoice) showHeard(out.transcript)
     else showHeard('')
+    if (activeComposer._scheduleSync) activeComposer._scheduleSync()
   }
   setGenState('default')
 }
@@ -969,6 +973,9 @@ function removeActionButtons() {
 
 function removeComposer() {
   if (!activeComposer) return;
+  if (activeComposer._syncTimer) {
+    clearTimeout(activeComposer._syncTimer());
+  }
   activeComposer.remove();
   activeComposer = null;
   composerDock.classList.remove("open");
@@ -1067,8 +1074,36 @@ function attachComposer(bubble, data) {
   composer._undoBody = null;
   composer._undoFromTap = false;
 
+  let syncTimer = null;
+  function scheduleSync() {
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(syncDraft, 1500);
+  }
+  function syncDraft() {
+    if (!activeComposer || activeComposer !== composer || !composer._readDraft) return;
+    const draft = composer._readDraft();
+    fetch("http://127.0.0.1:8000/action/sync_draft", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recipient: draft.to,
+        subject: draft.subject,
+        body: draft.body,
+        conversation_id: conversationId,
+        user_id: userId
+      })
+    }).catch((error) => console.error("Draft sync failed:", error));
+  }
+  composer._syncTimer = () => syncTimer;
+  composer._scheduleSync = scheduleSync;
+
+  toInput.addEventListener("input", scheduleSync);
+  subjectInput.addEventListener("input", scheduleSync);
+  urgentBtn.addEventListener("click", scheduleSync);
+
   bodyInput.addEventListener("input", () => {
     composer._bodyFromTapGenerate = false;
+    scheduleSync();
   });
   composer._focusMissing = function () {
     if (!toInput.value.trim()) toInput.focus();
@@ -1122,6 +1157,9 @@ function submitComposer() {
   if (!draft.to || !draft.subject || !draft.body) {
     activeComposer._focusMissing();
     return true;
+  }
+  if (activeComposer._syncTimer) {
+    clearTimeout(activeComposer._syncTimer());
   }
   removeComposer();
   const botBubble = addBubble("", "bot");

@@ -33,6 +33,7 @@ Coverage map (§13 criterion → tests):
        and criterion-4 tests (near-miss leaves no row)
 """
 
+import base64
 import io
 import json
 import sqlite3
@@ -133,11 +134,103 @@ class FakeComposio:
 
     def __init__(self, result=None):
         self.calls = []
+        self.draft_calls = []
+        self.drafts = {}
+        self._n = 0
+        self._clock = 0
         self.result = result or {"ok": True, "detail": "email sent", "error": None}
+        self.connected = True
+
+    def _next_id(self):
+        self._n += 1
+        return f"r-fake-{self._n}"
 
     def execute(self, action_type, params):
         self.calls.append((action_type, dict(params)))
         return self.result
+
+    def create_draft(self, params):
+        self.draft_calls.append(("create", dict(params)))
+        if not self.connected:
+            return {
+                "ok": False,
+                "error": "composio_not_connected",
+                "detail": "COMPOSIO_API_KEY is not set",
+            }
+        draft_id = self._next_id()
+        stored = dict(params)
+        self._clock += 1
+        stored["updated_at"] = str(self._clock)
+        self.drafts[draft_id] = stored
+        return {"ok": True, "draft_id": draft_id, "error": None, "detail": "draft created"}
+
+    def update_draft(self, draft_id, params):
+        self.draft_calls.append(("update", draft_id, dict(params)))
+        if not self.connected:
+            return {
+                "ok": False,
+                "error": "composio_not_connected",
+                "detail": "COMPOSIO_API_KEY is not set",
+            }
+        if draft_id not in self.drafts:
+            return {"ok": False, "error": "composio_error", "detail": "unknown draft"}
+        stored = dict(params)
+        self._clock += 1
+        stored["updated_at"] = str(self._clock)
+        self.drafts[draft_id] = stored
+        return {"ok": True, "draft_id": draft_id, "error": None, "detail": "draft updated"}
+
+    def get_draft(self, draft_id):
+        self.draft_calls.append(("get", draft_id))
+        if draft_id not in self.drafts:
+            return {"ok": False, "error": "composio_error", "detail": "not found"}
+        stored = self.drafts[draft_id]
+        payload = stored["get"] if isinstance(stored.get("get"), dict) else stored
+        fields = {}
+        for src in (payload, {"data": payload}):
+            for key, val in actions._extract_draft_fields(src).items():
+                if key in ("recipient", "subject", "body") and val and key not in fields:
+                    fields[key] = val
+        for key in ("recipient", "subject", "body"):
+            val = payload.get(key) if isinstance(payload, dict) else None
+            if key not in fields and isinstance(val, str) and val.strip():
+                fields[key] = val.strip()
+        return {
+            "ok": True,
+            "draft_id": draft_id,
+            "resolved_params": fields,
+            "error": None,
+        }
+
+    def delete_draft(self, draft_id):
+        self.draft_calls.append(("delete", draft_id))
+        self.drafts.pop(draft_id, None)
+        return {"ok": True, "error": None, "detail": "draft deleted"}
+
+    def send_draft(self, draft_id):
+        self.draft_calls.append(("send", draft_id))
+        if draft_id not in self.drafts:
+            return {"ok": False, "error": "composio_error", "detail": "unknown draft"}
+        self.drafts.pop(draft_id, None)
+        return {"ok": True, "detail": "email sent", "error": None}
+
+    def list_drafts(self, *, limit=50):
+        self.draft_calls.append(("list", limit))
+        if not self.connected:
+            return {
+                "ok": False,
+                "error": "composio_not_connected",
+                "detail": "COMPOSIO_API_KEY is not set",
+                "drafts": [],
+            }
+        items = []
+        for draft_id, params in self.drafts.items():
+            data = dict(params)
+            item = {"id": draft_id, "draft_id": draft_id, "data": data}
+            if params.get("updated_at"):
+                item["updated_at"] = params["updated_at"]
+            items.append(item)
+        return {"ok": True, "drafts": items[:limit], "error": None}
 
 
 class BoomExecutor:
@@ -1046,7 +1139,7 @@ def test_nevermind_dismisses_composer_and_asks_to_save_draft(client, ids):
     assert fetch_row(body["task_id"])["status"] == "CANCELLED"
 
     yes = chat(client, "yes", ids)
-    assert yes["answer"] == main.SAVE_DRAFT_YES_REPLY
+    assert yes["answer"] == main.SAVE_DRAFT_YES_NOT_READY
     assert yes.get("asked_to_save_draft") is False
     assert_no_task_fields(yes)
 
@@ -1208,3 +1301,574 @@ def test_startup_sweep_closes_open_rows_and_executes_nothing(monkeypatch):
         assert fetch_row(seeded[status]) == before[seeded[status]], (
             f"terminal {status} row changed during startup sweep"
         )
+
+
+# --- Gmail drafts: autosave, nevermind yes/no, confirm via send_draft --------
+
+
+def sync_draft(client, ids, recipient, subject, body):
+    resp = client.post(
+        "/action/sync_draft",
+        json={
+            "recipient": recipient,
+            "subject": subject,
+            "body": body,
+            **ids,
+        },
+    )
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def test_sync_draft_creates_then_updates_gmail_draft(client, ids, fake_composio):
+    first = chat(client, "send an email", ids)
+    assert first["task_status"] == "AWAITING_INPUT"
+
+    out = sync_draft(client, ids, "alex@example.com", "hi", "hello")
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["task_id"] == first["task_id"]
+    assert fake_composio.draft_calls[0][0] == "create"
+    draft_id = payload(fetch_row(first["task_id"]))["gmail_draft_id"]
+    assert draft_id in fake_composio.drafts
+
+    again = sync_draft(client, ids, "alex@example.com", "hi", "hello there")
+    assert again["task_status"] == "AWAITING_INPUT"
+    assert fake_composio.draft_calls[-1][0] == "update"
+    assert fake_composio.drafts[draft_id]["body"] == "hello there"
+    assert fake_composio.calls == []
+
+
+def test_sync_draft_skips_until_real_to_address(client, ids, fake_composio):
+    chat(client, "send an email", ids)
+    out = sync_draft(client, ids, "alex", "hi", "hello")
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert fake_composio.draft_calls == []
+    assert "gmail_draft_id" not in payload(fetch_row(out["task_id"]))
+
+
+def test_sync_draft_without_open_composer_does_not_create(client, ids, fake_composio):
+    out = sync_draft(client, ids, "alex@example.com", "hi", "hello")
+    assert out["task_id"] is None
+    assert fake_composio.draft_calls == []
+
+
+def test_nevermind_yes_keeps_gmail_draft(client, ids, fake_composio):
+    first = chat(client, "send an email", ids)
+    sync_draft(client, ids, "alex@example.com", "hi", "hello")
+    draft_id = payload(fetch_row(first["task_id"]))["gmail_draft_id"]
+
+    ask = chat(client, "nevermind", ids)
+    assert ask["asked_to_save_draft"] is True
+    assert fetch_row(first["task_id"])["status"] == "CANCELLED"
+
+    yes = chat(client, "yes", ids)
+    assert yes["answer"] == main.SAVE_DRAFT_YES_REPLY
+    assert draft_id in fake_composio.drafts
+    assert payload(fetch_row(first["task_id"]))["gmail_draft_kept"] is True
+    assert ("delete", draft_id) not in fake_composio.draft_calls
+    assert fake_composio.calls == []
+
+
+def test_nevermind_no_deletes_gmail_draft(client, ids, fake_composio):
+    first = chat(client, "send an email", ids)
+    sync_draft(client, ids, "alex@example.com", "hi", "hello")
+    draft_id = payload(fetch_row(first["task_id"]))["gmail_draft_id"]
+    chat(client, "nvm", ids)
+    out = chat(client, "no", ids)
+    assert out["answer"] == main.SAVE_DRAFT_NO_REPLY
+    assert draft_id not in fake_composio.drafts
+    assert ("delete", draft_id) in fake_composio.draft_calls
+
+
+def test_confirm_sends_gmail_draft_not_a_second_email(client, ids, fake_composio):
+    first = chat(client, "send an email", ids)
+    sync_draft(client, ids, **EMAIL_PARAMS)
+    draft_id = payload(fetch_row(first["task_id"]))["gmail_draft_id"]
+    pending = client.post(
+        "/action/submit_draft",
+        json={**EMAIL_PARAMS, **ids},
+    ).json()
+    assert pending["task_status"] == "PENDING"
+    out = confirm(client, ids, pending["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert fake_composio.calls == []
+    assert ("send", draft_id) in fake_composio.draft_calls
+    assert draft_id not in fake_composio.drafts
+
+
+def test_confirm_cancel_deletes_gmail_draft(client, ids, fake_composio):
+    chat(client, "send an email", ids)
+    sync_draft(client, ids, **EMAIL_PARAMS)
+    pending = client.post(
+        "/action/submit_draft",
+        json={**EMAIL_PARAMS, **ids},
+    ).json()
+    draft_id = payload(fetch_row(pending["task_id"]))["gmail_draft_id"]
+    out = confirm(client, ids, pending["task_id"], "cancel")
+    assert out["task_status"] == "CANCELLED"
+    assert draft_id not in fake_composio.drafts
+    assert ("delete", draft_id) in fake_composio.draft_calls
+    assert fake_composio.calls == []
+
+
+def test_sync_draft_noconnect_does_not_pretend_success(client, ids, fake_composio):
+    fake_composio.connected = False
+    first = chat(client, "send an email", ids)
+    out = sync_draft(client, ids, **EMAIL_PARAMS)
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert "gmail_draft_id" not in payload(fetch_row(first["task_id"]))
+    assert fake_composio.drafts == {}
+
+
+def test_session_start_restores_gmail_draft_after_sweep(client, ids, fake_composio):
+    first = chat(client, "send an email", ids)
+    sync_draft(client, ids, **EMAIL_PARAMS)
+    draft_id = payload(fetch_row(first["task_id"]))["gmail_draft_id"]
+    actions.startup_sweep()
+    assert fetch_row(first["task_id"])["status"] == "CANCELLED"
+    assert payload(fetch_row(first["task_id"]))["gmail_draft_id"] == draft_id
+
+    body = client.post("/session/start", json=ids).json()
+    assert body["task_status"] == "AWAITING_INPUT"
+    assert body["action_type"] == "send_email"
+    assert body["task_id"] != first["task_id"]
+    assert body["resolved_params"]["recipient"] == "alex@example.com"
+    assert payload(fetch_row(body["task_id"]))["gmail_draft_id"] == draft_id
+    assert payload(fetch_row(first["task_id"]))["gmail_draft_kept"] is True
+    assert ("get", draft_id) in fake_composio.draft_calls
+
+
+def test_session_start_skips_restore_if_gmail_draft_gone(client, ids, fake_composio):
+    first = chat(client, "send an email", ids)
+    sync_draft(client, ids, **EMAIL_PARAMS)
+    draft_id = payload(fetch_row(first["task_id"]))["gmail_draft_id"]
+    fake_composio.drafts.pop(draft_id)
+    actions.startup_sweep()
+    body = client.post("/session/start", json=ids).json()
+    assert "task_id" not in body
+    assert payload(fetch_row(first["task_id"])).get("gmail_draft_id") in (None, "")
+
+
+def test_nevermind_yes_without_composio_is_honest(client, ids):
+    chat(client, "send an email", ids)
+    sync_draft(client, ids, **EMAIL_PARAMS)
+    chat(client, "nevermind", ids)
+    yes = chat(client, "yes", ids)
+    assert yes["answer"] == main.SAVE_DRAFT_YES_NOT_CONNECTED
+    assert "Saved to Gmail" not in yes["answer"]
+
+
+def keep_draft(client, ids, fake_composio, recipient, subject, body):
+    first = chat(client, "send an email", ids)
+    sync_draft(client, ids, recipient=recipient, subject=subject, body=body)
+    chat(client, "nevermind", ids)
+    yes = chat(client, "yes", ids)
+    assert yes["answer"] == main.SAVE_DRAFT_YES_REPLY
+    draft_id = payload(fetch_row(first["task_id"]))["gmail_draft_id"]
+    assert draft_id in fake_composio.drafts
+    return first["task_id"], draft_id
+
+
+def test_send_that_draft_reopens_the_kept_gmail_draft(client, ids, fake_composio):
+    _, draft_id = keep_draft(client, ids, fake_composio, **EMAIL_PARAMS)
+    out = chat(client, "send that draft", ids)
+    assert out["engine"] == "action"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["action_type"] == "send_email"
+    assert payload(fetch_row(out["task_id"]))["gmail_draft_id"] == draft_id
+    assert out["resolved_params"]["recipient"] == "alex@example.com"
+    assert "Here's that draft" in out["answer"]
+    pending = client.post(
+        "/action/submit_draft",
+        json={**EMAIL_PARAMS, **ids},
+    ).json()
+    assert pending["task_status"] == "PENDING"
+    sent = confirm(client, ids, pending["task_id"], "confirm")
+    assert sent["task_status"] == "SUCCESS"
+    assert fake_composio.calls == []
+    assert ("send", draft_id) in fake_composio.draft_calls
+    assert draft_id not in fake_composio.drafts
+
+
+def test_describe_draft_matches_subject(client, ids, fake_composio):
+    keep_draft(
+        client, ids, fake_composio,
+        recipient="alex@example.com", subject="lunch", body="see you at 1",
+    )
+    other_ids = {
+        "conversation_id": ids["conversation_id"],
+        "user_id": ids["user_id"],
+    }
+    keep_draft(
+        client, other_ids, fake_composio,
+        recipient="sam@example.com", subject="project", body="status update",
+    )
+    out = chat(client, "the one about lunch", ids)
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["subject"] == "lunch"
+    assert out["resolved_params"]["recipient"] == "alex@example.com"
+
+
+def test_send_that_draft_with_two_asks_which(client, ids, fake_composio):
+    keep_draft(
+        client, ids, fake_composio,
+        recipient="alex@example.com", subject="lunch", body="see you",
+    )
+    keep_draft(
+        client, ids, fake_composio,
+        recipient="sam@example.com", subject="project", body="status",
+    )
+    out = chat(client, "send that draft", ids)
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["subject"] == "project"
+    assert out["resolved_params"]["recipient"] == "sam@example.com"
+    assert "Which one" not in out["answer"]
+    assert payload(fetch_row(out["task_id"]))["gmail_draft_id"] in fake_composio.drafts
+
+
+def test_two_lunch_drafts_asks_which(client, ids, fake_composio):
+    keep_draft(
+        client, ids, fake_composio,
+        recipient="alex@example.com", subject="lunch", body="see you at 1",
+    )
+    keep_draft(
+        client, ids, fake_composio,
+        recipient="sam@example.com", subject="lunch plans", body="see you at 2",
+    )
+    out = chat(client, "the one about lunch", ids)
+    assert out.get("task_id") is None
+    assert "Which one" in out["answer"]
+    assert "alex@example.com" in out["answer"]
+    assert "sam@example.com" in out["answer"]
+    assert len(open_rows(ids)) == 0
+
+
+def test_resume_miss_stays_honest(client, ids, fake_composio):
+    keep_draft(client, ids, fake_composio, **EMAIL_PARAMS)
+    out = chat(client, "the one about zebras", ids)
+    assert out["answer"] == main.RESUME_MISS_REPLY
+    assert out.get("task_id") is None
+    assert "I can't do that yet" not in out["answer"]
+    assert len(open_rows(ids)) == 0
+
+
+def test_send_an_email_still_starts_blank_when_a_draft_is_kept(client, ids, fake_composio):
+    keep_draft(client, ids, fake_composio, **EMAIL_PARAMS)
+    out = chat(client, "send an email", ids)
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"] == {}
+    assert payload(fetch_row(out["task_id"])).get("gmail_draft_id") in (None, "")
+
+
+def test_gmail_native_draft_resume_without_actions_log(client, ids, fake_composio):
+    fake_composio.drafts["r-native-lunch"] = {
+        "recipient": "pat@example.com",
+        "subject": "lunch",
+        "body": "see you at 1",
+        "updated_at": "2026-08-26T12:00:00Z",
+    }
+    assert action_rows(ids) == []
+    out = chat(client, "finish the lunch email", ids)
+    assert out["engine"] == "action"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["action_type"] == "send_email"
+    assert out["resolved_params"]["recipient"] == "pat@example.com"
+    assert out["resolved_params"]["subject"] == "lunch"
+    row_payload = payload(fetch_row(out["task_id"]))
+    assert row_payload["gmail_draft_id"] == "r-native-lunch"
+    assert row_payload["mail_provider"] == "gmail"
+    assert row_payload["mail_draft_id"] == "r-native-lunch"
+    assert ("list", 50) in fake_composio.draft_calls
+    assert ("get", "r-native-lunch") in fake_composio.draft_calls
+    pending = client.post(
+        "/action/submit_draft",
+        json={
+            "recipient": "pat@example.com",
+            "subject": "lunch",
+            "body": "see you at 1",
+            **ids,
+        },
+    ).json()
+    assert pending["task_status"] == "PENDING"
+    sent = confirm(client, ids, pending["task_id"], "confirm")
+    assert sent["task_status"] == "SUCCESS"
+    assert fake_composio.calls == []
+    assert ("send", "r-native-lunch") in fake_composio.draft_calls
+    assert "r-native-lunch" not in fake_composio.drafts
+
+
+def test_resume_empty_mailbox_is_miss(client, ids, fake_composio):
+    assert fake_composio.drafts == {}
+    out = chat(client, "send that draft", ids)
+    assert out["answer"] == main.RESUME_MISS_REPLY
+    assert out.get("task_id") is None
+    assert len(open_rows(ids)) == 0
+    assert ("list", 50) in fake_composio.draft_calls
+
+
+def test_resume_without_composio_does_not_invent_mailbox(client, ids):
+    out = chat(client, "send that draft", ids)
+    assert out["answer"] == main.RESUME_MISS_REPLY
+    assert out.get("task_id") is None
+    assert len(open_rows(ids)) == 0
+
+
+def test_unsynced_local_draft_still_resumes(client, ids, fake_composio):
+    first = chat(client, "send an email", ids)
+    sync_draft(client, ids, "alex", "lunch", "see you at 1")
+    assert "gmail_draft_id" not in payload(fetch_row(first["task_id"]))
+    actions.startup_sweep()
+    assert fetch_row(first["task_id"])["status"] == "CANCELLED"
+    out = chat(client, "finish the lunch email", ids)
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["subject"] == "lunch"
+    assert payload(fetch_row(out["task_id"])).get("gmail_draft_id") in (None, "")
+    assert len(open_rows(ids)) == 1
+
+
+def _gmail_b64(text: str) -> str:
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _native_gmail_draft(to, subject, body, *, snippet=""):
+    payload = {
+        "headers": [
+            {"name": "To", "value": to},
+            {"name": "Subject", "value": subject},
+        ],
+        "mimeType": "multipart/alternative",
+        "body": {"size": 0},
+        "parts": [
+            {"mimeType": "text/plain", "body": {"data": _gmail_b64(body)}},
+        ],
+    }
+    message = {"payload": payload}
+    if snippet:
+        message["snippet"] = snippet
+    return {
+        "message": message,
+        "updated_at": "2026-08-26T12:00:00Z",
+    }
+
+
+def test_resume_get_reads_gmail_mime_parts(client, ids, fake_composio):
+    body_text = "please find my statement of purpose attached"
+    fake_composio.drafts["r-mime"] = _native_gmail_draft(
+        "admissions@example.com", "application", body_text
+    )
+    out = chat(client, "send that draft", ids)
+    assert out["engine"] == "action"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["recipient"] == "admissions@example.com"
+    assert out["resolved_params"]["subject"] == "application"
+    assert out["resolved_params"]["body"] == body_text
+    assert ("get", "r-mime") in fake_composio.draft_calls
+
+
+def test_show_me_the_draft_matches_body_not_subject(client, ids, fake_composio):
+    body_text = "this is my math tutor application for the fall cohort"
+    fake_composio.drafts["r-tutor"] = _native_gmail_draft(
+        "hire@example.com",
+        "FYI",
+        body_text,
+        snippet=body_text,
+    )
+    text = "can you show me the draft about math tutor application"
+    assert intent.classify_intent(text)["intent"] == "ACTION"
+    analysis = intent.analyze_action_request(text)
+    assert analysis["resume"] is True
+    assert analysis["action_type"] == "send_email"
+    out = chat(client, text, ids)
+    assert out["engine"] == "action"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["subject"] == "FYI"
+    assert out["resolved_params"]["recipient"] == "hire@example.com"
+    assert "math tutor application" in out["resolved_params"]["body"]
+    assert payload(fetch_row(out["task_id"]))["gmail_draft_id"] == "r-tutor"
+
+
+def test_resume_get_raw_rfc2822_fills_body(client, ids, monkeypatch):
+    body_text = "I am applying to be a math tutor"
+    rfc = (
+        "To: hire@example.com\r\n"
+        "Subject: FYI\r\n"
+        "Content-Type: text/plain; charset=UTF-8\r\n"
+        "\r\n"
+        f"{body_text}\r\n"
+    )
+    full_raw = {
+        "data": {
+            "id": "r-raw",
+            "message": {
+                "payload": {
+                    "headers": [
+                        {"name": "To", "value": "hire@example.com"},
+                        {"name": "Subject", "value": "FYI"},
+                    ],
+                    "mimeType": "multipart/alternative",
+                    "body": {"size": 0},
+                    "parts": [
+                        {
+                            "mimeType": "text/plain",
+                            "body": {"attachmentId": "att-1", "size": 200},
+                        }
+                    ],
+                }
+            },
+        }
+    }
+    calls = []
+    executor = actions.ComposioExecutor()
+
+    def _run_tool(slug, arguments, **kwargs):
+        calls.append((slug, dict(arguments)))
+        if slug == "GMAIL_LIST_DRAFTS":
+            return {
+                "ok": True,
+                "raw": {
+                    "drafts": [
+                        {
+                            "id": "r-raw",
+                            "message": {
+                                "payload": {
+                                    "headers": [
+                                        {"name": "To", "value": "hire@example.com"},
+                                        {"name": "Subject", "value": "FYI"},
+                                    ],
+                                    "parts": [
+                                        {
+                                            "mimeType": "text/plain",
+                                            "body": {"attachmentId": "att-1"},
+                                        }
+                                    ],
+                                }
+                            },
+                        }
+                    ]
+                },
+            }
+        assert slug == "GMAIL_GET_DRAFT"
+        fmt = arguments.get("format")
+        if fmt == "full":
+            return {"ok": True, "raw": full_raw}
+        assert fmt == "raw"
+        return {
+            "ok": True,
+            "raw": {"data": {"id": "r-raw", "message": {"raw": _gmail_b64(rfc)}}},
+        }
+
+    monkeypatch.setattr(executor, "_run_tool", _run_tool)
+    monkeypatch.setitem(actions._EXECUTORS, "composio", executor)
+    monkeypatch.delenv("COMPOSIO_API_KEY", raising=False)
+    out = chat(client, "send that draft", ids)
+    assert out["engine"] == "action"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["recipient"] == "hire@example.com"
+    assert out["resolved_params"]["subject"] == "FYI"
+    assert out["resolved_params"]["body"].strip() == body_text
+    formats = [args.get("format") for slug, args in calls if slug == "GMAIL_GET_DRAFT"]
+    assert formats == ["full", "raw"]
+
+
+def test_resume_body_from_list_snippet_when_get_empty(client, ids, fake_composio):
+    snippet = "math tutor application for the fall"
+    fake_composio.drafts["r-snip"] = {
+        "snippet": snippet,
+        "updated_at": "1",
+        "get": {
+            "payload": {
+                "headers": [
+                    {"name": "To", "value": "hire@example.com"},
+                    {"name": "Subject", "value": "FYI"},
+                ],
+                "body": {"size": 0},
+                "parts": [
+                    {
+                        "mimeType": "text/plain",
+                        "body": {"attachmentId": "att-1"},
+                    }
+                ],
+            }
+        },
+    }
+    out = chat(client, "send that draft", ids)
+    assert out["engine"] == "action"
+    assert out["resolved_params"]["recipient"] == "hire@example.com"
+    assert out["resolved_params"]["subject"] == "FYI"
+    assert out["resolved_params"]["body"] == snippet
+    assert ("get", "r-snip") in fake_composio.draft_calls
+
+
+def test_moon_draft_beats_identical_urgent_which_one(client, ids, fake_composio):
+    fake_composio.drafts["r-u1"] = {
+        "recipient": "nate@example.com",
+        "subject": "[urgent]",
+        "body": "",
+        "updated_at": "1",
+    }
+    fake_composio.drafts["r-u2"] = {
+        "recipient": "nate@example.com",
+        "subject": "[urgent]",
+        "body": "",
+        "updated_at": "2",
+    }
+    fake_composio.drafts["r-moon"] = {
+        "recipient": "sd@nothing.com",
+        "subject": "trip",
+        "body": "going to the moon next week",
+        "updated_at": "3",
+    }
+    out = chat(client, "can you pull up the email draft about going to the moon", ids)
+    assert out["engine"] == "action"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert "Which one" not in out["answer"]
+    assert out["resolved_params"]["recipient"] == "sd@nothing.com"
+    assert "moon" in out["resolved_params"]["body"]
+    assert payload(fetch_row(out["task_id"]))["gmail_draft_id"] == "r-moon"
+
+
+def test_which_one_followup_address_is_not_open_app(client, ids, fake_composio):
+    fake_composio.drafts["r-alex"] = {
+        "recipient": "alex@example.com",
+        "subject": "lunch",
+        "body": "see you at 1",
+        "updated_at": "1",
+    }
+    fake_composio.drafts["r-sd"] = {
+        "recipient": "sd@nothing.com",
+        "subject": "lunch",
+        "body": "see you at 2",
+        "updated_at": "2",
+    }
+    first = chat(client, "the one about lunch", ids)
+    assert first.get("task_id") is None
+    assert "Which one" in first["answer"]
+    assert "sd@nothing.com" in first["answer"]
+    out = chat(client, "it was to sd@nothing.com", ids)
+    assert out["engine"] == "action"
+    assert out["action_type"] == "send_email"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["recipient"] == "sd@nothing.com"
+    assert out.get("missing_params") != ["app_name"]
+
+
+def test_which_one_none_clears_pick(client, ids, fake_composio):
+    fake_composio.drafts["r-alex"] = {
+        "recipient": "alex@example.com",
+        "subject": "lunch",
+        "body": "see you at 1",
+        "updated_at": "1",
+    }
+    fake_composio.drafts["r-sam"] = {
+        "recipient": "sam@example.com",
+        "subject": "lunch",
+        "body": "see you at 2",
+        "updated_at": "2",
+    }
+    first = chat(client, "the one about lunch", ids)
+    assert "Which one" in first["answer"]
+    out = chat(client, "none", ids)
+    assert out.get("task_id") is None
+    assert out["engine"] == "chat"
+    assert "leave those" in out["answer"].lower() or "okay" in out["answer"].lower()
+    assert len(open_rows(ids)) == 0

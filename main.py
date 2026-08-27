@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from typing import Optional, List, Tuple
 from uuid import UUID, uuid4
 
@@ -20,6 +21,9 @@ from intent import (
     maybe_promote_to_remember,
     parse_mixed_utterance,
     usable_memory_facts,
+    _ACTION_OPEN_RE,
+    _NEW_EMAIL_SEND_RE,
+    _looks_like_resume_draft,
 )
 from llm import (
     ask_llm,
@@ -144,11 +148,26 @@ UNSUPPORTED_ACTION_REPLY = (
 )
 USE_BUTTONS_REPLY = "Use the Confirm or Cancel buttons below to send or cancel it."
 SAVE_DRAFT_ASK = "Want to save that draft?"
-SAVE_DRAFT_YES_REPLY = "Can't stash drafts yet — I'll just drop it."
+SAVE_DRAFT_YES_REPLY = "Saved to Gmail Drafts."
+SAVE_DRAFT_YES_NOT_CONNECTED = (
+    "I can't stash that in Gmail until it's connected — I'll just drop it."
+)
+SAVE_DRAFT_YES_NOT_READY = (
+    "Gmail needs a real To address and a subject or body before I can stash it — "
+    "I'll just drop it."
+)
 SAVE_DRAFT_NO_REPLY = "All good — it's gone."
+RESUME_MISS_REPLY = "I don't have a draft that matches that."
+RESUME_GONE_REPLY = "I can't find that draft in Gmail anymore."
 
-# In-memory only. No draft body is stored — yes just acknowledges the ask.
-_pending_draft_asks: set[tuple[str, str]] = set()
+# Snapshot of the dismissed composer until yes/no. Keyed by (user_id, conversation_id).
+_pending_draft_asks: dict[tuple[str, str], dict] = {}
+# After "Which one?", the next line is a pick — not a new open_app.
+_pending_draft_picks: dict[tuple[str, str], dict] = {}
+_PICK_NONE_RE = re.compile(
+    r"^(?:none|neither|neither of (?:them|those)|not those|nope)\s*[.!?]*$",
+    re.IGNORECASE,
+)
 
 _MISSING_PARAM_WORDS = {
     "app_name": "which app to open",
@@ -233,6 +252,73 @@ def _merge_attachments(action: dict | None, paths) -> dict | None:
     return actions.update_action(action["action_id"], resolved_params=resolved)
 
 
+def _keep_gmail_draft(snapshot: dict) -> str:
+    """Nevermind → yes: leave or create the Gmail draft. Never sends."""
+    action_id = snapshot.get("action_id")
+    draft_id = snapshot.get("gmail_draft_id")
+    params = snapshot.get("resolved_params") or {}
+    if not draft_id:
+        if not actions.gmail_draft_ready(params):
+            return SAVE_DRAFT_YES_NOT_READY
+        executor = actions._EXECUTORS.get("composio")
+        create = getattr(executor, "create_draft", None)
+        if create is None:
+            return SAVE_DRAFT_YES_NOT_CONNECTED
+        result = create(params)
+        if result.get("error") == "composio_not_connected":
+            return SAVE_DRAFT_YES_NOT_CONNECTED
+        if not result.get("ok") or not result.get("draft_id"):
+            return SAVE_DRAFT_YES_NOT_READY
+        draft_id = result["draft_id"]
+    if action_id:
+        actions.patch_payload(
+            action_id, gmail_draft_id=draft_id, gmail_draft_kept=True
+        )
+    return SAVE_DRAFT_YES_REPLY
+
+
+def _restore_gmail_composer(user_id: str, conversation_id: str) -> dict | None:
+    """After startup_sweep, reopen the last unsaved Gmail draft in a new row."""
+    if actions.get_open_action(user_id, conversation_id):
+        return None
+    stale = actions.get_resumable_gmail_draft(user_id, conversation_id)
+    if not stale or not stale.get("gmail_draft_id"):
+        return None
+    loaded = actions.load_gmail_draft(stale["gmail_draft_id"])
+    if not loaded.get("ok"):
+        actions.patch_payload(stale["action_id"], gmail_draft_id=None)
+        return None
+    params = dict(loaded.get("resolved_params") or {})
+    local = stale.get("resolved_params") or {}
+    for key in ("recipient", "subject", "body"):
+        if not str(params.get(key) or "").strip() and local.get(key):
+            params[key] = local[key]
+    required = actions.ACTION_WHITELIST["send_email"]["required_params"]
+    missing = [p for p in required if not str(params.get(p) or "").strip()]
+    action = actions.create_action(
+        user_id,
+        conversation_id,
+        "send_email",
+        params,
+        missing,
+        "AWAITING_INPUT",
+        gmail_draft_id=stale["gmail_draft_id"],
+    )
+    actions.patch_payload(stale["action_id"], gmail_draft_kept=True)
+    return action
+
+
+def _open_email_composer(user_id: str, conversation_id: str) -> dict | None:
+    open_action = actions.get_open_action(user_id, conversation_id)
+    if (
+        open_action is None
+        or open_action["status"] != "AWAITING_INPUT"
+        or open_action["action_type"] != "send_email"
+    ):
+        return None
+    return open_action
+
+
 def _settle_action(action: dict, note: str) -> tuple[dict, str]:
     """Move a non-terminal row to the state its params dictate (§4) and build
     the reply. Low-risk + complete executes NOW, same request."""
@@ -254,14 +340,115 @@ def _settle_action(action: dict, note: str) -> tuple[dict, str]:
 
 
 def _queue_item(analysis: dict) -> dict:
-    return {
+    item = {
         "action_type": analysis["action_type"],
         "resolved_params": analysis["resolved_params"],
         "missing_params": analysis["missing_params"],
     }
+    if analysis.get("resume"):
+        item["resume"] = True
+        item["resume_query"] = analysis.get("resume_query") or ""
+    return item
+
+
+def _ambiguous_draft_label(draft: dict) -> str:
+    who = draft.get("recipient") or "someone"
+    subj = draft.get("subject") or "no subject"
+    snippet = str(draft.get("snippet") or draft.get("body") or "").strip()
+    snippet = " ".join(snippet.split())
+    if len(snippet) > 48:
+        snippet = snippet[:45].rstrip() + "…"
+    if snippet:
+        return f"to {who} ({subj}) — “{snippet}”"
+    return f"to {who} ({subj})"
+
+
+def _ambiguous_draft_ask(candidates: list[dict]) -> str:
+    bits = [_ambiguous_draft_label(draft) for draft in candidates[:3]]
+    if len(bits) == 1:
+        return f"Which one — {bits[0]}?"
+    return "Which one — " + " or ".join(bits) + "?"
+
+
+def _is_draft_pick_none(text: str) -> bool:
+    return bool(_PICK_NONE_RE.match((text or "").strip()))
+
+
+def _reopen_stashed_draft(
+    user_id: str, conversation_id: str, stash: dict, note: str = ""
+) -> tuple[dict | None, str]:
+    provider = stash.get("provider") or "gmail"
+    remote_id = (
+        stash.get("remote_id")
+        or stash.get("mail_draft_id")
+        or stash.get("gmail_draft_id")
+    )
+    if remote_id:
+        loaded = actions.load_draft(provider, remote_id)
+        if not loaded.get("ok"):
+            if stash.get("action_id"):
+                actions.patch_payload(
+                    stash["action_id"],
+                    gmail_draft_id=None,
+                    mail_draft_id=None,
+                )
+            return None, RESUME_GONE_REPLY
+        src = loaded.get("resolved_params") or {}
+        params = {}
+        for key in ("recipient", "subject", "body"):
+            val = str(src.get(key) or "").strip()
+            if val:
+                params[key] = val
+            elif stash.get(key):
+                params[key] = stash[key]
+    else:
+        params = {}
+        for key in ("recipient", "subject", "body"):
+            val = str(stash.get(key) or "").strip()
+            if val:
+                params[key] = val
+    required = actions.ACTION_WHITELIST["send_email"]["required_params"]
+    missing = [p for p in required if not str(params.get(p) or "").strip()]
+    action = actions.create_action(
+        user_id,
+        conversation_id,
+        "send_email",
+        params,
+        missing,
+        "AWAITING_INPUT",
+        gmail_draft_id=remote_id if provider == "gmail" else None,
+        mail_provider=provider if remote_id else None,
+        mail_draft_id=remote_id,
+    )
+    # Stay on the composer even when to/subject/body are complete — Send
+    # then Confirm, same as a new letter. Do not jump to PENDING.
+    if missing:
+        answer = note + _missing_ask("send_email", missing)
+    else:
+        answer = note + "Here's that draft."
+    return action, answer
 
 
 def _run_one_action(user_id, conversation_id, analysis, note="", queue=None):
+    if analysis.get("resume") and analysis.get("action_type") == "send_email":
+        shelf = actions.list_recent_drafts(user_id, conversation_id)
+        query = analysis.get("resume_query") or ""
+        matched = actions.pick_draft(query, shelf, resume=True)
+        status = matched.get("status")
+        if status in ("hit", "one", "newest"):
+            _pending_draft_picks.pop((user_id, conversation_id), None)
+            return _reopen_stashed_draft(
+                user_id, conversation_id, matched["draft"], note=note
+            )
+        if status == "ambiguous":
+            _pending_draft_picks[(user_id, conversation_id)] = {
+                "candidates": list(matched.get("candidates") or []),
+                "query": query,
+            }
+            return None, _ambiguous_draft_ask(matched.get("candidates") or [])
+        _pending_draft_picks.pop((user_id, conversation_id), None)
+        return None, RESUME_MISS_REPLY
+    _pending_draft_picks.pop((user_id, conversation_id), None)
     action = actions.create_action(
         user_id,
         conversation_id,
@@ -346,23 +533,128 @@ def _handle_action_intents(
 
     answer = "\n\n".join(p for p in answer_parts if p)
     return last_action, answer
-    """Move a non-terminal row to the state its params dictate (§4) and build
-    the reply. Low-risk + complete executes NOW, same request."""
-    action_type = action["action_type"]
-    risk = action["risk"]
-    resolved = action["resolved_params"]
-    missing = action["missing_params"]
-    if missing:
-        action = actions.update_action(action["action_id"], status="AWAITING_INPUT")
-        answer = note + _missing_ask(action_type, missing)
-    elif risk == "high":
-        action = actions.update_action(action["action_id"], status="PENDING")
-        answer = note + _pending_summary(resolved)
-    else:
-        status, exec_result = actions.confirm_and_execute(action["action_id"])
-        action = actions.get_action(action["action_id"])
-        answer = note + _exec_reply(action_type, resolved, status, exec_result)
-    return action, answer
+
+
+def _chat_only_payload(answer: str, conversation_id: str, user_id: str) -> dict:
+    return {
+        "answer": answer,
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "intent": "CHAT",
+        "remembered": [],
+        "asked_to_remember": False,
+        "engine": "chat",
+    }
+
+
+def _try_pending_draft_pick(
+    user_text: str,
+    user_id: str,
+    conversation_id: str,
+) -> dict | None:
+    """Continue a Which-one instead of starting a new open_app."""
+    key = (user_id, conversation_id)
+    pending = _pending_draft_picks.get(key)
+    if not pending:
+        return None
+    if _is_draft_pick_none(user_text):
+        _pending_draft_picks.pop(key, None)
+        answer = "Okay — I'll leave those."
+        save_message(conversation_id, "user", user_text, kind="action")
+        save_message(conversation_id, "assistant", answer, kind="action")
+        return _chat_only_payload(answer, conversation_id, user_id)
+    if _NEW_EMAIL_SEND_RE.search(user_text) and not _looks_like_resume_draft(user_text):
+        _pending_draft_picks.pop(key, None)
+        return None
+    if _ACTION_OPEN_RE.match(user_text.strip()):
+        _pending_draft_picks.pop(key, None)
+        return None
+    candidates = list(pending.get("candidates") or [])
+    prior = str(pending.get("query") or "").strip()
+    matched = actions.pick_draft(user_text, candidates, resume=True)
+    if matched.get("status") not in ("hit", "one", "newest"):
+        combined = f"{prior} {user_text}".strip()
+        if combined != user_text:
+            matched = actions.pick_draft(combined, candidates, resume=True)
+    status = matched.get("status")
+    if status in ("hit", "one", "newest"):
+        _pending_draft_picks.pop(key, None)
+        action, answer = _reopen_stashed_draft(
+            user_id, conversation_id, matched["draft"]
+        )
+        if action is None:
+            save_message(conversation_id, "user", user_text, kind="action")
+            save_message(conversation_id, "assistant", answer, kind="action")
+            return {
+                "answer": answer,
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "intent": "ACTION",
+                "is_question": False,
+                "kind": "ACTION",
+                "remembered": [],
+                "asked_to_remember": False,
+                "engine": "action",
+            }
+        save_message(conversation_id, "user", user_text, kind="action")
+        save_message(conversation_id, "assistant", answer, kind="action")
+        return _action_turn_payload(
+            answer,
+            conversation_id,
+            user_id,
+            action,
+            {
+                "is_question": False,
+                "kind": "ACTION",
+                "memory_score": 0.0,
+                "docs_score": 0.0,
+                "chat_score": 0.0,
+            },
+        )
+    if status == "ambiguous":
+        _pending_draft_picks[key] = {
+            "candidates": list(matched.get("candidates") or candidates),
+            "query": prior,
+        }
+        answer = _ambiguous_draft_ask(matched.get("candidates") or candidates)
+        save_message(conversation_id, "user", user_text, kind="action")
+        save_message(conversation_id, "assistant", answer, kind="action")
+        return {
+            "answer": answer,
+            "conversation_id": conversation_id,
+            "user_id": user_id,
+            "intent": "ACTION",
+            "is_question": False,
+            "kind": "ACTION",
+            "remembered": [],
+            "asked_to_remember": False,
+            "engine": "action",
+        }
+    answer = "I still need which draft you mean."
+    save_message(conversation_id, "user", user_text, kind="action")
+    save_message(conversation_id, "assistant", answer, kind="action")
+    return {
+        "answer": answer,
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "intent": "ACTION",
+        "is_question": False,
+        "kind": "ACTION",
+        "remembered": [],
+        "asked_to_remember": False,
+        "engine": "action",
+    }
+
+
+def _is_resume_chat_reply(answer: str) -> bool:
+    text = answer or ""
+    return (
+        RESUME_MISS_REPLY in text
+        or RESUME_GONE_REPLY in text
+        or "Which one —" in text
+        or text == "I still need which draft you mean."
+        or text == "Okay — I'll leave those."
+    )
 
 
 def _action_turn_payload(
@@ -423,13 +715,17 @@ def start_session(incoming_data: SessionStart):
         if not already_asked:
             save_message(conversation_id, "assistant", greeting)
 
-    return {
+    restored = _restore_gmail_composer(user_id, conversation_id)
+    payload = {
         "conversation_id": conversation_id,
         "user_id": user_id,
         "greeting": greeting,
         "ask_name": ask_name,
         "name": name,
     }
+    if restored:
+        payload.update(_task_fields(restored))
+    return payload
 
 
 @app.post("/chat")
@@ -484,12 +780,13 @@ def handle_chat(incoming_data: UserMessage):
         draft_key = (user_id, conversation_id)
         if draft_key in _pending_draft_asks:
             confirmation = classify_memory_confirmation(user_text)
+            snapshot = _pending_draft_asks.pop(draft_key)
             if confirmation == "yes":
-                _pending_draft_asks.discard(draft_key)
+                answer = _keep_gmail_draft(snapshot)
                 save_message(conversation_id, "user", user_text)
-                save_message(conversation_id, "assistant", SAVE_DRAFT_YES_REPLY)
+                save_message(conversation_id, "assistant", answer)
                 return {
-                    "answer": SAVE_DRAFT_YES_REPLY,
+                    "answer": answer,
                     "conversation_id": conversation_id,
                     "user_id": user_id,
                     "intent": "CHAT",
@@ -498,7 +795,7 @@ def handle_chat(incoming_data: UserMessage):
                     "engine": "chat",
                 }
             if confirmation == "no":
-                _pending_draft_asks.discard(draft_key)
+                actions.delete_gmail_draft(snapshot)
                 save_message(conversation_id, "user", user_text)
                 save_message(conversation_id, "assistant", SAVE_DRAFT_NO_REPLY)
                 return {
@@ -510,7 +807,11 @@ def handle_chat(incoming_data: UserMessage):
                     "asked_to_save_draft": False,
                     "engine": "chat",
                 }
-            _pending_draft_asks.discard(draft_key)
+            actions.delete_gmail_draft(snapshot)
+
+        picked = _try_pending_draft_pick(user_text, user_id, conversation_id)
+        if picked is not None:
+            return picked
 
         # If Michelle asked "want me to remember that?", handle yes/no first.
         if pending:
@@ -647,6 +948,20 @@ def handle_chat(incoming_data: UserMessage):
                     answer, conversation_id, user_id, action, intent_result,
                     attachments=incoming_data.attachments,
                 )
+            if _is_resume_chat_reply(answer):
+                save_message(conversation_id, "user", user_text, kind="action")
+                save_message(conversation_id, "assistant", answer, kind="action")
+                return {
+                    "answer": answer,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "intent": "ACTION",
+                    "is_question": False,
+                    "kind": "ACTION",
+                    "remembered": [],
+                    "asked_to_remember": False,
+                    "engine": "action",
+                }
             # Non-whitelisted order: no actions_log row, no execution path,
             # engine reports "chat" (§3.2, §8).
             action_note = ""
@@ -688,8 +1003,15 @@ def handle_chat(incoming_data: UserMessage):
                     dismissed
                     and open_action["action_type"] == "send_email"
                 ):
-                    actions.cancel_action(open_action["action_id"])
-                    _pending_draft_asks.add((user_id, conversation_id))
+                    action, _ = actions.upsert_gmail_draft(open_action)
+                    action = action or open_action
+                    snapshot = {
+                        "action_id": action["action_id"],
+                        "resolved_params": dict(action.get("resolved_params") or {}),
+                        "gmail_draft_id": action.get("gmail_draft_id"),
+                    }
+                    actions.cancel_action(action["action_id"], discard_gmail=False)
+                    _pending_draft_asks[(user_id, conversation_id)] = snapshot
                     save_message(conversation_id, "user", user_text, kind="action")
                     save_message(
                         conversation_id, "assistant", SAVE_DRAFT_ASK, kind="action"
@@ -1164,7 +1486,10 @@ def submit_draft(incoming: SubmitDraftRequest):
         missing_params=missing,
     )
     action = _merge_attachments(action, incoming.attachments) or action
-    action, answer = _settle_action(action, "")
+    action, _ = actions.upsert_gmail_draft(
+        action, action.get("resolved_params"), include_attachments=True
+    )
+    action, answer = _settle_action(action or open_action, "")
     save_message(conversation_id, "user", "Composer send.", kind="action")
     save_message(conversation_id, "assistant", answer, kind="action")
     print(
@@ -1172,6 +1497,42 @@ def submit_draft(incoming: SubmitDraftRequest):
         f"action {action['action_id'][:8]} → {action['status']}"
     )
     return _submit_draft_payload(answer, conversation_id, user_id, action)
+
+
+@app.post("/action/sync_draft")
+def sync_draft(incoming: SubmitDraftRequest):
+    """Autosave composer fields to Gmail. Does not send, classify, or Confirm.
+
+    Stays AWAITING_INPUT even when to/subject/body are complete — Send is
+    still the only path to PENDING.
+    """
+    user_id = _valid_uuid(incoming.user_id)
+    conversation_id = _valid_uuid(incoming.conversation_id)
+    open_action = _open_email_composer(user_id, conversation_id)
+    if open_action is None:
+        return _submit_draft_payload(
+            "There's no email draft open to save.",
+            conversation_id,
+            user_id,
+            None,
+        )
+    required = actions.ACTION_WHITELIST["send_email"]["required_params"]
+    resolved = dict(open_action.get("resolved_params") or {})
+    resolved["recipient"] = (incoming.recipient or "").strip()
+    resolved["subject"] = (incoming.subject or "").strip()
+    body = incoming.body if incoming.body is not None else ""
+    resolved["body"] = body.strip()
+    missing = [p for p in required if not str(resolved.get(p) or "").strip()]
+    action = actions.update_action(
+        open_action["action_id"],
+        resolved_params=resolved,
+        missing_params=missing,
+        status="AWAITING_INPUT",
+    )
+    action, _ = actions.upsert_gmail_draft(
+        action, resolved, include_attachments=False
+    )
+    return _submit_draft_payload("", conversation_id, user_id, action or open_action)
 
 
 @app.post("/action/confirm")

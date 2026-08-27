@@ -1,14 +1,17 @@
 """Suite 8 — unit tests on the deterministic seams (no HTTP)."""
 
+import base64
 from uuid import uuid4
 
 import pytest
 
+import actions
 import long_term_memory
 import retrieve
 from intent import (
     _looks_like_composer_dismiss,
     _looks_like_question,
+    _looks_like_resume_draft,
     analyze_action_request,
     classify_intent,
     classify_memory_confirmation,
@@ -344,6 +347,27 @@ def test_llm_chat_label_still_promotes_open_order(monkeypatch):
             "And this email is being said right now",
             [],
         ),
+        ("send that draft", "", ["send that draft"]),
+        ("finish the lunch email", "", ["finish the lunch email"]),
+        ("the one about the project", "", ["the one about the project"]),
+        (
+            "can you show me the draft about math tutor application",
+            "",
+            ["can you show me the draft about math tutor application"],
+        ),
+        ("show me the draft about lunch", "", ["show me the draft about lunch"]),
+        ("pull up the email", "", ["pull up the email"]),
+        ("get me the draft", "", ["get me the draft"]),
+        (
+            "pull up the email about math tutor",
+            "",
+            ["pull up the email about math tutor"],
+        ),
+        (
+            "can you pull up the email draft about going to the moon",
+            "",
+            ["can you pull up the email draft about going to the moon"],
+        ),
     ],
 )
 def test_parse_mixed_utterance(text, chat, actions):
@@ -359,6 +383,248 @@ def test_email_word_in_prose_is_not_an_action_order():
     parsed = parse_mixed_utterance(text)
     assert parsed["actions"] == []
     assert classify_intent(text)["intent"] != "ACTION"
+
+
+def test_resume_draft_is_not_a_new_send():
+    assert _looks_like_resume_draft("send that draft")
+    assert _looks_like_resume_draft("finish the lunch email")
+    assert _looks_like_resume_draft("the one about the project")
+    assert _looks_like_resume_draft(
+        "can you show me the draft about math tutor application"
+    )
+    assert _looks_like_resume_draft("show me the draft")
+    assert _looks_like_resume_draft("open the draft")
+    assert _looks_like_resume_draft("pull up the email")
+    assert _looks_like_resume_draft("find the draft about lunch")
+    assert _looks_like_resume_draft("get me the draft")
+    assert _looks_like_resume_draft("draft about math tutor")
+    assert _looks_like_resume_draft("email about the project")
+    assert not _looks_like_resume_draft("send an email")
+    assert not _looks_like_resume_draft("send another email for me")
+    assert not _looks_like_resume_draft("show me the handbook")
+    analysis = analyze_action_request("send that draft")
+    assert analysis["action_type"] == "send_email"
+    assert analysis["resume"] is True
+    assert analysis["resolved_params"] == {}
+    show = analyze_action_request(
+        "can you show me the draft about math tutor application"
+    )
+    assert show["action_type"] == "send_email"
+    assert show["resume"] is True
+    assert "math tutor" in show["resume_query"]
+    fresh = analyze_action_request("send an email")
+    assert fresh["resume"] is not True
+    assert fresh["action_type"] == "send_email"
+    handbook = classify_intent("show me the handbook")
+    assert handbook["intent"] != "ACTION"
+    assert classify_intent(
+        "can you show me the draft about math tutor application"
+    )["intent"] == "ACTION"
+
+
+def test_resume_draft_promotes_retrieve_to_action(monkeypatch):
+    monkeypatch.setenv("INTENT_MODE", "rules")
+    monkeypatch.setattr(
+        intent,
+        "_classify_with_rules",
+        lambda text: {"intent": "RETRIEVE", "confidence": 0.75},
+    )
+    text = "can you show me the draft about math tutor application"
+    out = classify_intent(text)
+    assert out["intent"] == "ACTION"
+    assert out["kind"] == "ACTION"
+    handbook = classify_intent("show me the handbook")
+    assert handbook["intent"] == "RETRIEVE"
+
+
+def test_resume_draft_promotes_remember_to_action(monkeypatch):
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_classify_with_llm",
+        lambda *a, **k: {
+            "intent": "REMEMBER",
+            "kind": "REMEMBER",
+            "confidence": 0.8,
+            "is_question": True,
+        },
+    )
+    text = "Can you show me the draft about math tutor application"
+    out = classify_intent(text)
+    assert out["intent"] == "ACTION"
+    assert out["kind"] == "ACTION"
+
+
+def test_pull_up_the_email_is_resume_not_open_app(monkeypatch):
+    text = "pull up the email about math tutor"
+    parsed = parse_mixed_utterance(text)
+    assert parsed["actions"] == [text]
+    rules = analyze_action_request(text)
+    assert rules["action_type"] == "send_email"
+    assert rules["resume"] is True
+    assert "app_name" not in rules["resolved_params"]
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_analyze_action_with_llm",
+        lambda *a, **k: {
+            "action_type": "open_app",
+            "resolved_params": {"app_name": "the"},
+            "missing_params": ["app_name"],
+            "related": True,
+            "confidence": 0.9,
+        },
+    )
+    out = analyze_action_request(text)
+    assert out["action_type"] == "send_email"
+    assert out["resume"] is True
+    assert out["resolved_params"] == {}
+
+
+def test_string_resolved_params_does_not_crash_analyze(monkeypatch):
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_analyze_action_with_llm",
+        lambda *a, **k: {
+            "action_type": "send_email",
+            "resolved_params": "send that draft",
+            "missing_params": [],
+            "related": True,
+            "confidence": 0.9,
+        },
+    )
+    out = analyze_action_request("send that draft")
+    assert out["action_type"] == "send_email"
+    assert out["resume"] is True
+    assert out["resolved_params"] == {}
+
+
+def _gmail_b64(text: str) -> str:
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def test_extract_draft_fields_gmail_mime_parts():
+    plain = "plain body from parts"
+    raw = {
+        "payload": {
+            "headers": [
+                {"name": "To", "value": "pat@example.com"},
+                {"name": "Subject", "value": "hello"},
+            ],
+            "mimeType": "multipart/alternative",
+            "body": {"size": 0},
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": _gmail_b64(plain)}},
+                {
+                    "mimeType": "text/html",
+                    "body": {"data": _gmail_b64("<p>html should lose</p>")},
+                },
+            ],
+        }
+    }
+    fields = actions._extract_draft_fields(raw)
+    assert fields["recipient"] == "pat@example.com"
+    assert fields["subject"] == "hello"
+    assert fields["body"] == plain
+
+
+def test_extract_draft_fields_gmail_html_only_parts():
+    fields = actions._extract_draft_fields(
+        {
+            "payload": {
+                "body": {"size": 0},
+                "parts": [
+                    {
+                        "mimeType": "text/html",
+                        "body": {"data": _gmail_b64("<p>hello <b>there</b></p>")},
+                    }
+                ],
+            }
+        }
+    )
+    assert fields["body"] == "hello there"
+
+
+def test_extract_draft_fields_outlook_body_content():
+    fields = actions._extract_draft_fields({"body": {"content": "graph body"}})
+    assert fields["body"] == "graph body"
+    unique = actions._extract_draft_fields(
+        {"uniqueBody": {"content": "unique graph"}}
+    )
+    assert unique["body"] == "unique graph"
+
+
+def test_extract_draft_fields_parses_stringified_data():
+    import json
+
+    plain = "stringified wrapper body"
+    inner = {
+        "payload": {
+            "headers": [
+                {"name": "To", "value": "pat@example.com"},
+                {"name": "Subject", "value": "hello"},
+            ],
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": _gmail_b64(plain)}},
+            ],
+        }
+    }
+    fields = actions._extract_draft_fields({"data": json.dumps(inner)})
+    assert fields["body"] == plain
+    double = actions._extract_draft_fields({"data": json.dumps(json.dumps(inner))})
+    assert double["body"] == plain
+
+
+def test_extract_draft_fields_rfc2822_raw():
+    body = "math tutor application body"
+    rfc = (
+        "To: hire@example.com\r\n"
+        "Subject: FYI\r\n"
+        "Content-Type: text/plain; charset=UTF-8\r\n"
+        "\r\n"
+        f"{body}\r\n"
+    )
+    fields = actions._extract_draft_fields(
+        {
+            "payload": {
+                "headers": [
+                    {"name": "To", "value": "hire@example.com"},
+                    {"name": "Subject", "value": "FYI"},
+                ],
+                "parts": [
+                    {
+                        "mimeType": "text/plain",
+                        "body": {"attachmentId": "att-1"},
+                    }
+                ],
+            },
+            "raw": _gmail_b64(rfc),
+        }
+    )
+    assert fields["body"].strip() == body
+    assert fields["recipient"] == "hire@example.com"
+
+
+def test_match_draft_uses_snippet():
+    drafts = [
+        {
+            "provider": "gmail",
+            "remote_id": "s",
+            "recipient": "a@example.com",
+            "subject": "hello",
+            "body": "",
+            "snippet": "math tutor application",
+        }
+    ]
+    out = actions.match_draft(
+        "the draft about math tutor application", drafts, resume=True
+    )
+    assert out["status"] == "hit"
+    assert out["draft"]["remote_id"] == "s"
 
 
 def test_new_email_does_not_reuse_last_send_from_history(monkeypatch):
@@ -477,3 +743,139 @@ def test_polish_email_body_ollama_is_not_michelle_and_skips_memory(monkeypatch):
     assert len(messages) == 2
     assert captured["json"]["options"]["temperature"] == 0.0
     assert "Hi my names Nathan" in messages[1]["content"]
+
+
+def test_match_draft_generic_picks_newest_not_all_fifty():
+    drafts = [
+        {
+            "provider": "gmail",
+            "remote_id": "newest",
+            "recipient": "a@example.com",
+            "subject": "alpha",
+            "body": "",
+        },
+        {
+            "provider": "gmail",
+            "remote_id": "older",
+            "recipient": "b@example.com",
+            "subject": "beta",
+            "body": "",
+        },
+    ]
+    out = actions.match_draft("send that draft", drafts, resume=True)
+    assert out["status"] == "newest"
+    assert out["draft"]["remote_id"] == "newest"
+    alias = actions.match_gmail_draft("send that draft", drafts, resume=True)
+    assert alias == out
+
+
+def test_match_draft_filler_does_not_tie_on_you():
+    drafts = [
+        {
+            "provider": "gmail",
+            "remote_id": "a",
+            "recipient": "a@example.com",
+            "subject": "[urgent]",
+            "body": "can you send this when you can",
+        },
+        {
+            "provider": "gmail",
+            "remote_id": "b",
+            "recipient": "b@example.com",
+            "subject": "[urgent]",
+            "body": "thank you for waiting",
+        },
+    ]
+    out = actions.match_draft("can you pull up the email", drafts, resume=True)
+    assert out["status"] == "newest"
+    assert out["draft"]["remote_id"] == "a"
+
+
+def test_match_draft_moon_beats_empty_urgent():
+    drafts = [
+        {
+            "provider": "gmail",
+            "remote_id": "u1",
+            "recipient": "nate@example.com",
+            "subject": "[urgent]",
+            "body": "",
+        },
+        {
+            "provider": "gmail",
+            "remote_id": "moon",
+            "recipient": "sd@nothing.com",
+            "subject": "trip",
+            "body": "going to the moon next week",
+        },
+        {
+            "provider": "gmail",
+            "remote_id": "u2",
+            "recipient": "nate@example.com",
+            "subject": "[urgent]",
+            "body": "",
+        },
+    ]
+    out = actions.match_draft(
+        "can you pull up the email draft about going to the moon",
+        drafts,
+        resume=True,
+    )
+    assert out["status"] == "hit"
+    assert out["draft"]["remote_id"] == "moon"
+
+
+def test_pick_draft_llm_only_uses_listed_ids(monkeypatch):
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    drafts = [
+        {
+            "provider": "gmail",
+            "remote_id": "moon",
+            "recipient": "sd@nothing.com",
+            "subject": "trip",
+            "body": "going to the moon",
+        },
+        {
+            "provider": "gmail",
+            "remote_id": "u1",
+            "recipient": "nate@example.com",
+            "subject": "[urgent]",
+            "body": "please review",
+        },
+    ]
+    monkeypatch.setattr(
+        actions,
+        "_llm_pick_ids",
+        lambda utterance, shelf: ["moon"],
+    )
+    out = actions.pick_draft(
+        "the one about going to the moon", drafts, resume=True
+    )
+    assert out["status"] == "hit"
+    assert out["draft"]["remote_id"] == "moon"
+    monkeypatch.setattr(
+        actions,
+        "_llm_pick_ids",
+        lambda utterance, shelf: ["invented"],
+    )
+    out = actions.pick_draft("the one about going to the moon", drafts, resume=True)
+    assert out["status"] == "miss"
+    drafts = [
+        {
+            "provider": "gmail",
+            "remote_id": "a",
+            "recipient": "alex@example.com",
+            "subject": "lunch",
+            "body": "",
+        },
+        {
+            "provider": "gmail",
+            "remote_id": "b",
+            "recipient": "sam@example.com",
+            "subject": "lunch plans",
+            "body": "",
+        },
+    ]
+    out = actions.match_draft("the one about lunch", drafts, resume=True)
+    assert out["status"] == "ambiguous"
+    assert len(out["candidates"]) == 2

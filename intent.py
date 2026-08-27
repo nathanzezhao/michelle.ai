@@ -149,25 +149,30 @@ def classify_intent(
         }
 
     if mode == "rules":
-        return _normalize_intent_result(_classify_with_rules(text), text)
-    if mode == "mock":
-        return _normalize_intent_result(_classify_mock(text), text)
+        result = _normalize_intent_result(_classify_with_rules(text), text)
+    elif mode == "mock":
+        result = _normalize_intent_result(_classify_mock(text), text)
+    elif _intent_backend() == "rules":
+        result = _normalize_intent_result(_classify_with_rules(text), text)
+    else:
+        try:
+            result = _normalize_intent_result(
+                _classify_with_llm(text, history, existing_facts), text
+            )
+        except Exception as e:
+            print(f"Intent LLM failed ({e}), falling back to rules")
+            result = _normalize_intent_result(_classify_with_rules(text), text)
+        else:
+            # llama3.2 often labels "open Notes" as CHAT. If the utterance is
+            # clearly an order, promote — same idea as maybe_promote_to_remember.
+            # CHAT only: a docs question stays RETRIEVE unless it's a draft reopen.
+            if result.get("intent") == "CHAT" and _looks_like_action_order(text):
+                print("intent_promoted=ACTION (classifier missed an order)")
+                result["intent"] = "ACTION"
+                result["kind"] = "ACTION"
 
-    if _intent_backend() == "rules":
-        return _normalize_intent_result(_classify_with_rules(text), text)
-
-    try:
-        result = _normalize_intent_result(
-            _classify_with_llm(text, history, existing_facts), text
-        )
-    except Exception as e:
-        print(f"Intent LLM failed ({e}), falling back to rules")
-        return _normalize_intent_result(_classify_with_rules(text), text)
-
-    # llama3.2 often labels "open Notes" as CHAT. If the utterance is clearly
-    # an order, promote — same idea as maybe_promote_to_remember.
-    if result.get("intent") == "CHAT" and _looks_like_action_order(text):
-        print("intent_promoted=ACTION (classifier missed an order)")
+    if result.get("intent") in ("CHAT", "RETRIEVE", "REMEMBER") and _looks_like_resume_draft(text):
+        print("intent_promoted=ACTION (draft resume)")
         result["intent"] = "ACTION"
         result["kind"] = "ACTION"
     return result
@@ -434,10 +439,15 @@ def analyze_action_request(
     return _finalize_action_analysis(raw, text, history, task_context)
 
 
+def _params_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
 def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
     """Merge deterministic extracts into a flaky LLM analyzer result."""
     out = dict(raw) if isinstance(raw, dict) else {}
-    rules = rules or {}
+    rules = rules if isinstance(rules, dict) else {}
+    out["resolved_params"] = _params_dict(out.get("resolved_params"))
     raw_type = str(out.get("action_type") or "").strip().lower()
     rules_type = str(rules.get("action_type") or "").strip().lower()
     if rules_type in ACTION_WHITELIST and (
@@ -450,18 +460,18 @@ def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
         allowed = set(ACTION_WHITELIST[rules_type]["required_params"])
         resolved = {
             k: v
-            for k, v in (out.get("resolved_params") or {}).items()
+            for k, v in _params_dict(out.get("resolved_params")).items()
             if k in allowed
         }
         out["resolved_params"] = resolved
 
-    resolved = dict(out.get("resolved_params") or {})
+    resolved = dict(_params_dict(out.get("resolved_params")))
     if not str(resolved.get("app_name") or "").strip():
         for alias in ("app", "application", "name", "appName"):
             if str(resolved.get(alias) or "").strip():
                 resolved["app_name"] = str(resolved[alias]).strip()
                 break
-    for key, value in (rules.get("resolved_params") or {}).items():
+    for key, value in _params_dict(rules.get("resolved_params")).items():
         if not str(resolved.get(key) or "").strip() and str(value or "").strip():
             resolved[key] = value
     out["resolved_params"] = resolved
@@ -472,6 +482,16 @@ def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
     if rules.get("dismiss"):
         out["dismiss"] = True
         out["related"] = False
+    rules_new_send = rules_type == "send_email" and not rules.get("resume")
+    if rules.get("resume") or (out.get("resume") and not rules_new_send):
+        out["resume"] = True
+        out["action_type"] = "send_email"
+        query = str(out.get("resume_query") or rules.get("resume_query") or "").strip()
+        out["resume_query"] = query
+        out["resolved_params"] = {}
+    elif rules_new_send:
+        out["resume"] = False
+        out["resume_query"] = ""
     return out
 
 
@@ -527,6 +547,12 @@ def _finalize_action_analysis(
         if dismiss:
             related = False
 
+    resume = bool(raw.get("resume"))
+    resume_query = str(raw.get("resume_query") or "").strip()
+    if resume:
+        resolved = {}
+        missing = list(required)
+
     return {
         "action_type": action_type,
         "resolved_params": resolved,
@@ -534,6 +560,8 @@ def _finalize_action_analysis(
         "confidence": confidence,
         "related": related if task_context else True,
         "dismiss": dismiss,
+        "resume": resume,
+        "resume_query": resume_query or (text if resume else ""),
     }
 
 
@@ -625,6 +653,16 @@ def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
             "confidence": 0.95,
             "related": False,
             "dismiss": True,
+        }
+
+    if _looks_like_resume_draft(stripped):
+        return {
+            "action_type": "send_email",
+            "resolved_params": {},
+            "confidence": 0.85,
+            "related": False,
+            "resume": True,
+            "resume_query": stripped,
         }
 
     open_match = _OPEN_APP_EXTRACT_RE.match(stripped)
@@ -726,8 +764,14 @@ Rules:
   conversation. "send an email" / "send another email" with no details →
   empty resolved_params. NEVER invent an email address, subject, body, or
   app name. If a required value was not given, list it in missing_params.
-- "send" plus a word that starts with e and ends with l (email, emial,
-  emauil, emaill) is send_email, never open_app.
+- A brand-new send-mail request (even with no details, even with typos) is
+  send_email with resume=false. Do not copy an old letter's fields.
+- If they want to reopen a letter they already stashed — that draft, finish
+  that email, the one about X, "show me the draft about X" — set resume=true
+  and resume_query to the describing words (e.g. "math tutor application").
+  Still send_email. Do not invent to/subject/body.
+- Opening/launching a program is open_app. Sending or finishing mail is
+  never open_app.
 - "unsupported" for any task that is not exactly one of the supported types
   (booking, deleting files, reminders, browsing, etc.).
 
@@ -737,7 +781,7 @@ Recent conversation:
 User message: {text}
 
 Reply with ONLY valid JSON, no markdown:
-{{"action_type": "open_app"|"send_email"|"unsupported", "related": true|false, "dismiss": false, "resolved_params": {{}}, "missing_params": [], "confidence": 0.0 to 1.0}}"""
+{{"action_type": "open_app"|"send_email"|"unsupported", "resume": false, "resume_query": "", "related": true|false, "dismiss": false, "resolved_params": {{}}, "missing_params": [], "confidence": 0.0 to 1.0}}"""
 
     result = _llm_json(prompt)
     if not isinstance(result, dict):
@@ -897,6 +941,9 @@ Step 1 — is_question (meaning, not punctuation or wording):
 true = they want an answer.
 false = telling, greeting, acknowledging, or an order/command.
 Orders are not questions even with a "?".
+Reopening a mailbox draft is ACTION even if phrased as a question
+("show me the draft about X", "can you open that email", "get me the draft").
+That is not RETRIEVE and not a docs lookup.
 
 Step 2 — if is_question is true, SCORE the two libraries plus chat.
 Do not jump to docs because the wording looks like "what is …", or because
@@ -916,6 +963,8 @@ handbook, company knowledge). Stay low if the question is about the user.
 Score chat_score 0-1: social / opinion / neither library.
 
 Pick kind as the highest of those three: REMEMBER, RETRIEVE, or CHAT.
+Exception: showing/opening/finding a mailbox draft or email draft is ACTION,
+not RETRIEVE, even when the message is a question.
 
 Step 2b — if is_question is false, set kind without the scores:
   REMEMBER = keep a personal fact/pref
@@ -1067,6 +1116,29 @@ _ACTION_EMAIL_RE = re.compile(
     rf"^{_LEADING_FILLER}{_EMAIL_VERB}",
     re.IGNORECASE,
 )
+# Must say draft or email (except "the one about …"). "show me the handbook"
+# is not resume. "email draft" is one opener so we do not also split on
+# "draft about" in "pull up the email draft about the moon".
+_RESUME_DRAFT_INNER = (
+    r"(?:send|finish|continue|resume)\s+(?:that|the|this)\s+(?:\S+\s+){0,4}(?:draft|e-?mail)"
+    r"|(?:show|open|pull\s+up|find|get)(?:\s+me)?\s+(?:the\s+)?(?:(?:e-?mail\s+)?draft|e-?mail)"
+    r"|(?:draft|e-?mail)\s+about"
+    r"|(?:that|the)\s+one\s+about"
+)
+_RESUME_DRAFT_RE = re.compile(_RESUME_DRAFT_INNER, re.IGNORECASE)
+_NEW_EMAIL_SEND_RE = re.compile(
+    r"\bsend\s+(?:an?|another|a\s+new)\s+e-?mail\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_resume_draft(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if _NEW_EMAIL_SEND_RE.search(stripped):
+        return False
+    return bool(_RESUME_DRAFT_RE.search(stripped))
 
 
 def _looks_like_action_order(text: str) -> bool:
@@ -1075,11 +1147,16 @@ def _looks_like_action_order(text: str) -> bool:
 
 def _clause_is_action(clause: str) -> bool:
     stripped = (clause or "").strip()
-    return bool(_ACTION_OPEN_RE.match(stripped) or _ACTION_EMAIL_RE.match(stripped))
+    return bool(
+        _ACTION_OPEN_RE.match(stripped)
+        or _ACTION_EMAIL_RE.match(stripped)
+        or _looks_like_resume_draft(stripped)
+    )
 
 
 _ACTION_START_RE = re.compile(
-    rf"(?:{_LEADING_FILLER})(?:{_OPEN_VERBS}(?:\s+up)?\s+\S|{_EMAIL_VERB})",
+    rf"(?:{_LEADING_FILLER})(?:{_RESUME_DRAFT_INNER}|{_EMAIL_VERB}|"
+    rf"{_OPEN_VERBS}(?:\s+up)?\s+\S)",
     re.IGNORECASE,
 )
 _TRAILING_CONNECTOR_RE = re.compile(
