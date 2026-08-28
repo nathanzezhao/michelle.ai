@@ -19,6 +19,7 @@ from intent import (
     classify_intent,
     classify_memory_confirmation,
     maybe_promote_to_remember,
+    mixed_chat_warrants_reply,
     parse_mixed_utterance,
     usable_memory_facts,
     _ACTION_CLOSE_RE,
@@ -36,6 +37,7 @@ from llm import (
 import long_term_memory
 from memory import get_history, init_db, save_message
 import retrieve
+import session_context
 import whisper
 
 load_dotenv()
@@ -44,6 +46,7 @@ long_term_memory.init_db()
 retrieve.init_db()
 retrieve.index_docs()
 actions.init_db()
+session_context.init_db()
 # No replay after restart: stale open actions are closed out (SPEC-PIPELINE §4).
 actions.startup_sweep()
 
@@ -368,7 +371,36 @@ def _settle_action(action: dict, note: str) -> tuple[dict, str]:
         status, exec_result = actions.confirm_and_execute(action["action_id"])
         action = actions.get_action(action["action_id"])
         answer = note + _exec_reply(action_type, resolved, status, exec_result)
+    _maybe_record_session_context(action)
     return action, answer
+
+
+def _maybe_record_session_context(action: dict | None) -> None:
+    """Write the conversation pad after SUCCESS or complete PENDING."""
+    if not action:
+        return
+    status = action.get("status")
+    if status not in ("SUCCESS", "PENDING"):
+        return
+    if action.get("missing_params"):
+        return
+    action_type = action.get("action_type")
+    names = actions._app_names_from_params(action.get("resolved_params") or {})
+    draft = None
+    if action_type == "send_email":
+        remote = action.get("mail_draft_id") or action.get("gmail_draft_id")
+        if remote:
+            draft = {
+                "provider": action.get("mail_provider") or "gmail",
+                "remote_id": remote,
+            }
+    session_context.record_action(
+        action["user_id"],
+        action["conversation_id"],
+        action_type,
+        app_names=names,
+        last_draft=draft,
+    )
 
 
 def _queue_item(analysis: dict) -> dict:
@@ -510,9 +542,12 @@ def _handle_action_intents(
     """
     parsed = parse_mixed_utterance(user_text)
     clauses = parsed["actions"] or [user_text]
+    pad = session_context.get(user_id, conversation_id)
     analyses = []
     for clause in clauses:
-        analysis = analyze_action_request(clause, reply_history)
+        analysis = analyze_action_request(
+            clause, reply_history, session_context=pad
+        )
         print(
             f"action_clause={clause!r} type={analysis['action_type']} "
             f"resolved={analysis['resolved_params']} "
@@ -533,7 +568,7 @@ def _handle_action_intents(
     if drop_note:
         answer_parts.append(drop_note.rstrip(" —"))
     chat = parsed.get("chat") or ""
-    if chat:
+    if chat and mixed_chat_warrants_reply(chat):
         try:
             answer_parts.append(ask_llm(chat, history, long_term_facts))
         except Exception as e:
@@ -966,7 +1001,10 @@ def handle_chat(incoming_data: UserMessage):
         action_note = ""
         if open_action and open_action["status"] == "AWAITING_INPUT":
             analysis = analyze_action_request(
-                user_text, reply_history, task_context=open_action
+                user_text,
+                reply_history,
+                task_context=open_action,
+                session_context=session_context.get(user_id, conversation_id),
             )
             dismissed = bool(analysis.get("dismiss"))
             if (
@@ -1633,6 +1671,7 @@ def confirm_action(incoming_data: ActionDecision):
         queued = list(action.get("queue") or [])
         status, exec_result = actions.confirm_and_execute(action["action_id"])
         done = actions.get_action(action["action_id"])
+        _maybe_record_session_context(done)
         answer = _exec_reply(
             done["action_type"], done["resolved_params"], status, exec_result
         )

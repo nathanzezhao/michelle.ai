@@ -408,13 +408,28 @@ _BODY_RE = re.compile(r"\bbody\s*[:=]?\s*(.+)$", re.IGNORECASE | re.DOTALL)
 _RECIPIENT_NAME_RE = re.compile(r"\bto\s+([A-Za-z][\w.'-]*)", re.IGNORECASE)
 
 # Placeholder-ish app names that mean the user never said which app.
-_GENERIC_APP_WORDS = {"app", "an app", "the app", "it", "that", "something", "a new app"}
+_GENERIC_APP_WORDS = {
+    "app",
+    "an app",
+    "the app",
+    "it",
+    "that",
+    "those",
+    "them",
+    "these",
+    "something",
+    "a new app",
+}
+_APP_PRONOUN_RE = re.compile(r"\b(it|that|those|them|these)\b", re.IGNORECASE)
+_APP_PRONOUN_SINGULAR = {"it", "that"}
+_APP_PRONOUN_PLURAL = {"those", "them", "these"}
 
 
 def analyze_action_request(
     text: str,
     history: Optional[list[dict]] = None,
     task_context: Optional[dict] = None,
+    session_context: Optional[dict] = None,
 ) -> dict:
     """After intent=ACTION (or while an action is AWAITING_INPUT): what task,
     with what params? Runs ONLY on those turns — no other turn pays for it.
@@ -452,7 +467,10 @@ def analyze_action_request(
             # extractor — never invent values, only recover what the user typed.
             raw = _fill_action_from_rules(raw, rules)
 
-    return _finalize_action_analysis(raw, text, history, task_context)
+    finalized = _finalize_action_analysis(raw, text, history, task_context)
+    # Pad names are not in THIS utterance — fill after grounding so they
+    # are not stripped. Recompute missing_params here.
+    return _fill_from_session_context(finalized, text, session_context)
 
 
 def _params_dict(value) -> dict:
@@ -611,6 +629,53 @@ def _finalize_action_analysis(
         "resume": resume,
         "resume_query": resume_query or (text if resume else ""),
     }
+
+
+def _app_pronouns_in(text: str) -> set[str]:
+    return {m.group(1).lower() for m in _APP_PRONOUN_RE.finditer(text or "")}
+
+
+def _fill_from_session_context(
+    analysis: dict, text: str, session_context: Optional[dict]
+) -> dict:
+    """Bind it/that/those/them/these to this conversation's last_app_names.
+
+    Explicit names already on the analysis always win. Bare quit/close/open
+    with no pronoun stays missing. Singular it/that with 2+ pad names does
+    not guess.
+    """
+    if not isinstance(session_context, dict) or not isinstance(analysis, dict):
+        return analysis
+    action_type = str(analysis.get("action_type") or "").strip().lower()
+    if action_type not in ("open_app", "close_app", "quit_app"):
+        return analysis
+    resolved = dict(_params_dict(analysis.get("resolved_params")))
+    if not _param_empty(resolved.get("app_names")):
+        return analysis
+    last_names = [
+        str(item).strip()
+        for item in (session_context.get("last_app_names") or [])
+        if str(item or "").strip()
+    ]
+    if not last_names:
+        return analysis
+    found = _app_pronouns_in(text)
+    if not found:
+        return analysis
+    if found & _APP_PRONOUN_PLURAL:
+        names = list(last_names)
+    elif found & _APP_PRONOUN_SINGULAR:
+        if len(last_names) != 1:
+            return analysis
+        names = list(last_names)
+    else:
+        return analysis
+    out = dict(analysis)
+    resolved["app_names"] = names
+    out["resolved_params"] = resolved
+    required = ACTION_WHITELIST[action_type]["required_params"]
+    out["missing_params"] = [p for p in required if _param_empty(resolved.get(p))]
+    return out
 
 
 def _ground_action_params(params, text: str, history: Optional[list[dict]] = None) -> dict:
@@ -1350,6 +1415,26 @@ def parse_mixed_utterance(text: str) -> dict:
         if chunk:
             actions.append(chunk)
     return {"chat": chat, "actions": actions}
+
+
+def mixed_chat_warrants_reply(text: str) -> bool:
+    """Leftover words before an action: reply only if this is a real ask.
+
+    Do not keep a filler word list. A short CHAT fragment is not a request;
+    a question, retrieve, remember, or a longer prompt is. Another action
+    in the leftover is already split into clauses — do not chat it.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if _looks_like_question(stripped) or _looks_like_remember_command(stripped):
+        return True
+    intent = str(_classify_with_rules(stripped).get("intent") or "").upper()
+    if intent in ("RETRIEVE", "REMEMBER"):
+        return True
+    if intent == "ACTION":
+        return False
+    return len(re.findall(r"[A-Za-z0-9']+", stripped)) >= 3
 
 
 def _classify_with_rules(text: str) -> dict:

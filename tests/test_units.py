@@ -15,6 +15,7 @@ from intent import (
     analyze_action_request,
     classify_intent,
     classify_memory_confirmation,
+    mixed_chat_warrants_reply,
     parse_mixed_utterance,
     usable_memory_facts,
 )
@@ -368,6 +369,8 @@ def test_llm_chat_label_still_promotes_open_order(monkeypatch):
             "",
             ["can you pull up the email draft about going to the moon"],
         ),
+        ("now close them", "now", ["close them"]),
+        ("pls close them", "", ["pls close them"]),
         ("close Notes", "", ["close Notes"]),
         ("close Notes and Safari", "", ["close Notes and Safari"]),
         (
@@ -388,6 +391,16 @@ def test_parse_mixed_utterance(text, chat, actions):
     assert parsed["actions"] == actions
     if actions:
         assert classify_intent(text)["intent"] == "ACTION"
+
+
+def test_mixed_chat_warrants_reply_is_meaning_not_a_filler_list():
+    assert mixed_chat_warrants_reply("") is False
+    assert mixed_chat_warrants_reply("now") is False
+    assert mixed_chat_warrants_reply("pls") is False
+    assert mixed_chat_warrants_reply("ok now") is False
+    assert mixed_chat_warrants_reply("hey how are you") is True
+    assert mixed_chat_warrants_reply("whats up") is True
+    assert mixed_chat_warrants_reply("what's the refund policy") is True
 
 
 def test_email_word_in_prose_is_not_an_action_order():
@@ -474,6 +487,37 @@ def test_close_and_quit_extract_names():
     assert both["resolved_params"]["app_names"] == ["Notes", "Safari"]
     oxford_open = analyze_action_request("open Chrome, Slack, and Notes")
     assert oxford_open["resolved_params"]["app_names"] == ["Chrome", "Slack", "Notes"]
+
+
+def test_session_context_fills_quit_those():
+    pad = {
+        "last_app_names": ["Notes", "Safari"],
+        "last_action_type": "open_app",
+    }
+    filled = analyze_action_request("quit those", session_context=pad)
+    assert filled["action_type"] == "quit_app"
+    assert filled["resolved_params"]["app_names"] == ["Notes", "Safari"]
+    assert filled["missing_params"] == []
+    bare = analyze_action_request("quit those")
+    assert not (bare.get("resolved_params") or {}).get("app_names")
+    assert "app_names" in bare["missing_params"]
+    no_pronoun = analyze_action_request(
+        "quit", session_context={"last_app_names": ["Notes", "Safari"]}
+    )
+    assert not (no_pronoun.get("resolved_params") or {}).get("app_names")
+    singular = analyze_action_request(
+        "close it", session_context={"last_app_names": ["Notes"]}
+    )
+    assert singular["resolved_params"]["app_names"] == ["Notes"]
+    ambiguous = analyze_action_request(
+        "close it", session_context={"last_app_names": ["Notes", "Safari"]}
+    )
+    assert not (ambiguous.get("resolved_params") or {}).get("app_names")
+    assert "app_names" in ambiguous["missing_params"]
+    explicit = analyze_action_request(
+        "quit Safari", session_context={"last_app_names": ["Notes"]}
+    )
+    assert explicit["resolved_params"]["app_names"] == ["Safari"]
 
 
 def test_llm_empty_quit_names_do_not_stick(monkeypatch):

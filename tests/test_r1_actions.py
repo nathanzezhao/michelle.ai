@@ -452,6 +452,19 @@ def test_open_app_slang_and_gibberish_names(client, ids, fake_open, text, app_na
     assert fake_open.calls == [["open", "-a", app_name]]
 
 
+def test_now_close_them_does_not_chat_the_crumb(client, ids, fake_open):
+    opened = chat(client, "open Notes and Safari", ids)
+    assert opened["task_status"] == "SUCCESS"
+    body = chat(client, "now close them", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "SUCCESS"
+    assert body["resolved_params"]["app_names"] == ["Notes", "Safari"]
+    assert "Closed Notes and Safari" in body["answer"]
+    assert "[mock mode]" not in body["answer"]
+    assert "I heard:" not in body["answer"]
+
+
 def test_chat_then_open_runs_action_and_replies(client, ids, fake_open):
     body = chat(client, "hey how are you, open Notes", ids)
     assert body["engine"] == "action"
@@ -2126,3 +2139,73 @@ def test_which_one_none_clears_pick(client, ids, fake_composio):
     assert out["engine"] == "chat"
     assert "leave those" in out["answer"].lower() or "okay" in out["answer"].lower()
     assert len(open_rows(ids)) == 0
+
+
+# --- Session working context (per-conversation pad, not long-term facts) -----
+
+
+def test_quit_those_uses_session_pad(client, ids, fake_open):
+    opened = chat(client, "open Notes and Safari", ids)
+    assert opened["task_status"] == "SUCCESS"
+    assert long_term_memory.get_facts(ids["user_id"]) == []
+    body = chat(client, "quit those", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["task_status"] == "PENDING"
+    assert body["resolved_params"]["app_names"] == ["Notes", "Safari"]
+    assert "Notes" in body["answer"]
+    assert "Safari" in body["answer"]
+    assert native_action_calls(fake_open) == [
+        ["open", "-a", "Notes"],
+        ["open", "-a", "Safari"],
+    ]
+    assert long_term_memory.get_facts(ids["user_id"]) == []
+
+
+def test_close_it_uses_single_session_app(client, ids, fake_open):
+    chat(client, "open Notes", ids)
+    body = chat(client, "close it", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "SUCCESS"
+    assert body["resolved_params"]["app_names"] == ["Notes"]
+    assert native_action_calls(fake_open)[-1][:2] == ["osascript", "-e"]
+    assert long_term_memory.get_facts(ids["user_id"]) == []
+
+
+def test_close_it_does_not_guess_among_two(client, ids, fake_open):
+    chat(client, "open Notes and Safari", ids)
+    body = chat(client, "close it", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "AWAITING_INPUT"
+    assert "app_names" in (body.get("missing_params") or [])
+    names = (body.get("resolved_params") or {}).get("app_names") or []
+    assert names == []
+    assert native_action_calls(fake_open) == [
+        ["open", "-a", "Notes"],
+        ["open", "-a", "Safari"],
+    ]
+    assert long_term_memory.get_facts(ids["user_id"]) == []
+
+
+def test_session_pad_does_not_follow_new_conversation(client, ids, fake_open):
+    chat(client, "open Notes and Safari", ids)
+    other = {"user_id": ids["user_id"], "conversation_id": str(uuid4())}
+    body = chat(client, "quit those", other)
+    names = (body.get("resolved_params") or {}).get("app_names") or []
+    assert "Notes" not in names
+    assert "Safari" not in names
+    assert body.get("task_status") != "PENDING"
+    assert long_term_memory.get_facts(ids["user_id"]) == []
+
+
+def test_explicit_quit_name_beats_session_pad(client, ids, fake_open):
+    chat(client, "open Notes", ids)
+    body = chat(client, "quit Safari", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["task_status"] == "PENDING"
+    assert body["resolved_params"]["app_names"] == ["Safari"]
+    assert "Notes" not in body["answer"]
+    assert long_term_memory.get_facts(ids["user_id"]) == []
