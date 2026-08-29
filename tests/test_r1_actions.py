@@ -48,6 +48,7 @@ import intent
 import long_term_memory
 import main
 import memory
+import session_context
 import whisper
 from conftest import chat
 
@@ -2209,3 +2210,136 @@ def test_explicit_quit_name_beats_session_pad(client, ids, fake_open):
     assert body["resolved_params"]["app_names"] == ["Safari"]
     assert "Notes" not in body["answer"]
     assert long_term_memory.get_facts(ids["user_id"]) == []
+
+
+def _list_calls(fake):
+    return [c for c in fake.draft_calls if c and c[0] == "list"]
+
+
+def test_generic_resume_uses_pad_draft_and_skips_list(client, ids, fake_composio):
+    fake_composio.drafts["r-pad"] = {
+        "recipient": "alex@example.com",
+        "subject": "hello",
+        "body": "from this chat",
+        "updated_at": "1",
+    }
+    fake_composio.drafts["r-other"] = {
+        "recipient": "sam@example.com",
+        "subject": "newer",
+        "body": "mailbox newest",
+        "updated_at": "9",
+    }
+    session_context.record_action(
+        ids["user_id"],
+        ids["conversation_id"],
+        "send_email",
+        last_draft={
+            "provider": "gmail",
+            "remote_id": "r-pad",
+            "recipient": "alex@example.com",
+            "subject": "hello",
+            "body": "from this chat",
+        },
+    )
+    fake_composio.draft_calls.clear()
+    out = chat(client, "show me the draft", ids)
+    assert out["engine"] == "action"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["recipient"] == "alex@example.com"
+    assert out["resolved_params"]["subject"] == "hello"
+    assert _list_calls(fake_composio) == []
+    assert ("get", "r-pad") in fake_composio.draft_calls
+
+
+def test_distinctive_resume_still_lists_mailbox(client, ids, fake_composio):
+    fake_composio.drafts["r-pad"] = {
+        "recipient": "alex@example.com",
+        "subject": "hello",
+        "body": "from this chat",
+        "updated_at": "1",
+    }
+    fake_composio.drafts["r-lunch"] = {
+        "recipient": "sam@example.com",
+        "subject": "lunch",
+        "body": "see you at 1",
+        "updated_at": "2",
+    }
+    session_context.record_action(
+        ids["user_id"],
+        ids["conversation_id"],
+        "send_email",
+        last_draft={"provider": "gmail", "remote_id": "r-pad"},
+    )
+    fake_composio.draft_calls.clear()
+    out = chat(client, "the one about lunch", ids)
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["subject"] == "lunch"
+    assert _list_calls(fake_composio)
+
+
+def test_pad_remote_gone_falls_through_to_mailbox(client, ids, fake_composio):
+    fake_composio.drafts["r-other"] = {
+        "recipient": "sam@example.com",
+        "subject": "kept",
+        "body": "still in gmail",
+        "updated_at": "1",
+    }
+    session_context.record_action(
+        ids["user_id"],
+        ids["conversation_id"],
+        "send_email",
+        last_draft={"provider": "gmail", "remote_id": "r-gone"},
+    )
+    fake_composio.draft_calls.clear()
+    out = chat(client, "show me the draft", ids)
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["recipient"] == "sam@example.com"
+    assert _list_calls(fake_composio)
+    assert ("get", "r-gone") in fake_composio.draft_calls
+
+
+def test_pad_fields_only_reopen_skips_gmail(client, ids, fake_composio):
+    session_context.record_action(
+        ids["user_id"],
+        ids["conversation_id"],
+        "send_email",
+        last_draft={
+            "recipient": "alex@example.com",
+            "subject": "hi",
+            "body": "hello",
+        },
+    )
+    fake_composio.draft_calls.clear()
+    out = chat(client, "show me the draft", ids)
+    assert out["engine"] == "action"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["recipient"] == "alex@example.com"
+    assert out["resolved_params"]["subject"] == "hi"
+    assert out["resolved_params"]["body"] == "hello"
+    assert fake_composio.draft_calls == []
+
+
+def test_ambiguous_draft_pick_survives_on_pad(client, ids, fake_composio):
+    fake_composio.drafts["r-alex"] = {
+        "recipient": "alex@example.com",
+        "subject": "lunch",
+        "body": "see you at 1",
+        "updated_at": "1",
+    }
+    fake_composio.drafts["r-sam"] = {
+        "recipient": "sam@example.com",
+        "subject": "lunch",
+        "body": "see you at 2",
+        "updated_at": "2",
+    }
+    first = chat(client, "the one about lunch", ids)
+    assert "Which one" in first["answer"]
+    pick = session_context.get(ids["user_id"], ids["conversation_id"])["last_draft_pick"]
+    assert pick and len(pick["candidates"]) == 2
+    out = chat(client, "the one to alex@example.com", ids)
+    assert out["engine"] == "action"
+    assert out["task_status"] == "AWAITING_INPUT"
+    assert out["resolved_params"]["recipient"] == "alex@example.com"
+    assert session_context.get(ids["user_id"], ids["conversation_id"])[
+        "last_draft_pick"
+    ] is None

@@ -43,6 +43,75 @@ def _empty() -> dict:
         "last_app_names": [],
         "last_action_type": None,
         "last_draft": None,
+        "last_draft_pick": None,
+    }
+
+
+def _clean_text(value) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_last_draft(draft) -> dict | None:
+    if not isinstance(draft, dict):
+        return None
+    out = {}
+    provider = _clean_text(draft.get("provider"))
+    if provider:
+        out["provider"] = provider
+    remote = _clean_text(
+        draft.get("remote_id") or draft.get("gmail_draft_id") or draft.get("mail_draft_id")
+    )
+    if remote:
+        out["remote_id"] = remote
+    for key in ("recipient", "subject", "body"):
+        val = _clean_text(draft.get(key))
+        if val:
+            out[key] = val
+    if not out:
+        return None
+    if "provider" not in out and (out.get("remote_id") or out.get("recipient")):
+        out["provider"] = "gmail"
+    return out
+
+
+def _slim_pick_candidate(draft) -> dict | None:
+    if not isinstance(draft, dict):
+        return None
+    remote = _clean_text(
+        draft.get("remote_id") or draft.get("gmail_draft_id") or draft.get("mail_draft_id")
+    )
+    recipient = _clean_text(draft.get("recipient"))
+    subject = _clean_text(draft.get("subject"))
+    body = _clean_text(draft.get("body"))
+    snippet = _clean_text(draft.get("snippet")) or body[:160]
+    if not remote and not recipient and not subject and not snippet:
+        return None
+    out = {
+        "provider": _clean_text(draft.get("provider")) or "gmail",
+        "remote_id": remote or None,
+        "recipient": recipient,
+        "subject": subject,
+        "snippet": snippet[:160],
+        "body": body,
+    }
+    if remote:
+        out["gmail_draft_id"] = remote
+    return out
+
+
+def _normalize_last_draft_pick(pick) -> dict | None:
+    if not isinstance(pick, dict):
+        return None
+    candidates = []
+    for item in pick.get("candidates") or []:
+        slim = _slim_pick_candidate(item)
+        if slim:
+            candidates.append(slim)
+    if not candidates:
+        return None
+    return {
+        "candidates": candidates,
+        "query": _clean_text(pick.get("query")),
     }
 
 
@@ -71,8 +140,8 @@ def get(user_id: str, conversation_id: str) -> dict:
             pad[key] = [str(item).strip() for item in value if str(item or "").strip()]
     action_type = stored.get("last_action_type")
     pad["last_action_type"] = str(action_type).strip() if action_type else None
-    draft = stored.get("last_draft")
-    pad["last_draft"] = draft if isinstance(draft, dict) else None
+    pad["last_draft"] = _normalize_last_draft(stored.get("last_draft"))
+    pad["last_draft_pick"] = _normalize_last_draft_pick(stored.get("last_draft_pick"))
     return pad
 
 
@@ -80,6 +149,8 @@ def put(user_id: str, conversation_id: str, payload: dict) -> dict:
     pad = _empty()
     if isinstance(payload, dict):
         pad.update(payload)
+    pad["last_draft"] = _normalize_last_draft(pad.get("last_draft"))
+    pad["last_draft_pick"] = _normalize_last_draft_pick(pad.get("last_draft_pick"))
     blob = json.dumps(pad)
     with _connect() as conn:
         conn.execute(
@@ -110,6 +181,7 @@ def record_action(
     action_type: str,
     app_names=None,
     last_draft=None,
+    clear_draft: bool = False,
 ) -> dict:
     """Merge this settled action into the conversation pad."""
     pad = get(user_id, conversation_id)
@@ -126,15 +198,33 @@ def record_action(
             pad["last_quit"] = names
         pad["last_app_names"] = names
         pad["last_action_type"] = kind
+        pad["last_draft_pick"] = None
     elif kind == "send_email":
         pad["last_action_type"] = kind
-        if isinstance(last_draft, dict) and (
-            last_draft.get("remote_id") or last_draft.get("provider")
-        ):
-            pad["last_draft"] = {
-                "provider": last_draft.get("provider") or "gmail",
-                "remote_id": last_draft.get("remote_id"),
-            }
+        if clear_draft:
+            pad["last_draft"] = None
+        else:
+            incoming = _normalize_last_draft(last_draft)
+            if incoming:
+                merged = dict(pad.get("last_draft") or {})
+                merged.update(incoming)
+                pad["last_draft"] = _normalize_last_draft(merged)
     else:
         return pad
     return put(user_id, conversation_id, pad)
+
+
+def set_draft_pick(user_id: str, conversation_id: str, pick) -> dict:
+    pad = get(user_id, conversation_id)
+    pad["last_draft_pick"] = _normalize_last_draft_pick(pick)
+    return put(user_id, conversation_id, pad)
+
+
+def clear_draft_pick(user_id: str, conversation_id: str) -> dict:
+    return set_draft_pick(user_id, conversation_id, None)
+
+
+def pad_draft_stash(user_id: str, conversation_id: str) -> dict | None:
+    """This-chat letter for generic resume. None if the pad has no draft."""
+    draft = get(user_id, conversation_id).get("last_draft")
+    return _normalize_last_draft(draft)

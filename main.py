@@ -167,8 +167,6 @@ RESUME_GONE_REPLY = "I can't find that draft in Gmail anymore."
 
 # Snapshot of the dismissed composer until yes/no. Keyed by (user_id, conversation_id).
 _pending_draft_asks: dict[tuple[str, str], dict] = {}
-# After "Which one?", the next line is a pick — not a new open_app.
-_pending_draft_picks: dict[tuple[str, str], dict] = {}
 _PICK_NONE_RE = re.compile(
     r"^(?:none|neither|neither of (?:them|those)|not those|nope)\s*[.!?]*$",
     re.IGNORECASE,
@@ -309,6 +307,22 @@ def _keep_gmail_draft(snapshot: dict) -> str:
         actions.patch_payload(
             action_id, gmail_draft_id=draft_id, gmail_draft_kept=True
         )
+        action = actions.get_action(action_id)
+        if action and draft_id:
+            draft = {
+                "provider": action.get("mail_provider") or "gmail",
+                "remote_id": draft_id,
+            }
+            for key in ("recipient", "subject", "body"):
+                val = str((params or action.get("resolved_params") or {}).get(key) or "").strip()
+                if val:
+                    draft[key] = val
+            session_context.record_action(
+                action["user_id"],
+                action["conversation_id"],
+                "send_email",
+                last_draft=draft,
+            )
     return SAVE_DRAFT_YES_REPLY
 
 
@@ -375,31 +389,57 @@ def _settle_action(action: dict, note: str) -> tuple[dict, str]:
     return action, answer
 
 
+def _draft_payload_from_action(action: dict) -> dict | None:
+    resolved = action.get("resolved_params") or {}
+    remote = action.get("mail_draft_id") or action.get("gmail_draft_id")
+    out = {}
+    if remote:
+        out["provider"] = action.get("mail_provider") or "gmail"
+        out["remote_id"] = remote
+    for key in ("recipient", "subject", "body"):
+        val = str(resolved.get(key) or "").strip()
+        if val:
+            out[key] = val
+    return out or None
+
+
 def _maybe_record_session_context(action: dict | None) -> None:
-    """Write the conversation pad after SUCCESS or complete PENDING."""
+    """Write the conversation pad after a settled action, including an open composer."""
     if not action:
         return
     status = action.get("status")
+    action_type = action.get("action_type")
+    if action_type == "send_email":
+        if status not in ("SUCCESS", "PENDING", "AWAITING_INPUT"):
+            return
+        if status == "SUCCESS":
+            session_context.record_action(
+                action["user_id"],
+                action["conversation_id"],
+                "send_email",
+                clear_draft=True,
+            )
+            return
+        draft = _draft_payload_from_action(action)
+        if not draft:
+            return
+        session_context.record_action(
+            action["user_id"],
+            action["conversation_id"],
+            "send_email",
+            last_draft=draft,
+        )
+        return
     if status not in ("SUCCESS", "PENDING"):
         return
     if action.get("missing_params"):
         return
-    action_type = action.get("action_type")
     names = actions._app_names_from_params(action.get("resolved_params") or {})
-    draft = None
-    if action_type == "send_email":
-        remote = action.get("mail_draft_id") or action.get("gmail_draft_id")
-        if remote:
-            draft = {
-                "provider": action.get("mail_provider") or "gmail",
-                "remote_id": remote,
-            }
     session_context.record_action(
         action["user_id"],
         action["conversation_id"],
         action_type,
         app_names=names,
-        last_draft=draft,
     )
 
 
@@ -439,7 +479,8 @@ def _is_draft_pick_none(text: str) -> bool:
 
 
 def _reopen_stashed_draft(
-    user_id: str, conversation_id: str, stash: dict, note: str = ""
+    user_id: str, conversation_id: str, stash: dict, note: str = "",
+    *, already_loaded: bool = False,
 ) -> tuple[dict | None, str]:
     provider = stash.get("provider") or "gmail"
     remote_id = (
@@ -447,7 +488,7 @@ def _reopen_stashed_draft(
         or stash.get("mail_draft_id")
         or stash.get("gmail_draft_id")
     )
-    if remote_id:
+    if remote_id and not already_loaded:
         loaded = actions.load_draft(provider, remote_id)
         if not loaded.get("ok"):
             if stash.get("action_id"):
@@ -495,24 +536,57 @@ def _reopen_stashed_draft(
 
 def _run_one_action(user_id, conversation_id, analysis, note="", queue=None):
     if analysis.get("resume") and analysis.get("action_type") == "send_email":
-        shelf = actions.list_recent_drafts(user_id, conversation_id)
         query = analysis.get("resume_query") or ""
+        if not actions._draft_tokens(query):
+            pad_stash = session_context.pad_draft_stash(user_id, conversation_id)
+            if pad_stash:
+                if pad_stash.get("remote_id"):
+                    loaded = actions.load_draft(
+                        pad_stash.get("provider") or "gmail",
+                        pad_stash["remote_id"],
+                    )
+                    if loaded.get("ok"):
+                        session_context.clear_draft_pick(user_id, conversation_id)
+                        src = loaded.get("resolved_params") or {}
+                        stash = dict(pad_stash)
+                        for key in ("recipient", "subject", "body"):
+                            val = str(src.get(key) or "").strip()
+                            if val:
+                                stash[key] = val
+                        return _reopen_stashed_draft(
+                            user_id,
+                            conversation_id,
+                            stash,
+                            note=note,
+                            already_loaded=True,
+                        )
+                    # Gone from Gmail — fall through to the mailbox list.
+                else:
+                    session_context.clear_draft_pick(user_id, conversation_id)
+                    return _reopen_stashed_draft(
+                        user_id, conversation_id, pad_stash, note=note
+                    )
+        shelf = actions.list_recent_drafts(user_id, conversation_id)
         matched = actions.pick_draft(query, shelf, resume=True)
         status = matched.get("status")
         if status in ("hit", "one", "newest"):
-            _pending_draft_picks.pop((user_id, conversation_id), None)
+            session_context.clear_draft_pick(user_id, conversation_id)
             return _reopen_stashed_draft(
                 user_id, conversation_id, matched["draft"], note=note
             )
         if status == "ambiguous":
-            _pending_draft_picks[(user_id, conversation_id)] = {
-                "candidates": list(matched.get("candidates") or []),
-                "query": query,
-            }
+            session_context.set_draft_pick(
+                user_id,
+                conversation_id,
+                {
+                    "candidates": list(matched.get("candidates") or []),
+                    "query": query,
+                },
+            )
             return None, _ambiguous_draft_ask(matched.get("candidates") or [])
-        _pending_draft_picks.pop((user_id, conversation_id), None)
+        session_context.clear_draft_pick(user_id, conversation_id)
         return None, RESUME_MISS_REPLY
-    _pending_draft_picks.pop((user_id, conversation_id), None)
+    session_context.clear_draft_pick(user_id, conversation_id)
     action = actions.create_action(
         user_id,
         conversation_id,
@@ -620,25 +694,24 @@ def _try_pending_draft_pick(
     conversation_id: str,
 ) -> dict | None:
     """Continue a Which-one instead of starting a new open_app."""
-    key = (user_id, conversation_id)
-    pending = _pending_draft_picks.get(key)
+    pending = session_context.get(user_id, conversation_id).get("last_draft_pick")
     if not pending:
         return None
     if _is_draft_pick_none(user_text):
-        _pending_draft_picks.pop(key, None)
+        session_context.clear_draft_pick(user_id, conversation_id)
         answer = "Okay — I'll leave those."
         save_message(conversation_id, "user", user_text, kind="action")
         save_message(conversation_id, "assistant", answer, kind="action")
         return _chat_only_payload(answer, conversation_id, user_id)
     if _NEW_EMAIL_SEND_RE.search(user_text) and not _looks_like_resume_draft(user_text):
-        _pending_draft_picks.pop(key, None)
+        session_context.clear_draft_pick(user_id, conversation_id)
         return None
     if (
         _ACTION_OPEN_RE.match(user_text.strip())
         or _ACTION_CLOSE_RE.match(user_text.strip())
         or _ACTION_QUIT_RE.match(user_text.strip())
     ):
-        _pending_draft_picks.pop(key, None)
+        session_context.clear_draft_pick(user_id, conversation_id)
         return None
     candidates = list(pending.get("candidates") or [])
     prior = str(pending.get("query") or "").strip()
@@ -649,7 +722,7 @@ def _try_pending_draft_pick(
             matched = actions.pick_draft(combined, candidates, resume=True)
     status = matched.get("status")
     if status in ("hit", "one", "newest"):
-        _pending_draft_picks.pop(key, None)
+        session_context.clear_draft_pick(user_id, conversation_id)
         action, answer = _reopen_stashed_draft(
             user_id, conversation_id, matched["draft"]
         )
@@ -683,10 +756,14 @@ def _try_pending_draft_pick(
             },
         )
     if status == "ambiguous":
-        _pending_draft_picks[key] = {
-            "candidates": list(matched.get("candidates") or candidates),
-            "query": prior,
-        }
+        session_context.set_draft_pick(
+            user_id,
+            conversation_id,
+            {
+                "candidates": list(matched.get("candidates") or candidates),
+                "query": prior,
+            },
+        )
         answer = _ambiguous_draft_ask(matched.get("candidates") or candidates)
         save_message(conversation_id, "user", user_text, kind="action")
         save_message(conversation_id, "assistant", answer, kind="action")
@@ -1603,7 +1680,9 @@ def sync_draft(incoming: SubmitDraftRequest):
     action, _ = actions.upsert_gmail_draft(
         action, resolved, include_attachments=False
     )
-    return _submit_draft_payload("", conversation_id, user_id, action or open_action)
+    action = action or open_action
+    _maybe_record_session_context(action)
+    return _submit_draft_payload("", conversation_id, user_id, action)
 
 
 @app.post("/action/confirm")

@@ -8,6 +8,7 @@ import pytest
 import actions
 import long_term_memory
 import retrieve
+import session_context
 from intent import (
     _looks_like_composer_dismiss,
     _looks_like_question,
@@ -518,6 +519,64 @@ def test_session_context_fills_quit_those():
         "quit Safari", session_context={"last_app_names": ["Notes"]}
     )
     assert explicit["resolved_params"]["app_names"] == ["Safari"]
+
+
+def test_session_pad_draft_fields_round_trip():
+    user_id, conversation_id = str(uuid4()), str(uuid4())
+    session_context.init_db()
+    session_context.record_action(
+        user_id,
+        conversation_id,
+        "send_email",
+        last_draft={
+            "provider": "gmail",
+            "recipient": "alex@example.com",
+            "subject": "hi",
+            "body": "hello",
+        },
+    )
+    pad = session_context.get(user_id, conversation_id)
+    assert pad["last_action_type"] == "send_email"
+    assert pad["last_draft"]["recipient"] == "alex@example.com"
+    assert pad["last_draft"]["subject"] == "hi"
+    assert pad["last_draft"]["body"] == "hello"
+    assert not pad["last_draft"].get("remote_id")
+    stash = session_context.pad_draft_stash(user_id, conversation_id)
+    assert stash["recipient"] == "alex@example.com"
+    session_context.record_action(
+        user_id,
+        conversation_id,
+        "send_email",
+        last_draft={"remote_id": "r-1"},
+    )
+    pad = session_context.get(user_id, conversation_id)
+    assert pad["last_draft"]["remote_id"] == "r-1"
+    assert pad["last_draft"]["recipient"] == "alex@example.com"
+    session_context.set_draft_pick(
+        user_id,
+        conversation_id,
+        {
+            "query": "lunch",
+            "candidates": [
+                {
+                    "remote_id": "r-a",
+                    "recipient": "a@x.com",
+                    "subject": "lunch",
+                    "body": "see you",
+                }
+            ],
+        },
+    )
+    pick = session_context.get(user_id, conversation_id)["last_draft_pick"]
+    assert pick["query"] == "lunch"
+    assert pick["candidates"][0]["remote_id"] == "r-a"
+    assert pick["candidates"][0]["gmail_draft_id"] == "r-a"
+    session_context.record_action(
+        user_id, conversation_id, "open_app", app_names=["Notes"]
+    )
+    pad = session_context.get(user_id, conversation_id)
+    assert pad["last_draft_pick"] is None
+    assert pad["last_app_names"] == ["Notes"]
 
 
 def test_llm_empty_quit_names_do_not_stick(monkeypatch):
