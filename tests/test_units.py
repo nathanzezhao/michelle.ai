@@ -521,6 +521,37 @@ def test_session_context_fills_quit_those():
     assert explicit["resolved_params"]["app_names"] == ["Safari"]
 
 
+def test_open_it_again_uses_pad_not_app_named_it_again(monkeypatch):
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Notes", "Safari"])
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: ["Notes", "Safari"])
+    pad = {"last_app_names": ["Notes"]}
+    again = analyze_action_request("open it again", session_context=pad)
+    assert again["action_type"] == "open_app"
+    assert again["resolved_params"]["app_names"] == ["Notes"]
+    typo = analyze_action_request("open it agian", session_context=pad)
+    assert typo["resolved_params"]["app_names"] == ["Notes"]
+    two = analyze_action_request(
+        "open it again", session_context={"last_app_names": ["Notes", "Safari"]}
+    )
+    assert not (two.get("resolved_params") or {}).get("app_names")
+    assert "app_names" in two["missing_params"]
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: [])
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: [])
+    empty = analyze_action_request("open it again", session_context=pad)
+    assert empty["resolved_params"]["app_names"] == ["Notes"]
+
+
+def test_open_it_safari_keeps_explicit_catalog_hit(monkeypatch):
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: [])
+    monkeypatch.setattr(
+        actions, "_list_installed_app_names", lambda: ["Notes", "Safari"]
+    )
+    out = analyze_action_request(
+        "open it Safari", session_context={"last_app_names": ["Notes"]}
+    )
+    assert out["resolved_params"]["app_names"] == ["Safari"]
+
+
 def test_session_pad_draft_fields_round_trip():
     user_id, conversation_id = str(uuid4()), str(uuid4())
     session_context.init_db()
@@ -621,6 +652,37 @@ def test_notes_does_not_resolve_to_notes_plus_when_notes_already_quit(monkeypatc
     assert actions.resolve_app_target("Notes") == ("not_running", "Notes")
     assert actions.resolve_app_target("Notes+") == ("running", "Notes+")
     assert actions._fuzzy_pick("Notes", ["Notes+"]) is None
+
+
+def test_outlook_short_and_typo_resolve_to_microsoft_outlook(monkeypatch):
+    catalog = ["Microsoft Outlook", "Safari", "Notes"]
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: [])
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: catalog)
+    assert actions._fuzzy_pick("outlook", catalog) == "Microsoft Outlook"
+    assert actions._fuzzy_pick("outlok", catalog) == "Microsoft Outlook"
+    assert actions.resolve_app_target("outlook") == (
+        "not_running",
+        "Microsoft Outlook",
+    )
+    assert actions.resolve_app_target("outlok") == (
+        "not_running",
+        "Microsoft Outlook",
+    )
+    assert actions.resolve_app_target("Safar") == ("not_running", "Safari")
+    assert actions._fuzzy_pick("again", catalog) is None
+
+
+def test_visual_studio_code_resolves_to_running_code(monkeypatch):
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Code", "Safari"])
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Visual Studio Code", "Safari", "Notes"],
+    )
+    assert actions._fuzzy_pick("Visual Studio Code", ["Code", "Safari"]) == "Code"
+    assert actions.resolve_app_target("Visual Studio Code") == ("running", "Code")
+    assert actions.resolve_app_target("visual studio code") == ("running", "Code")
+    assert actions.resolve_app_name("Visual Studio Code") == "Code"
 
 
 def test_llm_close_label_recovers_from_rules(monkeypatch):

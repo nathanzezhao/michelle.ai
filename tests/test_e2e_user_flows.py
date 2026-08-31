@@ -3,7 +3,7 @@
 HTTP /chat only. Temp DB + mock LLM + rules intent (conftest). No live Gmail,
 no real `open`/`osascript`, no Playwright.
 
-IDs E1–E13 map to Ray's Ada report.
+IDs E1–E20 map to Ray's Ada report.
 """
 
 from uuid import uuid4
@@ -17,6 +17,7 @@ from conftest import chat
 from test_r1_actions import (
     FakeComposio,
     FakeSubprocess,
+    confirm,
     native_action_calls,
     payload,
     fetch_row,
@@ -320,3 +321,122 @@ def test_e12_send_an_emauil_complete_goes_pending(client, ids):
     assert body["resolved_params"]["subject"] == "hi"
     assert body["resolved_params"]["body"] == "hello"
     assert body["missing_params"] == []
+
+
+def test_e14_open_it_again_reopens_pad_app(client, ids, fake_open):
+    chat(client, "open Notes", ids)
+    fake_open.calls.clear()
+    body = chat(client, "open it again", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "open_app"
+    assert body["task_status"] == "SUCCESS"
+    assert body["resolved_params"]["app_names"] == ["Notes"]
+    assert native_action_calls(fake_open) == [OPEN_NOTES]
+
+
+def test_e15_open_it_agian_typo_still_uses_pad(client, ids, fake_open):
+    chat(client, "open Notes", ids)
+    fake_open.calls.clear()
+    body = chat(client, "open it agian", ids)
+    assert body["task_status"] == "SUCCESS"
+    assert body["resolved_params"]["app_names"] == ["Notes"]
+    assert native_action_calls(fake_open) == [OPEN_NOTES]
+
+
+def test_e16_open_it_safari_is_explicit(client, ids, fake_open):
+    chat(client, "open Notes", ids)
+    fake_open.calls.clear()
+    body = chat(client, "open it Safari", ids)
+    assert body["task_status"] == "SUCCESS"
+    assert body["resolved_params"]["app_names"] == ["Safari"]
+    assert native_action_calls(fake_open) == [OPEN_SAFARI]
+
+
+def test_e17_open_it_again_two_apps_does_not_guess(client, ids, fake_open):
+    chat(client, "open Notes and Safari", ids)
+    fake_open.calls.clear()
+    body = chat(client, "open it again", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "open_app"
+    assert body["task_status"] == "AWAITING_INPUT"
+    assert "app_names" in (body.get("missing_params") or [])
+    assert native_action_calls(fake_open) == []
+
+
+def test_e18_open_visual_studio_code_then_close_it(client, ids, fake_open, monkeypatch):
+    fake_open.running = list(fake_open.running) + ["Code"]
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Visual Studio Code", "Safari", "Notes"],
+    )
+    opened = chat(client, "open visual studio code", ids)
+    assert opened["engine"] == "action"
+    assert opened["action_type"] == "open_app"
+    assert opened["task_status"] == "SUCCESS"
+    pad = session_context.get(ids["user_id"], ids["conversation_id"])
+    assert pad["last_app_names"] == ["Code"]
+    fake_open.calls.clear()
+    body = chat(client, "close it", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "SUCCESS"
+    assert "isn't open" not in body["answer"].lower()
+    assert "Closed Code" in body["answer"]
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Code" to close every window']
+    ]
+
+
+def test_e19_open_outlook_then_close_it(client, ids, fake_open, monkeypatch):
+    fake_open.running = list(fake_open.running) + ["Microsoft Outlook"]
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Microsoft Outlook", "Safari", "Notes"],
+    )
+    opened = chat(client, "open outlook", ids)
+    assert opened["engine"] == "action"
+    assert opened["action_type"] == "open_app"
+    assert opened["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [["open", "-a", "Microsoft Outlook"]]
+    pad = session_context.get(ids["user_id"], ids["conversation_id"])
+    assert pad["last_app_names"] == ["Microsoft Outlook"]
+    fake_open.calls.clear()
+    body = chat(client, "close it", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "SUCCESS"
+    assert "isn't open" not in body["answer"].lower()
+    assert "outlook" not in (body.get("resolved_params") or {}).get("app_names", [])
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Microsoft Outlook" to close every window']
+    ]
+
+
+def test_e20_open_outlook_then_quit_it(client, ids, fake_open, monkeypatch):
+    fake_open.running = list(fake_open.running) + ["Microsoft Outlook"]
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Microsoft Outlook", "Safari", "Notes"],
+    )
+    opened = chat(client, "open outlook", ids)
+    assert opened["engine"] == "action"
+    assert opened["action_type"] == "open_app"
+    assert opened["task_status"] == "SUCCESS"
+    pad = session_context.get(ids["user_id"], ids["conversation_id"])
+    assert pad["last_app_names"] == ["Microsoft Outlook"]
+    fake_open.calls.clear()
+    body = chat(client, "quit it", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["task_status"] == "PENDING"
+    assert body["confirm_required"] is True
+    assert body["resolved_params"]["app_names"] == ["Microsoft Outlook"]
+    assert native_action_calls(fake_open) == []
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Microsoft Outlook" to quit']
+    ]

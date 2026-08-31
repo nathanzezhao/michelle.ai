@@ -385,6 +385,8 @@ def _settle_action(action: dict, note: str) -> tuple[dict, str]:
         status, exec_result = actions.confirm_and_execute(action["action_id"])
         action = actions.get_action(action["action_id"])
         answer = note + _exec_reply(action_type, resolved, status, exec_result)
+        _maybe_record_session_context(action, exec_result)
+        return action, answer
     _maybe_record_session_context(action)
     return action, answer
 
@@ -403,8 +405,14 @@ def _draft_payload_from_action(action: dict) -> dict | None:
     return out or None
 
 
-def _maybe_record_session_context(action: dict | None) -> None:
-    """Write the conversation pad after a settled action, including an open composer."""
+def _maybe_record_session_context(
+    action: dict | None, exec_result: dict | None = None
+) -> None:
+    """Write the conversation pad after a settled action, including an open composer.
+
+    SUCCESS rows are terminal and cannot be patched. Canonical names come from
+    the executor result when present (typed misspellings stay off the pad).
+    """
     if not action:
         return
     status = action.get("status")
@@ -434,7 +442,15 @@ def _maybe_record_session_context(action: dict | None) -> None:
         return
     if action.get("missing_params"):
         return
-    names = actions._app_names_from_params(action.get("resolved_params") or {})
+    names = []
+    if isinstance(exec_result, dict):
+        names = [
+            str(item).strip()
+            for item in (exec_result.get("app_names") or [])
+            if str(item or "").strip()
+        ]
+    if not names:
+        names = actions._app_names_from_params(action.get("resolved_params") or {})
     session_context.record_action(
         action["user_id"],
         action["conversation_id"],
@@ -1750,7 +1766,7 @@ def confirm_action(incoming_data: ActionDecision):
         queued = list(action.get("queue") or [])
         status, exec_result = actions.confirm_and_execute(action["action_id"])
         done = actions.get_action(action["action_id"])
-        _maybe_record_session_context(done)
+        _maybe_record_session_context(done, exec_result)
         answer = _exec_reply(
             done["action_type"], done["resolved_params"], status, exec_result
         )

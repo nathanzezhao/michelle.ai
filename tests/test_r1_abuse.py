@@ -178,9 +178,10 @@ def test_shell_metachars_arrive_as_one_argv_element(client, ids, fake_run):
     body = chat(client, "open Notes; rm -rf ~", ids)
     assert body["engine"] == "action"
     assert body["action_type"] == "open_app"
-    assert len(fake_run.calls) == 1
-    argv = fake_run.calls[0]["argv"]
-    kwargs = fake_run.calls[0]["kwargs"]
+    opens = [rec for rec in fake_run.calls if rec["argv"][:2] == ["open", "-a"]]
+    assert len(opens) == 1
+    argv = opens[0]["argv"]
+    kwargs = opens[0]["kwargs"]
     assert isinstance(argv, list)                 # list args, never a shell string
     assert argv[:2] == ["open", "-a"]
     assert argv[2] == "Notes; rm -rf ~"           # whole payload = ONE element
@@ -191,10 +192,11 @@ def test_shell_metachars_arrive_as_one_argv_element(client, ids, fake_run):
 def test_backticks_and_subshell_stay_inert(fake_run):
     payload = "`whoami` $(rm -rf ~)"
     result = actions.NativeExecutor().execute("open_app", {"app_name": payload})
-    assert len(fake_run.calls) == 1
-    argv = fake_run.calls[0]["argv"]
+    opens = [rec for rec in fake_run.calls if rec["argv"][:2] == ["open", "-a"]]
+    assert len(opens) == 1
+    argv = opens[0]["argv"]
     assert argv == ["open", "-a", payload]
-    assert not fake_run.calls[0]["kwargs"].get("shell")
+    assert not opens[0]["kwargs"].get("shell")
     assert result["ok"] is False  # rc=1 → honest failure, nothing "opened"
 
 
@@ -429,8 +431,9 @@ def test_long_app_name_under_limit_fails_honestly(client, ids, fake_run):
     body = chat(client, "open " + long_name, ids)
     assert body["engine"] == "action"
     assert body["task_status"] == "FAILED"  # stubbed rc=1 → app_not_found
-    assert len(fake_run.calls) == 1
-    assert fake_run.calls[0]["argv"] == ["open", "-a", long_name]
+    opens = [rec for rec in fake_run.calls if rec["argv"][:2] == ["open", "-a"]]
+    assert len(opens) == 1
+    assert opens[0]["argv"] == ["open", "-a", long_name]
     rows = _rows_for_user(ids["user_id"])
     assert len(rows) == 1  # audited, no junk duplicates, no hang
 

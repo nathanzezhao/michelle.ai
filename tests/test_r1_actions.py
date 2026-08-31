@@ -387,8 +387,8 @@ def test_open_app_success(client, ids, fake_open):
     assert body["confirm_required"] is False
     assert body["task_status"] == "SUCCESS"
     assert body["missing_params"] == []
-    # Executor got exactly one list-args invocation.
-    assert fake_open.calls == [["open", "-a", "Notes"]]
+    # Executor got exactly one list-args invocation (listing osascript is ignored).
+    assert native_action_calls(fake_open) == [["open", "-a", "Notes"]]
     # §13-15 audit: an actions_log row AND a user-visible sentence, always.
     rows = action_rows(ids)
     assert len(rows) == 1
@@ -404,7 +404,10 @@ def test_open_multiple_apps_one_action(client, ids, fake_open):
     assert body["confirm_required"] is False
     assert body["task_status"] == "SUCCESS"
     assert body["resolved_params"]["app_names"] == ["Notes", "Safari"]
-    assert fake_open.calls == [["open", "-a", "Notes"], ["open", "-a", "Safari"]]
+    assert native_action_calls(fake_open) == [
+        ["open", "-a", "Notes"],
+        ["open", "-a", "Safari"],
+    ]
     assert "Opened Notes and Safari" in body["answer"]
 
 
@@ -413,10 +416,86 @@ def test_open_oxford_list(client, ids, fake_open):
     assert body["action_type"] == "open_app"
     assert body["task_status"] == "SUCCESS"
     assert body["resolved_params"]["app_names"] == ["Chrome", "Slack", "Notes"]
-    assert fake_open.calls == [
-        ["open", "-a", "Chrome"],
+    assert native_action_calls(fake_open) == [
+        ["open", "-a", "Google Chrome"],
         ["open", "-a", "Slack"],
         ["open", "-a", "Notes"],
+    ]
+
+
+def test_open_outlook_resolves_microsoft_outlook(client, ids, fake_open, monkeypatch):
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Microsoft Outlook", "Safari", "Notes"],
+    )
+    body = chat(client, "open outlook", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "open_app"
+    assert body["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [["open", "-a", "Microsoft Outlook"]]
+    assert "Opened Microsoft Outlook" in body["answer"]
+    pad = session_context.get(ids["user_id"], ids["conversation_id"])
+    assert pad["last_app_names"] == ["Microsoft Outlook"]
+
+
+def test_open_outlook_then_close_it_closes_microsoft_outlook(
+    client, ids, fake_open, monkeypatch
+):
+    fake_open.running = list(fake_open.running) + ["Microsoft Outlook"]
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Microsoft Outlook", "Safari", "Notes"],
+    )
+    chat(client, "open outlook", ids)
+    fake_open.calls.clear()
+    body = chat(client, "close it", ids)
+    assert body["action_type"] == "close_app"
+    assert body["task_status"] == "SUCCESS"
+    assert "isn't open" not in body["answer"].lower()
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Microsoft Outlook" to close every window']
+    ]
+
+
+def test_open_visual_studio_code_then_close_it_closes_code(
+    client, ids, fake_open, monkeypatch
+):
+    fake_open.running = list(fake_open.running) + ["Code"]
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Visual Studio Code", "Safari", "Notes"],
+    )
+    opened = chat(client, "open visual studio code", ids)
+    assert opened["task_status"] == "SUCCESS"
+    pad = session_context.get(ids["user_id"], ids["conversation_id"])
+    assert pad["last_app_names"] == ["Code"]
+    fake_open.calls.clear()
+    body = chat(client, "close it", ids)
+    assert body["task_status"] == "SUCCESS"
+    assert "isn't open" not in body["answer"].lower()
+    assert "Closed Code" in body["answer"]
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Code" to close every window']
+    ]
+
+
+def test_close_visual_studio_code_hits_running_code(
+    client, ids, fake_open, monkeypatch
+):
+    fake_open.running = list(fake_open.running) + ["Code"]
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Visual Studio Code", "Safari", "Notes"],
+    )
+    body = chat(client, "close visual studio code", ids)
+    assert body["task_status"] == "SUCCESS"
+    assert "isn't open" not in body["answer"].lower()
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Code" to close every window']
     ]
 
 
@@ -435,7 +514,7 @@ def test_open_app_unknown_app_fails_honestly(client, ids, fake_open):
 @pytest.mark.parametrize(
     "text,app_name",
     [
-        ("yo pull up chrome", "chrome"),
+        ("yo pull up chrome", "Google Chrome"),
         ("fire up vs code rq", "vs code"),
         ("hop into discord", "discord"),
         ("pls launch xyzzyqorp", "xyzzyqorp"),
@@ -450,7 +529,7 @@ def test_open_app_slang_and_gibberish_names(client, ids, fake_open, text, app_na
     assert body["engine"] == "action"
     assert body["action_type"] == "open_app"
     assert body["task_status"] == "SUCCESS"
-    assert fake_open.calls == [["open", "-a", app_name]]
+    assert native_action_calls(fake_open) == [["open", "-a", app_name]]
 
 
 def test_now_close_them_does_not_chat_the_crumb(client, ids, fake_open):
@@ -472,7 +551,7 @@ def test_chat_then_open_runs_action_and_replies(client, ids, fake_open):
     assert body["action_type"] == "open_app"
     assert body["task_status"] == "SUCCESS"
     assert "Opened Notes" in body["answer"]
-    assert fake_open.calls == [["open", "-a", "Notes"]]
+    assert native_action_calls(fake_open) == [["open", "-a", "Notes"]]
 
 
 def test_open_then_email_does_both_and_confirms(client, ids, fake_open, fake_composio):
@@ -487,7 +566,7 @@ def test_open_then_email_does_both_and_confirms(client, ids, fake_open, fake_com
     assert body["confirm_required"] is True
     assert "Opened Notes" in body["answer"]
     assert "alex@example.com" in body["answer"]
-    assert fake_open.calls == [["open", "-a", "Notes"]]
+    assert native_action_calls(fake_open) == [["open", "-a", "Notes"]]
     out = confirm(client, ids, body["task_id"], "confirm")
     assert out["task_status"] == "SUCCESS"
     assert out["confirm_required"] is False
@@ -525,7 +604,7 @@ def test_open_app_then_bare_name_continues(client, ids, fake_open):
     assert second["engine"] == "action"
     assert second["task_id"] == first["task_id"]
     assert second["task_status"] == "SUCCESS"
-    assert fake_open.calls == [["open", "-a", "Notes"]]
+    assert native_action_calls(fake_open) == [["open", "-a", "Notes"]]
 
 
 def test_close_app_success(client, ids, fake_open):
@@ -765,7 +844,7 @@ def test_llm_drops_app_name_but_extract_recovers(client, ids, fake_open, monkeyp
     body = chat(client, "open Notes", ids)
     assert body["engine"] == "action"
     assert body["task_status"] == "SUCCESS"
-    assert fake_open.calls == [["open", "-a", "Notes"]]
+    assert native_action_calls(fake_open) == [["open", "-a", "Notes"]]
 
 
 # --- Criterion 3: complete email goes PENDING with buttons -------------------

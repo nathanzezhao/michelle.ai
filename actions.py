@@ -794,6 +794,10 @@ def _alnum_key(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
 
 
+def _name_tokens(name: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", (name or "").lower())
+
+
 def _is_different_suffix_app(query: str, candidate: str) -> bool:
     """Notes vs Notes+ share letters but are different apps."""
     ql = (query or "").strip().lower()
@@ -826,11 +830,35 @@ def _fuzzy_pick(query: str, candidates: list[str]) -> str | None:
         return prefixed[0]
     tokens_hit = []
     for c in usable:
-        tokens = re.findall(r"[a-z0-9]+", c.lower())
+        tokens = _name_tokens(c)
         if ql in tokens and tokens != [ql]:
             tokens_hit.append(c)
     if len(tokens_hit) == 1:
         return tokens_hit[0]
+    q_tokens = _name_tokens(ql)
+    if len(q_tokens) >= 2:
+        reverse_hits = []
+        for c in usable:
+            c_tokens = _name_tokens(c)
+            n = len(c_tokens)
+            if (
+                n
+                and n < len(q_tokens)
+                and q_tokens[-n:] == c_tokens
+            ):
+                reverse_hits.append(c)
+        if len(reverse_hits) == 1:
+            return reverse_hits[0]
+    if len(ql) >= 3:
+        token_typo_hits = []
+        for c in usable:
+            tokens = _name_tokens(c)
+            if not tokens:
+                continue
+            if difflib.get_close_matches(ql, tokens, n=1, cutoff=0.8):
+                token_typo_hits.append(c)
+        if len(token_typo_hits) == 1:
+            return token_typo_hits[0]
     lowered = {c.lower(): c for c in usable}
     matches = difflib.get_close_matches(ql, list(lowered), n=1, cutoff=0.8)
     if matches and not _is_different_suffix_app(q, lowered[matches[0]]):
@@ -849,6 +877,9 @@ def resolve_app_target(query: str) -> tuple[str, str | None]:
     installed = _list_installed_app_names()
     hit = _fuzzy_pick(query, installed)
     if hit:
+        alias = _fuzzy_pick(hit, running)
+        if alias:
+            return ("running", alias)
         return ("not_running", hit)
     if not running and not installed:
         return ("running", query)
@@ -859,6 +890,14 @@ def resolve_app_name(query: str) -> str | None:
     """Running match only. None if the app is unknown or already quit."""
     state, name = resolve_app_target(query)
     return name if state == "running" else None
+
+
+def _canonical_app_name(query: str, fallback: str) -> str:
+    """Prefer a running or installed match; otherwise the fallback we opened."""
+    state, name = resolve_app_target(query)
+    if state != "unknown" and name:
+        return name
+    return fallback
 
 
 def _run_osascript(script: str):
@@ -899,28 +938,32 @@ class NativeExecutor:
         ok_names = []
         fail_names = []
         for typed in names:
+            state, canonical = resolve_app_target(typed)
+            target = canonical if state != "unknown" and canonical else typed
             try:
                 result = subprocess.run(
-                    ["open", "-a", typed],
+                    ["open", "-a", target],
                     capture_output=True,
                     text=True,
                     timeout=20,
                 )
             except Exception as e:
-                fail_names.append(typed)
-                lines.append(f"{typed} didn't open: {e}")
+                fail_names.append(target)
+                lines.append(f"{target} didn't open: {e}")
                 continue
             if result.returncode == 0:
-                ok_names.append(typed)
-                lines.append(f"Opened {typed}.")
+                recorded = _canonical_app_name(target, target)
+                ok_names.append(recorded)
+                lines.append(f"Opened {recorded}.")
             else:
-                fail_names.append(typed)
-                lines.append(f"I couldn't find an app called {typed}.")
+                fail_names.append(target)
+                lines.append(f"I couldn't find an app called {target}.")
         if ok_names and not fail_names:
             return {
                 "ok": True,
                 "detail": f"Opened {_format_app_list(ok_names)}.",
                 "error": None,
+                "app_names": ok_names,
             }
         if not ok_names:
             listed = _format_app_list(fail_names or names)
@@ -933,6 +976,7 @@ class NativeExecutor:
             "ok": False,
             "detail": " ".join(lines),
             "error": "partial_failure",
+            "app_names": ok_names,
         }
 
     def _close_or_quit(self, params: dict, *, quit_app: bool) -> dict:
@@ -998,11 +1042,14 @@ class NativeExecutor:
                 "detail": f"I couldn't find an app called {listed} — nothing was {nothing}.",
                 "error": error,
             }
+        recorded = ok_names or already_names
+        extra = {"app_names": recorded} if recorded else {}
         if fail_names:
             return {
                 "ok": False,
                 "detail": " ".join(lines),
                 "error": "partial_failure",
+                **extra,
             }
         if already_names and not ok_names:
             listed = _format_app_list(already_names)
@@ -1014,14 +1061,14 @@ class NativeExecutor:
                 copula = "isn't" if len(already_names) == 1 else "aren't"
                 detail = f"{listed} {copula} open."
                 error = "already_closed"
-            return {"ok": True, "detail": detail, "error": error}
+            return {"ok": True, "detail": detail, "error": error, **extra}
         if already_names:
-            return {"ok": True, "detail": " ".join(lines), "error": None}
+            return {"ok": True, "detail": " ".join(lines), "error": None, **extra}
         if quit_app:
             detail = f"Quit {_format_app_list(ok_names)}."
         else:
             detail = f"Closed {_format_app_list(ok_names)}."
-        return {"ok": True, "detail": detail, "error": None}
+        return {"ok": True, "detail": detail, "error": None, **extra}
 
 
 def platform_api_key() -> str | None:

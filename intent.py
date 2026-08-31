@@ -7,6 +7,7 @@ from typing import Optional
 import httpx
 from google import genai
 
+import actions
 from actions import ACTION_WHITELIST
 from long_term_memory import is_valid_name
 
@@ -423,6 +424,7 @@ _GENERIC_APP_WORDS = {
 _APP_PRONOUN_RE = re.compile(r"\b(it|that|those|them|these)\b", re.IGNORECASE)
 _APP_PRONOUN_SINGULAR = {"it", "that"}
 _APP_PRONOUN_PLURAL = {"those", "them", "these"}
+_APP_PRONOUN_WORDS = _APP_PRONOUN_SINGULAR | _APP_PRONOUN_PLURAL
 
 
 def analyze_action_request(
@@ -635,14 +637,51 @@ def _app_pronouns_in(text: str) -> set[str]:
     return {m.group(1).lower() for m in _APP_PRONOUN_RE.finditer(text or "")}
 
 
+def _leftover_resolves_to_app(rest: str) -> str | None:
+    """Leftover after a pronoun is an app only if the catalog has a fuzzy hit.
+
+    Empty running+installed lists do not count — that is resolve_app_target's
+    fallback and would treat 'again' as a name.
+    """
+    query = (rest or "").strip()
+    if not query:
+        return None
+    running = actions._list_running_app_names()
+    installed = actions._list_installed_app_names()
+    if not running and not installed:
+        return None
+    return actions._fuzzy_pick(query, running) or actions._fuzzy_pick(
+        query, installed
+    )
+
+
+def _explicit_names_after_pronoun(names) -> list[str]:
+    """Keep real apps after it/those; drop unknown leftovers (again, agian)."""
+    out: list[str] = []
+    for raw in names or []:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        tokens = name.split()
+        if tokens[0].lower() not in _APP_PRONOUN_WORDS:
+            if name not in out:
+                out.append(name)
+            continue
+        rest = " ".join(tokens[1:]).strip()
+        hit = _leftover_resolves_to_app(rest)
+        if hit and hit not in out:
+            out.append(hit)
+    return out
+
+
 def _fill_from_session_context(
     analysis: dict, text: str, session_context: Optional[dict]
 ) -> dict:
     """Bind it/that/those/them/these to this conversation's last_app_names.
 
-    Explicit names already on the analysis always win. Bare quit/close/open
-    with no pronoun stays missing. Singular it/that with 2+ pad names does
-    not guess.
+    A name that starts with a pronoun is not explicit unless the leftover
+    resolves to a running or installed app. Bare quit/close/open with no
+    pronoun stays missing. Singular it/that with 2+ pad names does not guess.
     """
     if not isinstance(session_context, dict) or not isinstance(analysis, dict):
         return analysis
@@ -650,8 +689,30 @@ def _fill_from_session_context(
     if action_type not in ("open_app", "close_app", "quit_app"):
         return analysis
     resolved = dict(_params_dict(analysis.get("resolved_params")))
-    if not _param_empty(resolved.get("app_names")):
-        return analysis
+    found = _app_pronouns_in(text)
+    extracted = resolved.get("app_names")
+    if not _param_empty(extracted):
+        if not found:
+            return analysis
+        explicit = _explicit_names_after_pronoun(
+            extracted if isinstance(extracted, list) else [extracted]
+        )
+        if explicit:
+            out = dict(analysis)
+            resolved["app_names"] = explicit
+            out["resolved_params"] = resolved
+            required = ACTION_WHITELIST[action_type]["required_params"]
+            out["missing_params"] = [
+                p for p in required if _param_empty(resolved.get(p))
+            ]
+            return out
+        resolved.pop("app_names", None)
+        analysis = dict(analysis)
+        analysis["resolved_params"] = resolved
+        required = ACTION_WHITELIST[action_type]["required_params"]
+        analysis["missing_params"] = [
+            p for p in required if _param_empty(resolved.get(p))
+        ]
     last_names = [
         str(item).strip()
         for item in (session_context.get("last_app_names") or [])
@@ -659,7 +720,6 @@ def _fill_from_session_context(
     ]
     if not last_names:
         return analysis
-    found = _app_pronouns_in(text)
     if not found:
         return analysis
     if found & _APP_PRONOUN_PLURAL:
