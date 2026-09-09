@@ -2,11 +2,12 @@
 
 Reference doc for what's done, what's next, and what's planned later.
 
-**Build order:** Memory + ACTION v1 are in. Next is leftover memory/UI polish and RETRIEVE v2, then screen capture / vision.
+**Build order:** Memory + ACTION v1 are in. **Next is chat voice** (main-bar mic → Whisper → same `/chat` turn as typing). Then leftover memory/UI polish and RETRIEVE v2, then screen capture / vision.
 
 **Screen capture source doc:** `/Users/nathan/Downloads/desktop_ai_agent_roadmap_screencapture.pdf`
 
-**Slice 1 spec:** [SPEC-PIPELINE.md](SPEC-PIPELINE.md) (ACTION engine). Do not put specs in `docs/` — that folder is Michelle's RAG KB.
+**Slice 1 spec:** [SPEC-PIPELINE.md](SPEC-PIPELINE.md) (ACTION engine).
+**Next-slice spec:** [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md) (main-chat microphone). Do not put specs in `docs/` — that folder is Michelle's RAG KB.
 
 ---
 
@@ -29,12 +30,27 @@ Reference doc for what's done, what's next, and what's planned later.
 - R0/R1 pytest suites (`tests/`)
 - Shorter replies via `SYSTEM_PROMPT` in `llm.py`
 
+### Next slice — chat voice (do this now)
+
+Locked in [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md). Email **tap** stays a sidecar (`/action/draft_body` → grammar only → composer body). Chat mic is **not** that.
+
+```
+record (main chat bar, not composer tap)
+  → Whisper transcribe
+  → that text is a normal /chat user_text
+       → session_context pad (so "close it" works)
+       → classify_intent (CHAT | RETRIEVE | REMEMBER | ACTION)
+       → same engines as typing
+```
+
+- [ ] **Chat-bar microphone** — tap to talk in the main input; transcript is a normal turn (session pad + classifier). Do not use `/action/draft_body` or `polish_email_body`. Junk/silence is not a saved message.
+
 ### How a turn works today
 
 ```
 main.py → memory.py (last N turns + long-term facts)
        → intent.py (CHAT | RETRIEVE | REMEMBER | ACTION)
-       → ACTION: analyze params → actions_log → native or Composio
+       → ACTION: analyze params (+ session_context pad) → actions_log → native or Composio
        → REMEMBER: existing store/recall
        → RETRIEVE: docs/ FTS
        → CHAT: reply + synchronous memory assessor
@@ -67,6 +83,7 @@ main.py → memory.py (last N turns + long-term facts)
 
 From the original Michelle architecture (intent router → RAG → agents):
 
+- [ ] **Chat-bar microphone (NEXT)** — see [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md). Transcribe first, then the same `/chat` path as typing (session_context + classify). Email composer tap stays isolated.
 - [x] **Intent includes ACTION** — fourth live label; `INTENT_MODE=llm` uses Ollama/Gemini (rules fallback)
 - [ ] **Intent clarifying questions** — use classifier confidence when she's unsure of the route
 - [x] **RETRIEVE v1** — local `docs/` ingest + SQLite FTS5 + grounded answers (sample KB included)
@@ -162,6 +179,7 @@ Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 | `main.js` | Window collapse/expand, drag |
 | `tests/` | R0/R1 pytest (httpx); `COMPOSIO_API_KEY` unset in suite |
 | `SPEC-PIPELINE.md` | Slice 1 ACTION spec (not a RAG doc) |
+| `SPEC-CHAT-VOICE.md` | Next: main-chat mic → Whisper → `/chat` (not email tap) |
 | `michelle.db` | Local chat archive + facts + doc index + actions (gitignored) |
 
 ## Quick reference: memory assessor

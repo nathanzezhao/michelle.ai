@@ -33,7 +33,9 @@ Project roadmap and checklist: [ROADMAP.md](ROADMAP.md)
 
 Say *send an email* (even without the details). Michelle asks for what’s missing and the composer drops under her message. Fill it, press **Send** with the chat box empty (or Enter in the body), then Confirm. Send posts the fields as an email draft — it does not run the body through chat, intent, or memory. Files and generate sit in the same bottom bar as Send.
 
-**Tap — microphone.** Tap **tap** to record the body; tap again to stop. Whisper transcribes what you said, then the LLM only fixes grammar and fillers — it does not chat as Michelle, does not read long-term memory, and does not rewrite the letter. Voice is body-only: it never sends mail. **Confirm** is still required.
+**Tap — microphone (email composer only).** Tap **tap** to record the body; tap again to stop. Whisper transcribes what you said, then the LLM only fixes grammar and fillers — it does not chat as Michelle, does not read long-term memory, and does not rewrite the letter. Voice is body-only: it never sends mail. **Confirm** is still required.
+
+**Chat-bar mic is next** ([SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md)): that recording will transcribe, then run the same `/chat` path as typing (session pad + classifier). Do not send it through this composer tap.
 
 On first hold, macOS may ask for the microphone. That press does not send (and does not tap-draft). Allow, then hold again.
 
