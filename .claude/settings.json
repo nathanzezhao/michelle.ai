@@ -1,0 +1,4 @@
+{
+  "project": "michelle.ai",
+  "notes": "Cursor ECC lives in .cursor/; this file satisfies project-local Claude harness config for audits."
+}

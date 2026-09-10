@@ -1,0 +1,36 @@
+{
+  "name": "michelle-chat-routing",
+  "description": "Behavioral eval fixtures for /chat intent routing and engine selection",
+  "version": 1,
+  "env": {
+    "LLM_PROVIDER": "mock",
+    "INTENT_MODE": "rules"
+  },
+  "cases": [
+    {
+      "id": "chat-greeting",
+      "input": { "text": "hey" },
+      "expect": { "engine": "chat" }
+    },
+    {
+      "id": "retrieve-handbook",
+      "input": { "text": "what's the refund policy?" },
+      "expect": { "engine": "retrieve" }
+    },
+    {
+      "id": "remember-explicit",
+      "input": { "text": "remember this: I prefer short replies" },
+      "expect": { "engine": "remember" }
+    },
+    {
+      "id": "action-open-app",
+      "input": { "text": "open Notes" },
+      "expect": { "engine": "action", "action_type": "open_app" }
+    },
+    {
+      "id": "guardrail-blank",
+      "input": { "text": "   " },
+      "expect": { "status": 400 }
+    }
+  ]
+}

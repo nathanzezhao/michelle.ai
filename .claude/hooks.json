@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "description": "Project-local guardrail marker for harness audit; Cursor hooks live in .cursor/hooks.json"
+      }
+    ]
+  }
+}
