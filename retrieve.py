@@ -6,10 +6,13 @@ No Postgres / embeddings required for v1 — swap search() later for vectors.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
 from pathlib import Path
+
+import httpx
 
 DB_PATH = Path(os.getenv("MICHELLE_DB_PATH", "michelle.db"))
 DOCS_DIR = Path(os.getenv("MICHELLE_DOCS_DIR", "docs"))
@@ -17,6 +20,9 @@ DOCS_DIR = Path(os.getenv("MICHELLE_DOCS_DIR", "docs"))
 CHUNK_SIZE = int(os.getenv("RETRIEVE_CHUNK_SIZE", "600"))
 CHUNK_OVERLAP = int(os.getenv("RETRIEVE_CHUNK_OVERLAP", "80"))
 TOP_K = int(os.getenv("RETRIEVE_TOP_K", "4"))
+RETRIEVE_V2 = os.getenv("RETRIEVE_V2", "0").lower() in ("1", "true", "yes")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+EMBED_MODEL = os.getenv("RETRIEVE_EMBED_MODEL", "nomic-embed-text")
 
 SUPPORTED_SUFFIXES = {".md", ".txt", ".markdown"}
 
@@ -45,6 +51,16 @@ def init_db() -> None:
                 source,
                 content,
                 tokenize = 'porter unicode61'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS doc_chunk_vectors (
+                rowid INTEGER PRIMARY KEY,
+                source TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding TEXT
             )
             """
         )
@@ -118,6 +134,7 @@ def index_docs(force: bool = False) -> int:
 
         conn.execute("DELETE FROM doc_chunks_fts")
         conn.execute("DELETE FROM doc_files")
+        conn.execute("DELETE FROM doc_chunk_vectors")
 
         total = 0
         for path in files:
@@ -132,6 +149,18 @@ def index_docs(force: bool = False) -> int:
                 conn.execute(
                     "INSERT INTO doc_chunks_fts (source, content) VALUES (?, ?)",
                     (source, chunk),
+                )
+                embedding = _embed_text(chunk) if RETRIEVE_V2 else None
+                conn.execute(
+                    """
+                    INSERT INTO doc_chunk_vectors (source, content, embedding)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        source,
+                        chunk,
+                        json.dumps(embedding) if embedding else None,
+                    ),
                 )
                 total += 1
 
@@ -196,9 +225,80 @@ def _fts_query(user_text: str) -> str:
     return " OR ".join(parts)
 
 
-def search(query: str, limit: int = TOP_K) -> list[dict]:
-    """Return top matching doc chunks for a user question."""
-    index_docs()
+def _translate_query(query: str) -> str:
+    """RETRIEVE v2: lightweight query normalization before search."""
+    text = (query or "").strip().lower()
+    replacements = {
+        "what's": "what is",
+        "whats": "what is",
+        "how many": "count",
+        "vacation days": "vacation policy",
+        "time off": "vacation policy",
+        "remote work": "remote policy",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text.strip() or query
+
+
+def _embed_text(text: str) -> list[float] | None:
+    if not RETRIEVE_V2:
+        return None
+    try:
+        response = httpx.post(
+            f"{OLLAMA_BASE_URL}/api/embeddings",
+            json={"model": EMBED_MODEL, "prompt": text},
+            timeout=8.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        embedding = payload.get("embedding")
+        if isinstance(embedding, list) and embedding:
+            return [float(x) for x in embedding]
+    except Exception as exc:
+        print(f"[retrieve] embedding unavailable ({exc}); FTS only")
+    return None
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _vector_search(query: str, limit: int) -> list[dict]:
+    vector = _embed_text(query)
+    if vector is None:
+        return []
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT source, content, embedding FROM doc_chunk_vectors WHERE embedding IS NOT NULL"
+        ).fetchall()
+    scored: list[dict] = []
+    for row in rows:
+        try:
+            stored = json.loads(row["embedding"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(stored, list):
+            continue
+        scored.append(
+            {
+                "source": row["source"],
+                "content": row["content"],
+                "score": -_cosine(vector, stored),
+            }
+        )
+    scored.sort(key=lambda item: item["score"])
+    return scored[:limit]
+
+
+def _fts_search(query: str, limit: int) -> list[dict]:
     fts = _fts_query(query)
     with _connect() as conn:
         try:
@@ -233,6 +333,37 @@ def search(query: str, limit: int = TOP_K) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def _merge_hybrid(fts_hits: list[dict], vector_hits: list[dict], limit: int) -> list[dict]:
+    merged: dict[tuple[str, str], dict] = {}
+    for rank, hit in enumerate(fts_hits):
+        key = (hit["source"], hit["content"])
+        merged[key] = {
+            **hit,
+            "score": merged.get(key, {}).get("score", 0.0) + 1.0 / (60 + rank),
+        }
+    for rank, hit in enumerate(vector_hits):
+        key = (hit["source"], hit["content"])
+        merged[key] = {
+            **hit,
+            "score": merged.get(key, {}).get("score", 0.0) + 1.0 / (60 + rank),
+        }
+    ordered = sorted(merged.values(), key=lambda item: item["score"], reverse=True)
+    return ordered[:limit]
+
+
+def search(query: str, limit: int = TOP_K) -> list[dict]:
+    """Return top matching doc chunks for a user question."""
+    index_docs()
+    translated = _translate_query(query)
+    fts_hits = _fts_search(translated, limit)
+    if not RETRIEVE_V2:
+        return fts_hits
+    vector_hits = _vector_search(translated, limit)
+    if not vector_hits:
+        return fts_hits
+    return _merge_hybrid(fts_hits, vector_hits, limit)
 
 
 _CONTENT_STOP = {

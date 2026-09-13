@@ -4,7 +4,8 @@ from uuid import uuid4
 
 import long_term_memory
 import main
-from memory import get_history
+from memory import get_history, save_message
+import session_context
 
 
 def test_fresh_session_asks_for_name(client):
@@ -53,3 +54,32 @@ def test_session_start_replaces_garbage_ids(client):
     ).json()
     assert body["conversation_id"] != "junk"
     assert body["user_id"] != "more junk"
+
+
+def test_session_start_clears_working_pad_keeps_chatlog_and_facts(client, ids):
+    uid, cid = ids["user_id"], ids["conversation_id"]
+    long_term_memory.upsert_fact(user_id=uid, fact_key="name", fact_value="Nathan", replace=True)
+    save_message(cid, "user", "hello from last time")
+    save_message(cid, "assistant", "hey")
+    session_context.record_action(uid, cid, "open_app", app_names=["Notes"])
+    assert session_context.get(uid, cid)["last_opened"] == ["Notes"]
+
+    body = client.post("/session/start", json=ids).json()
+    pad = session_context.get(uid, cid)
+    assert pad["last_opened"] == []
+    assert pad["last_action_type"] is None
+    assert body["greeting"] == "Hey Nathan, what's up?"
+    assert long_term_memory.get_fact(uid, "name") == "Nathan"
+    history = get_history(cid)
+    assert any(m["content"] == "hello from last time" for m in history)
+
+
+def test_clear_all_empties_pads_not_facts():
+    uid, cid = str(uuid4()), str(uuid4())
+    session_context.init_db()
+    long_term_memory.init_db()
+    session_context.record_action(uid, cid, "open_app", app_names=["Notes"])
+    long_term_memory.upsert_fact(user_id=uid, fact_key="color", fact_value="indigo", replace=True)
+    session_context.clear_all()
+    assert session_context.get(uid, cid)["last_opened"] == []
+    assert long_term_memory.get_fact(uid, "color") == "indigo"

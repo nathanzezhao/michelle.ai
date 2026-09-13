@@ -3,6 +3,8 @@ const path = require('path')
 
 const MIN_WIDTH = 300
 const MIN_HEIGHT = 460
+const RENDERER_DEV_URL = process.env.ELECTRON_RENDERER_URL || 'http://127.0.0.1:5173'
+const USE_DEV_RENDERER = process.env.ELECTRON_DEV === '1'
 
 let win
 let captureWin
@@ -14,6 +16,11 @@ let ignoringMouse = false
 let micOp = Promise.resolve()
 let micReq = 0
 let capturing = false
+let uiMode = 'chat'
+
+function rendererIndexPath() {
+  return path.join(__dirname, 'renderer', 'dist', 'index.html')
+}
 
 function describeOverlay() {
   if (!win || win.isDestroyed()) return { destroyed: true }
@@ -61,6 +68,14 @@ function loadCaptureWindow() {
   return captureLoaded
 }
 
+async function loadRenderer(winInstance) {
+  if (USE_DEV_RENDERER) {
+    await winInstance.loadURL(RENDERER_DEV_URL)
+    return
+  }
+  await winInstance.loadFile(rendererIndexPath())
+}
+
 function createWindow() {
   win = new BrowserWindow({
     width: 380,
@@ -79,7 +94,9 @@ function createWindow() {
       backgroundThrottling: false
     }
   })
-  win.loadFile('index.html')
+  loadRenderer(win).catch((err) => {
+    console.log('[michelle] renderer load failed', err && err.message)
+  })
   win.setAlwaysOnTop(true)
 
   win.on('hide', () => {
@@ -102,7 +119,10 @@ function setIgnore(ignore) {
   else win.setIgnoreMouseEvents(false)
 }
 
-// Collapsed = click-through window with the orb still in place (no resize flash).
+ipcMain.on('ui-mode', (_event, mode) => {
+  uiMode = typeof mode === 'string' ? mode : 'voice'
+})
+
 ipcMain.on('collapse', (event, isCollapsed) => {
   collapsed = !!isCollapsed
   if (collapsed) setIgnore(true)

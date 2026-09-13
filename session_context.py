@@ -1,7 +1,8 @@
 """Per-conversation working pad: what this chat is doing right now.
 
 Not durable identity. Not long_term_facts. Not injected into the LLM prompt.
-Keyed by (user_id, conversation_id). A new conversation_id starts empty.
+Keyed by (user_id, conversation_id). Cleared on backend process start and
+on /session/start (Electron reload). Chatlog and long-term facts stay.
 """
 
 import json
@@ -113,6 +114,25 @@ def _normalize_last_draft_pick(pick) -> dict | None:
         "candidates": candidates,
         "query": _clean_text(pick.get("query")),
     }
+
+
+def clear(user_id: str, conversation_id: str) -> dict:
+    """Drop this conversation's working pad. Messages and long-term facts stay."""
+    with _connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM session_context
+            WHERE user_id = ? AND conversation_id = ?
+            """,
+            (user_id, conversation_id),
+        )
+    return _empty()
+
+
+def clear_all() -> None:
+    """Empty every working pad (backend process start). Chatlog and facts stay."""
+    with _connect() as conn:
+        conn.execute("DELETE FROM session_context")
 
 
 def get(user_id: str, conversation_id: str) -> dict:

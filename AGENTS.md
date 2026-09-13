@@ -6,7 +6,7 @@ Desktop AI assistant: Electron floating UI + FastAPI backend. Not a plain LLM wr
 
 | Layer | Tech |
 |-------|------|
-| UI | Electron (`index.html`, `main.js`) |
+| UI | Electron + Vite/React (`renderer/`, `main.js`) — chat (default), voice stub, collapsed |
 | API | FastAPI (`main.py`) |
 | LLM | Ollama (default), Gemini, or mock via `LLM_PROVIDER` |
 | DB | SQLite (`michelle.db`, gitignored) |
@@ -53,7 +53,7 @@ Composer **Send** and email **tap** (Whisper) are sidecars — they do **not** g
 | `intent.py` | Intent router, memory assessor, action analyzer |
 | `llm.py` | Chat + grounded RETRIEVE replies |
 | `actions.py` | Whitelist, `actions_log`, Composio Gmail |
-| `session_context.py` | Conversation pad for follow-ups ("close it", resume draft) |
+| `session_context.py` | Working pad for follow-ups ("close it"). Cleared on `b` refresh and `/session/start`; chatlog + facts stay. |
 | `tests/` | R0/R1 pytest (httpx) |
 
 ## Michelle team agents (Cursor)
@@ -62,7 +62,7 @@ Project-specific roles under `.cursor/agents/`: Tom (eng lead), Ned (backend), K
 
 ## Roadmap
 
-Next slice: **chat-bar mic** → Whisper → same `/chat` path as typing ([SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md)). See [ROADMAP.md](ROADMAP.md).
+Voice UI: three modes, blob default ([SPEC-VOICE-UI.md](SPEC-VOICE-UI.md)). Voice → `POST /chat/voice` → `/chat` ([SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md)). See [ROADMAP.md](ROADMAP.md).
 
 ## Reset personal data
 

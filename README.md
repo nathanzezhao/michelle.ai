@@ -111,7 +111,12 @@ A fresh git clone has no `michelle.db`, so it’s already clean.
 
 ## UI
 
-- Run `f` in terminal to start Electron. Restart `f` after `index.html` or `main.js` changes (the backend `b` hot-reloads; Electron does not).
+Michelle uses a **Vite + React** renderer (`renderer/`). Electron loads `renderer/dist/` after build.
+
+- **`b`** — FastAPI backend (hot-reloads)
+- **`f`** — Electron window (restart after renderer or `main.js` changes)
+
+**Default mode:** chat (the original window). Header **audio-lines** opens the voice stub; **messages-circle** returns to chat. Collapse via top-left square.
 
 Click top left square → Collapse animation → Square into circle  
 

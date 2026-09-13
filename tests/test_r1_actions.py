@@ -701,6 +701,68 @@ def test_quit_multiple_one_confirm(client, ids, fake_open):
     ]
 
 
+def test_close_and_quit_then_open_does_not_skip_quit(client, ids, fake_open):
+    """Live bug: 'close and quit notes, then open music' opened Music and
+    asked which app to close; quit Notes was parsed then skipped."""
+    fake_open.running = list(fake_open.running) + ["Music"]
+    body = chat(client, "close and quit notes, then open music", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["confirm_required"] is True
+    assert body["task_status"] == "PENDING"
+    names = [n.lower() for n in (body["resolved_params"].get("app_names") or [])]
+    assert names == ["notes"]
+    assert "which app to close" not in body["answer"].lower()
+    assert "closed" in body["answer"].lower()
+    assert "opened" in body["answer"].lower()
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Notes" to close every window'],
+        ["open", "-a", "Music"],
+    ]
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Notes" to close every window'],
+        ["open", "-a", "Music"],
+        ["osascript", "-e", 'tell application "Notes" to quit'],
+    ]
+
+
+def test_quit_then_open_keeps_both_targets(client, ids, fake_open):
+    fake_open.running = list(fake_open.running) + ["Music"]
+    body = chat(client, "quit notes and open music", ids)
+    assert body["action_type"] == "quit_app"
+    assert body["confirm_required"] is True
+    assert [n.lower() for n in body["resolved_params"]["app_names"]] == ["notes"]
+    assert native_action_calls(fake_open) == [["open", "-a", "Music"]]
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open)[-1] == [
+        "osascript",
+        "-e",
+        'tell application "Notes" to quit',
+    ]
+
+
+def test_close_quit_open_three_targets(client, ids, fake_open):
+    fake_open.running = list(fake_open.running) + ["Music"]
+    body = chat(client, "close notes, quit safari, open music", ids)
+    assert body["action_type"] == "quit_app"
+    assert body["confirm_required"] is True
+    assert [n.lower() for n in body["resolved_params"]["app_names"]] == ["safari"]
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Notes" to close every window'],
+        ["open", "-a", "Music"],
+    ]
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open)[-1] == [
+        "osascript",
+        "-e",
+        'tell application "Safari" to quit',
+    ]
+
+
 def test_close_then_quit_runs_close_and_confirms_quit(client, ids, fake_open):
     body = chat(client, "close Notes and quit Safari", ids)
     assert body["engine"] == "action"

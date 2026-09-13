@@ -1,0 +1,53 @@
+---
+description: Free React Bits components via MCP and shadcn registry — use instead of React Bits Pro ($300).
+globs: renderer/**/*
+alwaysApply: false
+---
+
+# React Bits (free)
+
+Use the **free** React Bits stack from [DavidHDev/react-bits](https://github.com/DavidHDev/react-bits). Do **not** require React Bits Pro or `REACTBITS_LICENSE_KEY` unless the user explicitly opts in.
+
+## MCP server
+
+Configured in `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "reactbits": {
+      "command": "npx",
+      "args": ["-y", "reactbits-dev-mcp-server"],
+      "env": {
+        "GITHUB_TOKEN": "your_github_token_here"
+      }
+    }
+  }
+}
+```
+
+Replace `your_github_token_here` with a GitHub PAT (repo read is enough). Without a token the server still works but is limited to ~60 GitHub API requests/hour.
+
+After editing MCP config, restart Cursor or reload MCP servers.
+
+## shadcn registry (install into renderer)
+
+`components.json` includes the free registry:
+
+```json
+"registries": {
+  "@react-bits": "https://reactbits.dev/r/{name}.json"
+}
+```
+
+Install from the renderer directory (uses `renderer/components.json`), e.g.:
+
+```bash
+cd renderer && npx shadcn@latest add @react-bits/Orb-TS-TW
+```
+
+Prefer `@react-bits/*` over `@reactbits-starter/*` (Pro). **`ai-blob-tw` is Pro-only**; voice UI uses free **`Orb`** instead.
+
+## Voice UI blob
+
+`renderer/src/components/AiBlob/AiBlob.tsx` wraps `@/components/Orb/Orb` (React Bits free WebGL orb). Map recording/processing to `forceHoverState` + `hoverIntensity`.

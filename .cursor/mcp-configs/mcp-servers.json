@@ -213,6 +213,14 @@
       "command": "npx",
       "args": ["-y", "squish-memory"],
       "description": "Local-first persistent memory runtime for AI agents — MCP server for Claude Code, Cursor, OpenCode, Codex, Cline. Auto-captures context across sessions. 1-20ms recall, 283KB, no second LLM needed. Runs locally with SQLite. Supports cloud sync via Stripe checkout ($9-$99/mo). GitHub: https://github.com/michielhdoteth/squish | Docs: https://squishplugin.dev | (also available via local `squish run mcp`)"
+    },
+    "reactbits": {
+      "command": "npx",
+      "args": ["-y", "reactbits-dev-mcp-server"],
+      "env": {
+        "GITHUB_TOKEN": "YOUR_GITHUB_TOKEN_HERE"
+      },
+      "description": "Free React Bits components from DavidHDev/react-bits — browse, search, demo code (135+ components). Optional GitHub token raises API rate limit from 60/hr to 5000/hr."
     }
   },
   "_comments": {

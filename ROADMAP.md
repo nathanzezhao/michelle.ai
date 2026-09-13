@@ -2,7 +2,7 @@
 
 Reference doc for what's done, what's next, and what's planned later.
 
-**Build order:** Memory + ACTION v1 are in. **Next is chat voice** (main-bar mic → Whisper → same `/chat` turn as typing). Then leftover memory/UI polish and RETRIEVE v2, then screen capture / vision.
+**Build order:** Memory + ACTION v1 are in. **Voice UI (three modes, blob default)** is in via Vite/React renderer ([SPEC-VOICE-UI.md](SPEC-VOICE-UI.md)). **Chat voice backend** (`POST /chat/voice`) is wired. Next: polish voice UX, chat composer port in React, RETRIEVE v2 tuning, then screen capture / vision.
 
 **Screen capture source doc:** `/Users/nathan/Downloads/desktop_ai_agent_roadmap_screencapture.pdf`
 
@@ -30,20 +30,14 @@ Reference doc for what's done, what's next, and what's planned later.
 - R0/R1 pytest suites (`tests/`)
 - Shorter replies via `SYSTEM_PROMPT` in `llm.py`
 
-### Next slice — chat voice (do this now)
+### Voice UI + chat voice (in progress)
 
-Locked in [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md). Email **tap** stays a sidecar (`/action/draft_body` → grammar only → composer body). Chat mic is **not** that.
-
-```
-record (main chat bar, not composer tap)
-  → Whisper transcribe
-  → that text is a normal /chat user_text
-       → session_context pad (so "close it" works)
-       → classify_intent (CHAT | RETRIEVE | REMEMBER | ACTION)
-       → same engines as typing
-```
-
-- [ ] **Chat-bar microphone** — tap to talk in the main input; transcript is a normal turn (session pad + classifier). Do not use `/action/draft_body` or `polish_email_body`. Junk/silence is not a saved message.
+- [x] **Three-mode shell** — chat (original window, default) + voice stub + collapsed ([SPEC-VOICE-UI.md](SPEC-VOICE-UI.md))
+- [x] **AI Blob voice mode** — tap record, glow, process via `/chat/voice`
+- [x] **Saved chatlog API** — `GET /session/history` (window still starts empty)
+- [x] **`POST /chat/voice`** — Whisper → normal `/chat` ([SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md))
+- [x] **React Bits free orb** — `Orb` WebGL blob + `reactbits` MCP (no Pro license)
+- [x] **Full composer port** — email tap/composer in React chat mode
 
 ### How a turn works today
 
@@ -66,13 +60,13 @@ main.py → memory.py (last N turns + long-term facts)
 
 - **DB:** stores every message in the thread + upserted user facts + `actions_log`
 - **LLM:** sees last 10 messages + all long-term facts each turn
-- **Refresh:** same conversation + same user continue via `localStorage`, but chat bubbles don't reload in the UI yet
+- **Refresh:** same conversation + same user continue via `localStorage`. The window starts empty (greeting only). Chatlog stays in `messages`; long-term facts stay in `long_term_facts` (invisible in the UI). The session_context working pad clears on `b` refresh and on `/session/start`.
 
 ---
 
 ## Track 1: Finish memory
 
-- [ ] **Reload chat bubbles on open** — fetch history from DB so the UI matches backend after refresh
+- [x] **Saved chatlog API** — `GET /session/history` exists; React chat mode does not dump old bubbles on open
 - [x] **Long-term fact memory** — second assessor decides importance; durable facts (name, location, etc.) stored per user and injected into the prompt beyond the 10-message window
 - [x] **Document `MAX_HISTORY`** — default 10; set in `.env`; described in README
 - [x] **Update README** — docs/retrieve, reset, ACTION, Composio, composer UI
@@ -87,7 +81,7 @@ From the original Michelle architecture (intent router → RAG → agents):
 - [x] **Intent includes ACTION** — fourth live label; `INTENT_MODE=llm` uses Ollama/Gemini (rules fallback)
 - [ ] **Intent clarifying questions** — use classifier confidence when she's unsure of the route
 - [x] **RETRIEVE v1** — local `docs/` ingest + SQLite FTS5 + grounded answers (sample KB included)
-- [ ] **RETRIEVE v2** — query translator + vector/embeddings (sqlite-vec + nomic-embed-text); same `retrieve.search()` API
+- [x] **RETRIEVE v2 (baseline)** — query translator + optional Ollama embeddings hybrid behind `retrieve.search()` (`RETRIEVE_V2=1`)
 - [x] **ACTION v1** — `open_app` + `send_email` (Composio), Confirm/Cancel, composer UI, `actions_log`
 - [ ] **More actions** — quit apps, calendar, Slack, etc. Still whitelist + risk tiers in code, never LLM-judged
 - [ ] **Evaluator loop** — Don't hallucinate when retrieval fails; structured "not found" behavior

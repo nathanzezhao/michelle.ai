@@ -46,6 +46,30 @@ def init_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN kind TEXT")
 
 
+def get_full_history(conversation_id: str, limit: int = 200) -> list[dict]:
+    """All recent turns for UI reload (not limited to MAX_HISTORY prompt window)."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT role, content, kind
+            FROM messages
+            WHERE conversation_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (conversation_id, limit),
+        ).fetchall()
+
+    return [
+        {
+            "role": row["role"],
+            "content": row["content"],
+            "kind": row["kind"],
+        }
+        for row in reversed(rows)
+    ]
+
+
 def get_history(conversation_id: str, limit: int = MAX_HISTORY) -> list[dict]:
     """Regular memory: recent turns for this conversation only."""
     with _connect() as conn:

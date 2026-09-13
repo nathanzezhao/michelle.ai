@@ -310,6 +310,66 @@ def test_llm_chat_label_still_promotes_open_order(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "text",
+    ["yo wsp", "yo", "wsp", "sup", "what's up", "whats up", "whats good"],
+)
+def test_llm_action_label_demotes_slang_hello(monkeypatch, text):
+    """Live bug: llama labeled 'yo wsp' ACTION because the prompt uses 'yo pull up'."""
+    monkeypatch.setenv("INTENT_MODE", "llm")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setattr(
+        intent,
+        "_classify_with_llm",
+        lambda *a, **k: {
+            "intent": "ACTION",
+            "confidence": 0.0,
+            "is_question": False,
+            "kind": "ACTION",
+            "memory_score": 0.0,
+            "docs_score": 0.0,
+            "chat_score": 0.0,
+        },
+    )
+    result = classify_intent(text)
+    assert result["intent"] == "CHAT"
+    assert result["kind"] == "CHAT"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["yo wsp", "yo", "wsp", "sup", "what's up", "whats up", "whats good"],
+)
+def test_rules_mode_slang_hello_is_chat(text):
+    assert classify_intent(text)["intent"] == "CHAT"
+
+
+def test_greeting_does_not_fill_missing_app_name():
+    analysis = analyze_action_request(
+        "hi",
+        task_context={
+            "action_type": "open_app",
+            "resolved_params": {},
+            "missing_params": ["app_names"],
+        },
+    )
+    assert analysis["related"] is False
+    assert not analysis["resolved_params"].get("app_names")
+
+
+def test_bare_app_name_still_continues_open_app():
+    analysis = analyze_action_request(
+        "Notes",
+        task_context={
+            "action_type": "open_app",
+            "resolved_params": {},
+            "missing_params": ["app_names"],
+        },
+    )
+    assert analysis["related"] is True
+    assert analysis["resolved_params"]["app_names"] == ["Notes"]
+
+
+@pytest.mark.parametrize(
     "text,chat,actions",
     [
         ("open Notes", "", ["open Notes"]),
@@ -378,6 +438,21 @@ def test_llm_chat_label_still_promotes_open_order(monkeypatch):
             "close Notes and quit Safari",
             "",
             ["close Notes", "quit Safari"],
+        ),
+        (
+            "close and quit notes, then open music",
+            "",
+            ["close notes", "quit notes", "open music"],
+        ),
+        (
+            "quit notes and open music",
+            "",
+            ["quit notes", "open music"],
+        ),
+        (
+            "close notes, quit safari, open music",
+            "",
+            ["close notes", "quit safari", "open music"],
         ),
         ("quit Chrome, Slack, and Notes", "", ["quit Chrome, Slack, and Notes"]),
         ("clsoe Notes", "", ["clsoe Notes"]),
@@ -1162,3 +1237,48 @@ def test_pick_draft_llm_only_uses_listed_ids(monkeypatch):
     out = actions.match_draft("the one about lunch", drafts, resume=True)
     assert out["status"] == "ambiguous"
     assert len(out["candidates"]) == 2
+
+
+def test_history_for_reply_omits_action_residue_on_greeting():
+    from llm import history_for_reply
+
+    history = [
+        {"role": "user", "kind": "action", "content": "yo wsp"},
+        {
+            "role": "assistant",
+            "kind": "action",
+            "content": "Sure — I just need which apps to open.",
+        },
+        {"role": "user", "kind": "action", "content": "hi"},
+        {
+            "role": "assistant",
+            "kind": "action",
+            "content": "I couldn't find an app called hi — nothing was opened.",
+        },
+        {"role": "user", "kind": None, "content": "yo wsp"},
+        {
+            "role": "assistant",
+            "kind": None,
+            "content": 'Still can\'t seem to open "wsp".',
+        },
+        {"role": "user", "kind": None, "content": "my favorite color is indigo"},
+        {"role": "assistant", "kind": None, "content": "nice, indigo is a good one"},
+    ]
+    out = history_for_reply(history, "yo wsp")
+    contents = [t["content"] for t in out]
+    assert "which apps to open" not in " ".join(contents)
+    assert "couldn't find an app" not in " ".join(contents)
+    assert "Still can't seem to open" not in " ".join(contents)
+    assert "nice, indigo is a good one" in contents
+
+
+def test_history_for_reply_keeps_action_when_this_turn_is_an_order():
+    from llm import history_for_reply
+
+    history = [
+        {"role": "user", "kind": "action", "content": "open Notes"},
+        {"role": "assistant", "kind": "action", "content": "Opened Notes."},
+    ]
+    out = history_for_reply(history, "now close it")
+    assert len(out) == 2
+    assert out[1]["content"] == "Opened Notes."

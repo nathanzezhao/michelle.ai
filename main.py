@@ -5,7 +5,7 @@ from typing import Optional, List, Tuple
 from uuid import UUID, uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -35,7 +35,7 @@ from llm import (
     polish_email_body,
 )
 import long_term_memory
-from memory import get_history, init_db, save_message
+from memory import get_full_history, get_history, init_db, save_message
 import retrieve
 import session_context
 import whisper
@@ -47,6 +47,9 @@ retrieve.init_db()
 retrieve.index_docs()
 actions.init_db()
 session_context.init_db()
+# Working pad is this process only — "close it" / last draft stash do not
+# survive `b` refresh. messages + long_term_facts stay.
+session_context.clear_all()
 # No replay after restart: stale open actions are closed out (SPEC-PIPELINE §4).
 actions.startup_sweep()
 
@@ -646,6 +649,18 @@ def _handle_action_intents(
         if analysis["action_type"] in actions.ACTION_WHITELIST:
             analyses.append(analysis)
 
+    kept = []
+    for analysis in analyses:
+        missing = analysis.get("missing_params") or []
+        nameless_app = (
+            analysis["action_type"] in ("close_app", "quit_app", "open_app")
+            and missing == ["app_names"]
+        )
+        if nameless_app and any(not (a.get("missing_params") or []) for a in analyses):
+            continue
+        kept.append(analysis)
+    analyses = kept
+
     drop_note = ""
     if open_action:
         actions.cancel_action(open_action["action_id"])
@@ -851,11 +866,17 @@ def _action_turn_payload(
 def start_session(incoming_data: SessionStart):
     """Called when the Electron UI first opens (not on backend restart).
 
+    Clears the working pad for this conversation so follow-ups like "close it"
+    do not leak across reloads. Chatlog and long-term facts stay in SQLite.
+
     If Michelle does not yet know this user's name, she asks once and stores
     it forever in long-term memory when they reply.
     """
     conversation_id = _valid_uuid(incoming_data.conversation_id)
     user_id = _valid_uuid(incoming_data.user_id)
+    # Fresh working pad on every window open. Chatlog stays in messages;
+    # name and other facts stay in long_term_facts (not painted as bubbles).
+    session_context.clear(user_id, conversation_id)
     name = long_term_memory.get_fact(user_id, "name")
     if name and not long_term_memory.is_valid_name(name):
         long_term_memory.delete_fact(user_id, "name")
@@ -890,6 +911,81 @@ def start_session(incoming_data: SessionStart):
     if restored:
         payload.update(_task_fields(restored))
     return payload
+
+
+@app.get("/session/history")
+def session_history(conversation_id: str, user_id: str):
+    """Return the saved chatlog. The window does not paint this on open."""
+    cid = _valid_uuid(conversation_id)
+    uid = _valid_uuid(user_id)
+    rows = get_full_history(cid)
+    messages = [{"role": row["role"], "content": row["content"]} for row in rows]
+    return {
+        "conversation_id": cid,
+        "user_id": uid,
+        "messages": messages,
+    }
+
+
+@app.post("/chat/voice")
+async def chat_voice(
+    audio: UploadFile = File(...),
+    conversation_id: Optional[str] = Form(None),
+    user_id: Optional[str] = Form(None),
+):
+    """Transcribe main-chat voice, then run the normal /chat pipeline (SPEC-CHAT-VOICE)."""
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        return {
+            "error": "heard_nothing",
+            "answer": "",
+            "conversation_id": _valid_uuid(conversation_id),
+            "user_id": _valid_uuid(user_id),
+            "engine": "chat",
+        }
+
+    duration = whisper.wav_duration_seconds(audio_bytes)
+    if duration < whisper.MIN_AUDIO_SECONDS:
+        return {
+            "error": "heard_nothing",
+            "answer": "",
+            "conversation_id": _valid_uuid(conversation_id),
+            "user_id": _valid_uuid(user_id),
+            "engine": "chat",
+        }
+
+    try:
+        transcript = whisper.transcribe_wav(audio_bytes)
+    except whisper.WhisperError as exc:
+        return {
+            "error": exc.error_code,
+            "answer": "",
+            "conversation_id": _valid_uuid(conversation_id),
+            "user_id": _valid_uuid(user_id),
+            "engine": "chat",
+        }
+
+    if whisper.is_junk_transcript(transcript):
+        return {
+            "error": "heard_nothing",
+            "transcript": (transcript or "").strip() or None,
+            "answer": "",
+            "conversation_id": _valid_uuid(conversation_id),
+            "user_id": _valid_uuid(user_id),
+            "engine": "chat",
+        }
+
+    text = (transcript or "").strip()
+    result = handle_chat(
+        UserMessage(
+            text=text,
+            conversation_id=conversation_id,
+            user_id=user_id,
+        )
+    )
+    if isinstance(result, dict):
+        result = {**result, "transcript": text}
+    return result
 
 
 @app.post("/chat")
@@ -1296,7 +1392,7 @@ def handle_chat(incoming_data: UserMessage):
                 recall_facts = analysis["matched_facts"] or long_term_facts
                 answer = ask_llm(
                     user_text,
-                    history,
+                    reply_history,
                     recall_facts,
                 )
             else:
@@ -1324,13 +1420,13 @@ def handle_chat(incoming_data: UserMessage):
                             "do not dump the raw key:value list unless asked, "
                             "and do not bring up unrelated earlier topics.]"
                         ),
-                        history,
+                        reply_history,
                         updated_facts,
                     )
                 else:
                     # "remind me to email Sam" etc. — not a durable fact.
                     intent = "CHAT"
-                    answer = ask_llm(user_text, history, long_term_facts)
+                    answer = ask_llm(user_text, reply_history, long_term_facts)
         elif intent == "RETRIEVE":
             context, chunks = retrieve.answer_from_docs(user_text)
             sources = sorted({chunk["source"] for chunk in chunks})
@@ -1341,11 +1437,11 @@ def handle_chat(incoming_data: UserMessage):
             answer = ask_llm_with_context(
                 user_text,
                 context,
-                history,
+                reply_history,
                 long_term_facts,
             )
         else:
-            answer = ask_llm(user_text, history, long_term_facts)
+            answer = ask_llm(user_text, reply_history, long_term_facts)
 
         # Auto-assessor: CHAT only. Don't ask to remember a doc lookup.
         # Still allowed to save user facts (name, prefs) when the assessor is sure,

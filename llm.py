@@ -6,6 +6,7 @@ import httpx
 from google import genai
 from google.genai import types
 
+from intent import _looks_like_action_order, _looks_like_resume_draft
 from long_term_memory import format_facts
 
 ## To keep responses nice and concise
@@ -23,7 +24,9 @@ SYSTEM_PROMPT = (
     "no purchases). If asked, say that plainly — do not pretend you did "
     "something you didn't. "
     "If a previous document lookup failed, do not keep talking about it "
-    "unless the user brings that topic up again."
+    "unless the user brings that topic up again. "
+    "If they are just greeting or small-talking, greet back — do not continue "
+    "a previous app-open or email attempt."
 )
 
 
@@ -102,19 +105,30 @@ def _content_tokens(text: str) -> set[str]:
     return tokens - _HISTORY_STOPWORDS
 
 
+# Assistant lines that are leftover ACTION execution, including CHAT turns
+# that copied a failed open after the classifier already said CHAT.
+_ACTION_RESIDUE_RE = re.compile(
+    r"(couldn'?t find an app|can'?t seem to open|still can'?t open|"
+    r"need which apps|nothing was opened|which apps to open)",
+    re.IGNORECASE,
+)
+
+
 def history_for_reply(history: list[dict], current_text: str) -> list[dict]:
     """Copy of chat history for the LLM.
 
-    Lookup turns stay in the DB (so they can be brought up later) but are
-    omitted from the prompt unless the current message looks related.
-    A lookup is whatever the router tagged retrieve / retrieve_miss — not a
-    phrase list.
+    Lookup and ACTION turns stay in the DB but are omitted from the prompt
+    unless this message looks related. A greeting must not see old open-app
+    failures. Chatlog and long-term facts are not deleted.
     """
     if not history:
         return []
 
     current_tokens = _content_tokens(current_text)
     skip = set()
+    keep_action_history = _looks_like_action_order(current_text) or _looks_like_resume_draft(
+        current_text
+    )
 
     def _is_lookup_turn(turn: dict) -> bool:
         if turn.get("role") != "assistant":
@@ -126,6 +140,21 @@ def history_for_reply(history: list[dict], current_text: str) -> list[dict]:
         content = (turn.get("content") or "").strip()
         return content.startswith(RETRIEVE_MISS_REPLY[:40])
 
+    def _is_action_turn(turn: dict) -> bool:
+        if turn.get("role") != "assistant":
+            return False
+        if (turn.get("kind") or "") == "action":
+            return True
+        return bool(_ACTION_RESIDUE_RE.search(turn.get("content") or ""))
+
+    def _skip_unrelated_pair(i: int, user_tokens: set[str]) -> None:
+        related = bool(current_tokens and user_tokens and (current_tokens & user_tokens))
+        if related:
+            return
+        skip.add(i)
+        if i > 0 and history[i - 1].get("role") == "user":
+            skip.add(i - 1)
+
     for i, turn in enumerate(history):
         if turn.get("role") != "assistant" or not _is_lookup_turn(turn):
             continue
@@ -133,11 +162,17 @@ def history_for_reply(history: list[dict], current_text: str) -> list[dict]:
         miss_tokens = (
             _content_tokens(history[user_i].get("content", "")) if user_i is not None else set()
         )
-        related = bool(current_tokens and miss_tokens and (current_tokens & miss_tokens))
-        if not related:
-            skip.add(i)
-            if user_i is not None:
-                skip.add(user_i)
+        _skip_unrelated_pair(i, miss_tokens)
+
+    if not keep_action_history:
+        for i, turn in enumerate(history):
+            if turn.get("role") != "assistant" or not _is_action_turn(turn):
+                continue
+            user_i = i - 1 if i > 0 and history[i - 1].get("role") == "user" else None
+            user_tokens = (
+                _content_tokens(history[user_i].get("content", "")) if user_i is not None else set()
+            )
+            _skip_unrelated_pair(i, user_tokens)
 
     return [turn for i, turn in enumerate(history) if i not in skip]
 

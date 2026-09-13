@@ -171,6 +171,15 @@ def classify_intent(
                 print("intent_promoted=ACTION (classifier missed an order)")
                 result["intent"] = "ACTION"
                 result["kind"] = "ACTION"
+            elif (
+                result.get("intent") == "ACTION"
+                and not _looks_like_action_order(text)
+                and not _looks_like_resume_draft(text)
+            ):
+                # llama copies "yo pull up chrome" onto slang hellos ("yo wsp").
+                print("intent_demoted=CHAT (no action verb)")
+                result["intent"] = "CHAT"
+                result["kind"] = "CHAT"
 
     if result.get("intent") in ("CHAT", "RETRIEVE", "REMEMBER") and _looks_like_resume_draft(text):
         print("intent_promoted=ACTION (draft resume)")
@@ -957,7 +966,7 @@ def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
         elif action_type == "open_app" and (
             "app_names" in missing or "app_name" in missing
         ):
-            if not _looks_like_question(stripped):
+            if not _looks_like_question(stripped) and not _is_greeting_only(stripped):
                 names = _split_app_names(stripped)
                 if names and re.fullmatch(
                     r"[A-Za-z][\w .'+-]*(?:\s*(?:,|&|and)\s*[A-Za-z][\w .'+-]*)*",
@@ -966,7 +975,7 @@ def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
                 ):
                     supplied = {"app_names": names}
         elif action_type in ("close_app", "quit_app") and "app_names" in missing:
-            if not _looks_like_question(stripped):
+            if not _looks_like_question(stripped) and not _is_greeting_only(stripped):
                 names = _split_app_names(stripped)
                 if names and re.fullmatch(
                     r"[A-Za-z][\w .'+-]*(?:\s*(?:,|&|and)\s*[A-Za-z][\w .'+-]*)*",
@@ -1244,12 +1253,14 @@ not RETRIEVE, even when the message is a question.
 Step 2b — if is_question is false, set kind without the scores:
   REMEMBER = keep a personal fact/pref
   RETRIEVE = order a doc lookup
-  CHAT = greetings, small talk, acknowledgements — NEVER an order to open an app
+  CHAT = greetings and small talk, including slang with no task verb:
+    "hi", "yo", "yo wsp", "wsp", "sup", "what's up". NEVER an order.
   ACTION = they want a task done on the computer or an external service.
-    Opening/launching ANY app is ACTION, including slang and made-up names:
+    Needs an open/send/close/quit verb (or resume-a-draft). Slang verbs count:
     "open Notes", "yo pull up chrome", "fire up vs code rq", "hop into discord",
-    "pls launch xyzzyqorp". Sending email is ACTION. Not a memory instruction,
-    not a doc lookup. App names are whatever they said — there is no fixed list.
+    "pls launch xyzzyqorp". "yo" alone is CHAT — the verb is "pull up", not "yo".
+    Sending email is ACTION. Not a memory instruction, not a doc lookup.
+    App names are whatever they said — there is no fixed list.
 Set unused scores to 0.
 
 User message: {text}
@@ -1291,7 +1302,8 @@ Reply with ONLY valid JSON, no markdown:
     elif kind not in ("CHAT", "RETRIEVE", "REMEMBER", "ACTION"):
         kind = "CHAT"
 
-    # ACTION is live (SPEC-PIPELINE §3.1): no demotion to CHAT anymore.
+    # ACTION is live (SPEC-PIPELINE §3.1). classify_intent may still demote
+    # a guessed ACTION that has no open/send/close/quit verb.
     intent = kind
 
     confidence = float(result.get("confidence", 0.5))
@@ -1376,16 +1388,19 @@ def maybe_promote_to_remember(
 
 # Deterministic ACTION detection for rules/mock modes (SPEC-PIPELINE §3.1).
 # Verbs/slang only — app names are not a closed list.
+_CLAUSE_CONNECTOR = r"(?:and then|and|then|also|plus|btw)"
+_APP_TOKEN = rf"(?!{_CLAUSE_CONNECTOR}\b)\S"
+
 _ACTION_OPEN_RE = re.compile(
-    rf"^{_LEADING_FILLER}{_OPEN_VERBS}(?:\s+up)?\s+\S",
+    rf"^{_LEADING_FILLER}{_OPEN_VERBS}(?:\s+up)?\s+{_APP_TOKEN}",
     re.IGNORECASE,
 )
 _ACTION_CLOSE_RE = re.compile(
-    rf"^{_LEADING_FILLER}{_CLOSE_TAIL}\s+\S",
+    rf"^{_LEADING_FILLER}{_CLOSE_TAIL}\s+{_APP_TOKEN}",
     re.IGNORECASE,
 )
 _ACTION_QUIT_RE = re.compile(
-    rf"^{_LEADING_FILLER}{_QUIT_WORD}\s+\S",
+    rf"^{_LEADING_FILLER}{_QUIT_WORD}\s+{_APP_TOKEN}",
     re.IGNORECASE,
 )
 # send email / send an email / send another email / send a new email /
@@ -1425,6 +1440,20 @@ def _looks_like_resume_draft(text: str) -> bool:
     return bool(_RESUME_DRAFT_RE.search(stripped))
 
 
+_GREETING_ONLY_RE = re.compile(
+    r"^(?:y+o+|hi+|hey+|hello|howdy|sup|wsp|"
+    r"yo+\s+wsp|whats?\s+up|what's\s+up|whats?\s+good|what's\s+good|"
+    r"how(?:'s|s)?\s+it\s+going|how\s+are\s+(?:you|u)"
+    r")[!?.]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_greeting_only(text: str) -> bool:
+    """Slang hello with no task verb. 'yo pull up chrome' is not this."""
+    return bool(_GREETING_ONLY_RE.fullmatch((text or "").strip()))
+
+
 def _looks_like_action_order(text: str) -> bool:
     return bool(parse_mixed_utterance(text)["actions"])
 
@@ -1442,14 +1471,93 @@ def _clause_is_action(clause: str) -> bool:
 
 _ACTION_START_RE = re.compile(
     rf"(?:{_LEADING_FILLER})(?:{_RESUME_DRAFT_INNER}|{_EMAIL_VERB}|"
-    rf"{_CLOSE_TAIL}\s+\S|{_QUIT_WORD}\s+\S|"
-    rf"{_OPEN_VERBS}(?:\s+up)?\s+\S)",
+    rf"{_CLOSE_TAIL}\s+{_APP_TOKEN}|{_QUIT_WORD}\s+{_APP_TOKEN}|"
+    rf"{_OPEN_VERBS}(?:\s+up)?\s+{_APP_TOKEN})",
     re.IGNORECASE,
 )
+_APP_VERB_SPAN_RE = re.compile(
+    rf"(?<![A-Za-z])(?:(?P<close>{_CLOSE_TAIL})|(?P<quit>{_QUIT_WORD})|"
+    rf"(?P<open>{_OPEN_VERBS}(?:\s+up)?))(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_DRAFT_OBJECT_RE = re.compile(
+    r"^(?:the\s+|that\s+|this\s+)?(?:(?:e-?mail\s+)?draft|e-?mail|letter)\b",
+    re.IGNORECASE,
+)
+_LEADING_CONNECTOR_RE = re.compile(
+    rf"^(?:{_CLAUSE_CONNECTOR})[\s,;]+",
+    re.IGNORECASE,
+)
+_TRAILING_CLAUSE_CONNECTOR_RE = re.compile(
+    rf"[\s,;]+(?:{_CLAUSE_CONNECTOR})$",
+    re.IGNORECASE,
+)
+_BARE_CONNECTOR_RE = re.compile(rf"^{_CLAUSE_CONNECTOR}$", re.IGNORECASE)
+_EMAIL_IN_TEXT_RE = re.compile(_EMAIL_VERB, re.IGNORECASE)
 _TRAILING_CONNECTOR_RE = re.compile(
     r"[\s,;]*(?:\b(?:and then|and|also|then|plus|btw)\b[\s,;]*)+$",
     re.IGNORECASE,
 )
+
+
+def _strip_clause_object(obj: str) -> str:
+    text = (obj or "").strip(" \t,;.")
+    text = _LEADING_CONNECTOR_RE.sub("", text).strip(" \t,;.")
+    text = _TRAILING_CLAUSE_CONNECTOR_RE.sub("", text).strip(" \t,;.")
+    if _BARE_CONNECTOR_RE.match(text):
+        return ""
+    return text
+
+
+def _filler_before_verb(text: str, verb_start: int) -> str:
+    prefix = text[:verb_start]
+    match = re.search(rf"(?:{_LEADING_FILLER})$", prefix, re.IGNORECASE)
+    return match.group(0) if match else ""
+
+
+def expand_action_clauses(text: str) -> list[str]:
+    """Coordinated app verbs share one object: close and quit notes → both Notes.
+
+    Email / draft-resume utterances return [] so the existing splitter handles them.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return []
+    if _EMAIL_IN_TEXT_RE.search(stripped):
+        return []
+    matches = [m for m in _APP_VERB_SPAN_RE.finditer(stripped)]
+    if not matches:
+        return []
+
+    items = []
+    for i, match in enumerate(matches):
+        obj_end = matches[i + 1].start() if i + 1 < len(matches) else len(stripped)
+        obj = _strip_clause_object(stripped[match.end() : obj_end])
+        if match.group("close"):
+            kind = "close"
+        elif match.group("quit"):
+            kind = "quit"
+        else:
+            kind = "open"
+        verb = match.group(0)
+        if obj and _DRAFT_OBJECT_RE.match(obj):
+            return []
+        filler = _filler_before_verb(stripped, match.start())
+        items.append({"kind": kind, "verb": verb, "object": obj, "filler": filler})
+
+    inherited = ""
+    for item in reversed(items):
+        if item["object"]:
+            inherited = item["object"]
+        elif inherited:
+            item["object"] = inherited
+
+    clauses = []
+    for item in items:
+        if not item["object"]:
+            continue
+        clauses.append(f"{item['filler']}{item['verb']} {item['object']}".strip())
+    return clauses
 
 
 def parse_mixed_utterance(text: str) -> dict:
@@ -1457,10 +1565,22 @@ def parse_mixed_utterance(text: str) -> dict:
 
     Commas are NOT a blanket split (email params use them). An action starts
     wherever an open/email verb appears, so 'hey, open Notes' still routes.
+    Coordinated verbs ('close and quit notes') share the object.
     """
     stripped = (text or "").strip()
     if not stripped:
         return {"chat": "", "actions": []}
+    expanded = expand_action_clauses(stripped)
+    if expanded:
+        first = _APP_VERB_SPAN_RE.search(stripped)
+        chat_end = first.start() if first else 0
+        if first:
+            filler = _filler_before_verb(stripped, first.start())
+            if filler:
+                chat_end = first.start() - len(filler)
+        chat = stripped[:chat_end].strip()
+        chat = _TRAILING_CONNECTOR_RE.sub("", chat).strip(" \t,;.")
+        return {"chat": chat, "actions": expanded}
     starts = [m.start() for m in _ACTION_START_RE.finditer(stripped)]
     if not starts:
         return {"chat": stripped if not _clause_is_action(stripped) else "",
@@ -1513,6 +1633,10 @@ def _classify_with_rules(text: str) -> dict:
     # Orders to do a task (open an app, send an email) — even with a "?".
     if _looks_like_action_order(text):
         return {"intent": "ACTION", "confidence": 0.9}
+
+    # Before retrieve_starts: "what's" would steal "what's up".
+    if _is_greeting_only(text):
+        return {"intent": "CHAT", "confidence": 0.9}
 
     retrieve_starts = (
         "what is",
