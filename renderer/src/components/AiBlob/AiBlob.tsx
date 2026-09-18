@@ -12,12 +12,12 @@ const VOICE_PANEL_BG = "rgb(241, 241, 250)";
 
 const orbPropsForState = (state: VoiceRecordingState) => {
   if (state === "recording") {
-    return { forceHoverState: true, hoverIntensity: 0.9, rotateOnHover: true, hue: 245 };
+    return { forceHoverState: true, hoverIntensity: 0.9, rotateOnHover: true, hue: 0 };
   }
   if (state === "processing") {
-    return { forceHoverState: true, hoverIntensity: 0.55, rotateOnHover: true, hue: 210 };
+    return { forceHoverState: true, hoverIntensity: 0.55, rotateOnHover: true, hue: 0 };
   }
-  return { forceHoverState: false, hoverIntensity: 0.3, rotateOnHover: true, hue: 230 };
+  return { forceHoverState: false, hoverIntensity: 0.3, rotateOnHover: true, hue: 0 };
 };
 
 /** Voice orb — React Bits free `Orb` (WebGL). Pro-only `ai-blob-tw` not required. */

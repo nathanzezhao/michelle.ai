@@ -30,7 +30,7 @@
   aspect-ratio: 1;
   flex-shrink: 0;
   animation: blob-idle 2.4s ease-in-out infinite;
-  filter: drop-shadow(0 0 8px rgba(120, 140, 255, 0.2));
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.14)) drop-shadow(0 0 10px rgba(255, 255, 255, 0.35));
   transition: filter 400ms ease;
 }
 
@@ -41,11 +41,11 @@
 }
 
 .voice-blob[data-state="recording"] {
-  filter: drop-shadow(0 0 28px rgba(120, 140, 255, 0.75));
+  filter: drop-shadow(0 4px 16px rgba(0, 0, 0, 0.22)) drop-shadow(0 0 28px rgba(255, 255, 255, 0.65));
 }
 
 .voice-blob[data-state="processing"] {
-  filter: drop-shadow(0 0 16px rgba(120, 140, 255, 0.45));
+  filter: drop-shadow(0 3px 12px rgba(0, 0, 0, 0.18)) drop-shadow(0 0 16px rgba(255, 255, 255, 0.45));
 }
 
 @media (prefers-reduced-motion: reduce) {
