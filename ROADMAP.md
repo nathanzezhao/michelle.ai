@@ -98,7 +98,9 @@ From the original Michelle architecture (intent router → RAG → agents):
 
 Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 
-**Vision:** Cross-platform, local-first assistant that floats on the desktop, observes screen context, respects strict privacy guardrails, and can eventually run background tasks via tool integration.
+**Vision:** Cross-platform, local-first assistant that floats on the desktop, observes screen context (pixels **or** DOM text when the target is a page), respects strict privacy guardrails, and can eventually run background tasks via tool integration.
+
+- [ ] **DOM / text access script shell** — read `textContent` / `innerText` / `innerHTML` on a selected element when the page is reachable; pixels + OCR/VLM remain the fallback. Read-only. Not wired.
 
 ### Phase 1 — Screen capture & OS integration (The Eyes)
 
@@ -106,6 +108,7 @@ Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 - **Current stack:** Electron today — migration to Tauri is a future decision, not required to prototype capture concepts
 - **Capture strategy:** Event-driven or low-Hz polling (1–2 fps) to limit CPU/GPU; downsample frames before inference
 - **OS APIs:** Windows Graphics Capture, macOS ScreenCaptureKit, Linux equivalent
+- **When to skip pixels:** If the target is a browser or webview Michelle can reach, prefer Phase 1b (DOM text) over OCR on a screenshot
 
 **Edge cases (from PDF):**
 
@@ -113,10 +116,46 @@ Reference: `desktop_ai_agent_roadmap_screencapture.pdf` (July 2026)
 - DRM / protected content: black frame → fail gracefully, don't hallucinate
 - Transient UI: tooltips vanish on focus loss → "capture snapshot" shortcut before agent window takes focus
 
+### Phase 1b — DOM / text access (The Script)
+
+Pixel capture is the general eye. For a page Michelle can already see as a document, **read the DOM first** — cheaper, faster, and more accurate than OCR. Fall back to Phase 1 frames when the UI is native, canvas/WebGL, or the origin is not reachable.
+
+**Script shell (read-only prototype — not wired, not an ACTION):**
+
+```javascript
+// Selecting the element
+const element = document.getElementById("myElement");
+
+// 1. Get or set the text content (Fastest, gets hidden text too)
+let text = element.textContent;
+
+// 2. Get or set the visible text (Respects CSS styling like display: none)
+let visibleText = element.innerText;
+
+// 3. Get or set the full HTML structure inside the element
+let htmlContent = element.innerHTML;
+```
+
+**Which field:**
+
+| Field | Use when |
+|-------|----------|
+| `textContent` | Fast dump of all text nodes, including `display: none` and off-screen copy |
+| `innerText` | What a sighted user would see (layout + CSS) |
+| `innerHTML` | Structure / semantics, not the visible string |
+
+**Guardrails (same brakes as Phase 3):**
+
+- Shell is **read-only** until a later whitelist. Do not set `innerHTML` from model output (XSS). If a write ever ships, prefer `textContent`.
+- `textContent` can leak hidden fields (passwords, visually hidden PII) — mask before the VLM/LLM sees it.
+- Same contextual denylists as capture (banking, password managers, incognito).
+- Electron later: inject via a consented `webContents.executeJavaScript`; never scrape arbitrary origins without user permission.
+- Does **not** click, type, or hijack mouse/keyboard.
+
 ### Phase 2 — Local AI processing (The Brain)
 
 - **Local VLM:** Ollama or llama.cpp; multimodal models (e.g. LLaVA or smaller quantized VLMs)
-- **OCR pre-pass:** Tesseract (or similar) before VLM — hard text + downsampled image improves small UI text accuracy
+- **OCR pre-pass:** Tesseract (or similar) before VLM — hard text + downsampled image improves small UI text accuracy. Skip when Phase 1b already returned `innerText` / `textContent`
 - **Privacy:** All vision processing local by default
 
 ### Phase 3 — Guardrails (The Brakes)
