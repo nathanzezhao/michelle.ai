@@ -170,9 +170,19 @@ body.collapsed {
   height: 22px;
   background: #333;
   border: none;
-  cursor: pointer;
+  cursor: grab;
   outline: none;
   transition: border-radius 0.5s;
+}
+
+.shell-collapse-btn:focus-visible,
+.collapsed-orb:focus-visible {
+  outline: 2px solid #333;
+  outline-offset: 2px;
+}
+
+.shell-collapse-btn:active {
+  cursor: grabbing;
 }
 
 .shell-collapse-btn--circle {
@@ -553,7 +563,11 @@ body.collapsed {
   border-radius: 50%;
   border: 1.5px solid whitesmoke;
   background: #333;
-  cursor: pointer;
+  cursor: grab;
+}
+
+.collapsed-orb:active {
+  cursor: grabbing;
 }
 
 .bubble-thinking {

@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useDragOrClick } from "@/hooks/useDragOrClick";
 
 type ShellHeaderProps = {
   collapseCircle: boolean;
@@ -8,6 +9,8 @@ type ShellHeaderProps = {
 };
 
 export function ShellHeader({ collapseCircle, onCollapse, trailing, hidden }: ShellHeaderProps) {
+  const pointer = useDragOrClick(onCollapse);
+
   return (
     <header
       className={`shell-header relative shrink-0 ${hidden ? "shell-header--hidden" : ""}`}
@@ -16,8 +19,10 @@ export function ShellHeader({ collapseCircle, onCollapse, trailing, hidden }: Sh
       <button
         type="button"
         id="collapse-btn"
-        aria-label="Collapse"
-        onClick={onCollapse}
+        aria-label="Collapse (drag to move)"
+        onPointerDown={pointer.onPointerDown}
+        onPointerUp={pointer.onPointerUp}
+        onClick={pointer.onClick}
         className={`shell-collapse-btn ${collapseCircle ? "shell-collapse-btn--circle" : ""}`}
         style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
       />

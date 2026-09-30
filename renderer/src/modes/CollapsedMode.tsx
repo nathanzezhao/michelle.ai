@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { dragStart, dragStop, setIgnoreMouse } from "@/ipc/electron";
+import { useDragOrClick } from "@/hooks/useDragOrClick";
+import { setIgnoreMouse } from "@/ipc/electron";
 
 type CollapsedModeProps = {
   onExpand: () => void;
@@ -7,13 +8,26 @@ type CollapsedModeProps = {
 
 export function CollapsedMode({ onExpand }: CollapsedModeProps) {
   const btnRef = useRef<HTMLButtonElement>(null);
+  const draggingRef = useRef(false);
   const [pointerOnBtn, setPointerOnBtn] = useState(true);
-  const dragStartScreen = useRef<{ x: number; y: number } | null>(null);
 
   const syncHitTest = (over: boolean) => {
     setPointerOnBtn(over);
     setIgnoreMouse(!over);
   };
+
+  const pointer = useDragOrClick(onExpand, {
+    onDragStart: () => {
+      draggingRef.current = true;
+      syncHitTest(true);
+    },
+    onGestureEnd: () => {
+      draggingRef.current = false;
+    },
+    onDragEnd: () => {
+      syncHitTest(true);
+    },
+  });
 
   useEffect(() => {
     syncHitTest(true);
@@ -22,13 +36,17 @@ export function CollapsedMode({ onExpand }: CollapsedModeProps) {
 
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
+      if (draggingRef.current) return;
       const btn = btnRef.current;
       if (!btn) return;
       const over = e.target === btn || btn.contains(e.target as Node);
       if (over === pointerOnBtn) return;
       syncHitTest(over);
     };
-    const onLeave = () => syncHitTest(false);
+    const onLeave = () => {
+      if (draggingRef.current) return;
+      syncHitTest(false);
+    };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseleave", onLeave);
     return () => {
@@ -37,38 +55,20 @@ export function CollapsedMode({ onExpand }: CollapsedModeProps) {
     };
   }, [pointerOnBtn]);
 
-  const onMouseDown = (e: React.MouseEvent) => {
-    e.preventDefault();
-    syncHitTest(true);
-    dragStartScreen.current = { x: e.screenX, y: e.screenY };
-    dragStart(e.screenX, e.screenY);
-
-    const onUp = (ev: MouseEvent) => {
-      document.removeEventListener("mouseup", onUp);
-      dragStop();
-      const start = dragStartScreen.current;
-      dragStartScreen.current = null;
-      if (!start) return;
-      const dx = Math.abs(ev.screenX - start.x);
-      const dy = Math.abs(ev.screenY - start.y);
-      if (dx < 5 && dy < 5) {
-        onExpand();
-        return;
-      }
-      syncHitTest(true);
-    };
-    document.addEventListener("mouseup", onUp);
-  };
-
   return (
     <div className="collapsed-orb-wrap">
       <button
         ref={btnRef}
         type="button"
-        aria-label="Expand Michelle"
-        onMouseDown={onMouseDown}
+        aria-label="Expand Michelle (drag to move)"
+        onPointerDown={pointer.onPointerDown}
+        onPointerUp={pointer.onPointerUp}
+        onClick={pointer.onClick}
         onMouseEnter={() => syncHitTest(true)}
-        onMouseLeave={() => syncHitTest(false)}
+        onMouseLeave={() => {
+          if (draggingRef.current) return;
+          syncHitTest(false);
+        }}
         className="collapsed-orb"
       />
     </div>

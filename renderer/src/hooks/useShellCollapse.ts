@@ -5,19 +5,39 @@ import type { UiMode } from "@/types/ui";
 const COLLAPSED_HEIGHT = 56;
 const FADE_OUT_MS = 200;
 const FADE_IN_MS = 300;
+/** Keep in sync with `.app-shell` height transition in index.css */
+const HEIGHT_MS = 500;
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function prefersReducedMotion(): boolean {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
 function animateShellHeight(shell: HTMLElement, toPx: number): Promise<void> {
+  const fromPx = shell.clientHeight;
+  if (fromPx === toPx || prefersReducedMotion()) {
+    shell.style.height = `${toPx}px`;
+    return Promise.resolve();
+  }
+
   return new Promise((resolve) => {
-    const onEnd = (event: TransitionEvent) => {
-      if (event.propertyName !== "height") return;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       shell.removeEventListener("transitionend", onEnd);
+      window.clearTimeout(timer);
       resolve();
     };
+    const onEnd = (event: TransitionEvent) => {
+      if (event.target !== shell || event.propertyName !== "height") return;
+      finish();
+    };
     shell.addEventListener("transitionend", onEnd);
+    const timer = window.setTimeout(finish, HEIGHT_MS + 80);
     shell.style.height = `${toPx}px`;
   });
 }
@@ -44,13 +64,10 @@ export function useShellCollapse(mode: UiMode, setMode: (next: UiMode) => void) 
     preCollapseModeRef.current = mode;
     savedHeightRef.current = shell.clientHeight;
 
-    if (collapseGuardRef.current) {
-      await collapseGuardRef.current();
-    }
+    void collapseGuardRef.current?.();
 
     setCollapseBtnCircle(true);
     setContentOpacity(0);
-    await wait(FADE_OUT_MS);
 
     shell.style.overflow = "hidden";
     shell.style.height = `${shell.clientHeight}px`;
