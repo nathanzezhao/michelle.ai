@@ -32,7 +32,7 @@ Electron → FastAPI `POST /chat`, `POST /session/start`, `POST /action/confirm`
 
 CHAT | RETRIEVE | REMEMBER | ACTION today. ACTION v1 is **live** (`open_app` + `send_email`, Confirm/Cancel, Composio, `actions_log`). More ACTION tools stay parked. Memory is short-term window + long-term facts. Retrieve is local `docs/` FTS, not embeddings yet.
 
-**Track 3 (voice/vision):** **not started**. Do not start until leftover memory UI + RETRIEVE v2 are in good shape (ROADMAP). Chat-bar mic is still NEXT, not capture.
+**Track 3 (voice/vision):** **not started**. Do not start until leftover memory UI + RETRIEVE v2 are in good shape (ROADMAP). Chat-bar mic is **shipped**. Clarifying chips are in. Inbox briefing is next (LLM intent, not a greeting chip). Not capture.
 
 **Vision (planning only):** if the target is a reachable page, prefer Phase 1b DOM `textContent` / `innerText` / `innerHTML` (read-only, not wired). Pixels + OCR/VLM only for native / canvas / unreachable origin. Do not spec capture UI or `executeJavaScript` on this track.
 

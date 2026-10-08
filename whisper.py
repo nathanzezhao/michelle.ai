@@ -56,8 +56,12 @@ class WhisperDownloading(WhisperError):
     error_code = "downloading"
 
 
-def is_junk_transcript(text) -> bool:
-    """Silence / Whisper hallucinations that must never reach the LLM."""
+def is_junk_transcript(text, *, strict: bool = True) -> bool:
+    """Silence / Whisper hallucinations that must never reach the LLM.
+
+    strict=True (email tap): also drop short phrases under 4 words / 12 chars.
+    strict=False (chat-bar + voice blob): allow “open Notes”; still drop thanks/empty.
+    """
     if text is None:
         return True
     cleaned = " ".join(str(text).split())
@@ -66,6 +70,8 @@ def is_junk_transcript(text) -> bool:
     core = cleaned.lower().strip(".,!?;:\"'")
     if core in _JUNK_PHRASES or cleaned.lower() in _JUNK_PHRASES:
         return True
+    if not strict:
+        return False
     if len(cleaned) < MIN_TRANSCRIPT_CHARS:
         return True
     if len(cleaned.split()) < MIN_TRANSCRIPT_WORDS:

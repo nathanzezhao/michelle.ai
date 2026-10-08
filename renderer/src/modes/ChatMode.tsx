@@ -4,7 +4,9 @@ import {
   isOpenEmailComposer,
   sendChat,
   submitDraft,
+  transcribeChatAudio,
   type ChatResponse,
+  type ClarifyOption,
   type ComposerDraft,
   type HistoryMessage,
 } from "@/api/michelle";
@@ -13,6 +15,7 @@ import {
   type ComposerFields,
   type EmailComposerHandle,
 } from "@/components/EmailComposer/EmailComposer";
+import { useMicCapture } from "@/hooks/useMicCapture";
 import { revealScramble } from "@/lib/scramble";
 
 type ChatModeProps = {
@@ -64,10 +67,15 @@ export function ChatMode({
   );
   const [composer, setComposer] = useState<ComposerFields | null>(restoredComposer ?? null);
   const [composerKey, setComposerKey] = useState(0);
+  const [clarifyOptions, setClarifyOptions] = useState<ClarifyOption[] | null>(null);
+  const [clarifySource, setClarifySource] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<EmailComposerHandle | null>(null);
   const scrambledFor = useRef<string | null>(null);
   const scrambleTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const { recording, startRecording, stopRecording } = useMicCapture();
+  const [micBusy, setMicBusy] = useState(false);
+  const [micHint, setMicHint] = useState<string | undefined>();
   const stickToBottom = useRef(false);
   const seededRef = useRef<HistoryMessage[] | undefined>(undefined);
 
@@ -121,7 +129,7 @@ export function ChatMode({
     if (!stickToBottom.current) return;
     const el = contentRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, composer, pendingAction]);
+  }, [messages, composer, pendingAction, clarifyOptions]);
 
   const applyChatResponse = useCallback(
     (data: ChatResponse, botId: string) => {
@@ -133,14 +141,21 @@ export function ChatMode({
         );
         const node = document.getElementById(botId);
         if (node) revealScramble(node, data.answer || "");
-        if (data.confirm_required && data.task_id) {
+        if (data.engine === "clarify" && data.clarify_options?.length) {
+          setPendingAction(null);
+          setComposer(null);
+          setClarifyOptions(data.clarify_options);
+        } else if (data.confirm_required && data.task_id) {
+          setClarifyOptions(null);
           setComposer(null);
           setPendingAction({ taskId: data.task_id, afterId: botId });
         } else if (isOpenEmailComposer(data)) {
+          setClarifyOptions(null);
           setPendingAction(null);
           setComposer(fieldsFromResponse(data));
           setComposerKey((n) => n + 1);
         } else if (data.asked_to_save_draft || data.task_status !== "AWAITING_INPUT") {
+          setClarifyOptions(null);
           setComposer(null);
           setPendingAction(null);
         }
@@ -159,6 +174,8 @@ export function ChatMode({
     }
     setInput("");
     setPendingAction(null);
+    setClarifyOptions(null);
+    setClarifySource(text);
     stickToBottom.current = true;
     const userBubble: Bubble = { id: bubbleId("user", messages.length), role: "user", content: text };
     const botBubble: Bubble = {
@@ -175,6 +192,66 @@ export function ChatMode({
       applyChatResponse({ answer: "System Error: Connection to backend lost." }, botBubble.id);
     }
   }, [applyChatResponse, composer, conversationId, input, messages.length, userId]);
+
+  const handleClarify = useCallback(
+    async (choice: ClarifyOption) => {
+      const text = clarifySource;
+      if (!text) return;
+      setClarifyOptions(null);
+      stickToBottom.current = true;
+      const botBubble: Bubble = {
+        id: bubbleId("clarify", messages.length),
+        role: "assistant",
+        content: "",
+        pending: true,
+      };
+      setMessages((prev) => [...prev, botBubble]);
+      try {
+        const data = await sendChat(text, conversationId, userId, choice.intent);
+        applyChatResponse(data, botBubble.id);
+      } catch {
+        applyChatResponse({ answer: "System Error: Connection to backend lost." }, botBubble.id);
+      }
+    },
+    [applyChatResponse, clarifySource, conversationId, messages.length, userId]
+  );
+
+  const flashMicHint = useCallback((text: string) => {
+    setMicHint(text);
+    window.setTimeout(() => setMicHint(undefined), 2000);
+  }, []);
+
+  const handleMic = useCallback(async () => {
+    if (composer || micBusy) return;
+    if (recording) {
+      setMicBusy(true);
+      setMicHint("Transcribing…");
+      const blob = await stopRecording();
+      if (!blob) {
+        flashMicHint("Didn't catch that");
+        setMicBusy(false);
+        return;
+      }
+      try {
+        const data = await transcribeChatAudio(blob, conversationId, userId);
+        if (data.error === "downloading") {
+          setMicHint("Downloading speech model…");
+        } else if (data.error || !data.transcript) {
+          flashMicHint("Didn't catch that");
+        } else {
+          setInput(data.transcript);
+          setMicHint(undefined);
+        }
+      } catch {
+        flashMicHint("Didn't catch that");
+      }
+      setMicBusy(false);
+      return;
+    }
+    setMicHint("Listening…");
+    const started = await startRecording();
+    if (!started) setMicHint(undefined);
+  }, [composer, conversationId, flashMicHint, micBusy, recording, startRecording, stopRecording, userId]);
 
   const handleComposerSubmit = useCallback(
     async (draft: ComposerDraft) => {
@@ -231,7 +308,20 @@ export function ChatMode({
             {m.pending ? <span className="loading-dot" /> : m.content}
           </div>
         ))}
-        {pendingAction ? (
+        {clarifyOptions ? (
+          <div className="action-row action-row--chips" role="group" aria-label="Choose what Michelle should do">
+            {clarifyOptions.map((opt) => (
+              <button
+                key={opt.intent}
+                type="button"
+                className="action-btn action-btn-cancel"
+                onClick={() => void handleClarify(opt)}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        ) : pendingAction ? (
           <div className="action-row">
             <button type="button" onClick={() => void handleConfirm("confirm")} className="action-btn">
               Confirm
@@ -259,18 +349,57 @@ export function ChatMode({
       ) : null}
 
       <div className="chat-input-area">
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void handleSend();
-          }}
-          placeholder="Ask me anything..."
-          className="chat-input"
-        />
-        <button type="button" onClick={() => void handleSend()} className="chat-send-btn">
-          Send
-        </button>
+        <div className="chat-input-row">
+          <div className="chat-input-shell">
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void handleSend();
+              }}
+              placeholder={micHint ? "" : "Ask me anything..."}
+              className={`chat-input${micHint ? " chat-input--status" : ""}`}
+              id="chat-input"
+              disabled={recording || micBusy}
+              aria-describedby={micHint ? "chat-mic-status" : undefined}
+            />
+            {micHint ? (
+              <span id="chat-mic-status" className="chat-mic-status" aria-live="polite">
+                {micHint}
+              </span>
+            ) : null}
+          </div>
+          {!composer ? (
+            <button
+              type="button"
+              className={`chat-mic-btn ${recording ? "chat-mic-btn--hot" : ""}`}
+              aria-label={recording ? "Stop recording" : "Dictate into chat"}
+              aria-pressed={recording}
+              disabled={micBusy}
+              onClick={() => void handleMic()}
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden
+              >
+                <path d="M12 19v3" />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <rect x="9" y="2" width="6" height="13" rx="3" />
+              </svg>
+            </button>
+          ) : null}
+          <button type="button" onClick={() => void handleSend()} className="chat-send-btn">
+            Send
+          </button>
+        </div>
       </div>
     </div>
   );

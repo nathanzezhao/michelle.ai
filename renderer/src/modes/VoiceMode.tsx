@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { sendChatVoice } from "@/api/michelle";
+import { sendChatVoice, type ChatResponse } from "@/api/michelle";
 import { AiBlob } from "@/components/AiBlob/AiBlob";
 import { useMicCapture } from "@/hooks/useMicCapture";
 import type { VoiceRecordingState } from "@/types/ui";
@@ -7,7 +7,7 @@ import type { VoiceRecordingState } from "@/types/ui";
 type VoiceModeProps = {
   conversationId: string | null;
   userId: string | null;
-  onOpenChat: (lastTranscript?: string, lastAnswer?: string) => void;
+  onOpenChat: (voice?: ChatResponse) => void;
   registerCollapseGuard: (guard: (() => Promise<void> | void) | null) => void;
 };
 
@@ -55,7 +55,7 @@ export function VoiceMode({
         }
         setVoiceState("idle");
         setStatusText(undefined);
-        onOpenChat(data.transcript, data.answer);
+        onOpenChat(data);
       } catch {
         setVoiceState("idle");
         setStatusText("Connection error");

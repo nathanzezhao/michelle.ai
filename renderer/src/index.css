@@ -268,7 +268,8 @@ body.collapsed {
 
 .chat-input-area {
   display: flex;
-  gap: 8px;
+  flex-direction: column;
+  gap: 6px;
   padding-top: 12px;
   margin-top: auto;
   flex-shrink: 0;
@@ -276,8 +277,22 @@ body.collapsed {
   width: 100%;
 }
 
-.chat-input {
+.chat-input-row {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+  align-items: stretch;
+}
+
+.chat-input-shell {
+  position: relative;
   flex: 1;
+  min-width: 0;
+}
+
+.chat-input {
+  width: 100%;
   min-width: 0;
   padding: 10px 14px;
   border-radius: 10px;
@@ -286,6 +301,52 @@ body.collapsed {
   font-size: 13px;
   font-family: "IBM Plex Mono", monospace;
   outline: none;
+}
+
+.chat-input--status {
+  color: transparent;
+  caret-color: transparent;
+}
+
+.chat-mic-status {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  margin: 0;
+  font-size: 13px;
+  font-family: "IBM Plex Mono", monospace;
+  letter-spacing: 0.02em;
+  color: #888;
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-mic-btn {
+  flex-shrink: 0;
+  width: 40px;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  background: white;
+  color: #333;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-mic-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.chat-mic-btn--hot {
+  background: #333;
+  color: whitesmoke;
+  animation: gen-listen 1.2s ease-in-out infinite;
 }
 
 .chat-send-btn {
@@ -521,6 +582,11 @@ body.collapsed {
   gap: 8px;
   max-width: 80%;
   margin-top: -4px;
+}
+
+.action-row--chips {
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 
 .action-btn {

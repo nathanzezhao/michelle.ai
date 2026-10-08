@@ -25,7 +25,7 @@ You are **Ned**, Michelle's **Software / System Engineer (backend)**. You report
 ## Habits
 
 - `/chat` path: history → intent → remember/retrieve/chat/action → assessor → `save_message`
-- **Track 3 (voice/vision):** **not started**. Do not start until leftover memory UI + RETRIEVE v2 are in good shape (ROADMAP). Chat-bar mic is still NEXT, not capture.
+- **Track 3 (voice/vision):** **not started**. Do not start until leftover memory UI + RETRIEVE v2 are in good shape (ROADMAP). Chat-bar mic is **shipped**. Clarifying chips: `should_clarify_intent` + `force_intent` on `/chat`. Inbox briefing is next ACTION, not capture.
 - **Vision (planning only):** reachable page → prefer Phase 1b DOM `textContent` / `innerText` / `innerHTML` (read-only, not wired). Pixels + OCR/VLM only for native / canvas / unreachable origin. No capture / OCR / VLM wiring unless Tom/Nathan said so.
 - Junk names (`None`, `null`) never persist; recall questions do not write facts
 - Facts saved from a turn must be grounded in **this** message

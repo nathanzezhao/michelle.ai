@@ -12,8 +12,6 @@ import re
 import sqlite3
 from pathlib import Path
 
-import httpx
-
 DB_PATH = Path(os.getenv("MICHELLE_DB_PATH", "michelle.db"))
 DOCS_DIR = Path(os.getenv("MICHELLE_DOCS_DIR", "docs"))
 
@@ -244,31 +242,15 @@ def _translate_query(query: str) -> str:
 def _embed_text(text: str) -> list[float] | None:
     if not RETRIEVE_V2:
         return None
-    try:
-        response = httpx.post(
-            f"{OLLAMA_BASE_URL}/api/embeddings",
-            json={"model": EMBED_MODEL, "prompt": text},
-            timeout=8.0,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        embedding = payload.get("embedding")
-        if isinstance(embedding, list) and embedding:
-            return [float(x) for x in embedding]
-    except Exception as exc:
-        print(f"[retrieve] embedding unavailable ({exc}); FTS only")
-    return None
+    from embeddings import embed_text
+
+    return embed_text(text)
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(y * y for y in b) ** 0.5
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
+    from embeddings import cosine
+
+    return cosine(a, b)
 
 
 def _vector_search(query: str, limit: int) -> list[dict]:

@@ -52,7 +52,7 @@ Electron UI (`index.html`, `main.js`) → FastAPI `POST /chat`, `POST /session/s
 
 **Intents today:** CHAT | RETRIEVE | REMEMBER | ACTION.
 
-**Track 3 (voice/vision):** **not started**. Do not start until leftover memory UI + RETRIEVE v2 are in good shape (ROADMAP). Chat-bar mic is still NEXT, not capture.
+**Track 3 (voice/vision):** **not started**. Do not start until leftover memory UI + RETRIEVE v2 are in good shape (ROADMAP). Chat-bar mic is **shipped**. Clarifying chips are in (`engine: "clarify"`). Inbox briefing is the next ACTION. Not capture.
 
 **Vision (planning only):** if the target is a reachable page, prefer Phase 1b DOM `textContent` / `innerText` / `innerHTML` (read-only, not wired). Pixels + OCR/VLM only for native / canvas / unreachable origin. No capture code unless Nathan/Sam open that ticket.
 

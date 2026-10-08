@@ -8,11 +8,24 @@ import httpx
 from google import genai
 
 import actions
+import embeddings
 from actions import ACTION_WHITELIST
 from long_term_memory import is_valid_name
 
 INTENTS = ("CHAT", "RETRIEVE", "REMEMBER", "ACTION")
 PRIORITIES = ("high", "medium", "low")
+
+# Track 2 clarifying chips (ROADMAP): ask only when the LLM classifier is
+# actually on. Rules/mock never pause. Gap is inclusive.
+CLARIFY_CONFIDENCE_BELOW = 0.6
+CLARIFY_CLOSE_GAP = 0.15
+CLARIFY_REPLY = "Which did you mean?"
+CLARIFY_CHIPS = (
+    {"intent": "RETRIEVE", "label": "Look up docs"},
+    {"intent": "REMEMBER", "label": "Remember"},
+    {"intent": "ACTION", "label": "Do this"},
+    {"intent": "CHAT", "label": "Just chat"},
+)
 
 # Only HIGH-priority facts with strong confidence get written.
 # Default is strict so casual chat does not pollute long-term memory.
@@ -51,6 +64,48 @@ def _intent_backend() -> str:
 def _intent_llm_on() -> bool:
     mode = os.getenv("INTENT_MODE", "llm").lower()
     return mode not in ("rules", "mock") and _intent_backend() != "rules"
+
+
+def _score_or_zero(result: dict, key: str) -> float:
+    try:
+        return max(0.0, min(1.0, float(result.get(key, 0) or 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def competing_intent_scores(result: dict) -> list[tuple[str, float]]:
+    """Rank CHAT / RETRIEVE / REMEMBER shelf scores from classify_intent."""
+    scores = {
+        "REMEMBER": _score_or_zero(result, "memory_score"),
+        "RETRIEVE": _score_or_zero(result, "docs_score"),
+        "CHAT": _score_or_zero(result, "chat_score"),
+    }
+    return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def should_clarify_intent(result: dict | None) -> bool:
+    """True when confidence is below 0.6 and the top two shelves are close.
+
+    Does not run in INTENT_MODE=rules/mock. Requires two positive scores.
+    """
+    if not result:
+        return False
+    mode = os.getenv("INTENT_MODE", "llm").lower()
+    if mode in ("rules", "mock"):
+        return False
+    try:
+        confidence = float(result.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence >= CLARIFY_CONFIDENCE_BELOW:
+        return False
+    ranked = competing_intent_scores(result)
+    if len(ranked) < 2:
+        return False
+    top, second = ranked[0][1], ranked[1][1]
+    if top <= 0 or second <= 0:
+        return False
+    return (top - second) <= CLARIFY_CLOSE_GAP
 
 
 # Shared instruction for every follow-up classifier. Rules still win on
@@ -481,7 +536,8 @@ def analyze_action_request(
     finalized = _finalize_action_analysis(raw, text, history, task_context)
     # Pad names are not in THIS utterance — fill after grounding so they
     # are not stripped. Recompute missing_params here.
-    return _fill_from_session_context(finalized, text, session_context)
+    filled = _fill_from_session_context(finalized, text, session_context)
+    return _apply_pad_followup(filled, text, session_context)
 
 
 def _params_dict(value) -> dict:
@@ -664,6 +720,36 @@ def _leftover_resolves_to_app(rest: str) -> str | None:
     )
 
 
+_PAD_JUNK_LEFTOVER_RE = re.compile(
+    r"^(?:(?:please|just)\s+)*(?:try\s+)?(?:again|agian)(?:\s+please)?$"
+    r"|^(?:it\s+)?(?:wasn'?t|was\s+not)$",
+    re.IGNORECASE,
+)
+PAD_FOLLOWUP_MIN_COSINE = 0.55
+PAD_FOLLOWUP_MARGIN = 0.08
+_PAD_LABEL_VEC_CACHE: dict[str, list[float]] = {}
+
+
+def _is_junk_app_leftover(name: str) -> bool:
+    n = (name or "").strip()
+    if not n:
+        return True
+    if n.lower() in {"again", "agian"}:
+        return True
+    return bool(_PAD_JUNK_LEFTOVER_RE.fullmatch(n))
+
+
+def _strip_junk_app_names(names) -> list[str]:
+    out: list[str] = []
+    for raw in names or []:
+        name = str(raw or "").strip()
+        if not name or _is_junk_app_leftover(name):
+            continue
+        if name not in out:
+            out.append(name)
+    return out
+
+
 def _explicit_names_after_pronoun(names) -> list[str]:
     """Keep real apps after it/those; drop unknown leftovers (again, agian)."""
     out: list[str] = []
@@ -702,26 +788,49 @@ def _fill_from_session_context(
     extracted = resolved.get("app_names")
     if not _param_empty(extracted):
         if not found:
-            return analysis
-        explicit = _explicit_names_after_pronoun(
-            extracted if isinstance(extracted, list) else [extracted]
-        )
-        if explicit:
-            out = dict(analysis)
-            resolved["app_names"] = explicit
-            out["resolved_params"] = resolved
+            cleaned = _strip_junk_app_names(
+                extracted if isinstance(extracted, list) else [extracted]
+            )
+            if cleaned:
+                if cleaned != (
+                    extracted if isinstance(extracted, list) else [extracted]
+                ):
+                    out = dict(analysis)
+                    resolved["app_names"] = cleaned
+                    out["resolved_params"] = resolved
+                    required = ACTION_WHITELIST[action_type]["required_params"]
+                    out["missing_params"] = [
+                        p for p in required if _param_empty(resolved.get(p))
+                    ]
+                    return out
+                return analysis
+            resolved.pop("app_names", None)
+            analysis = dict(analysis)
+            analysis["resolved_params"] = resolved
             required = ACTION_WHITELIST[action_type]["required_params"]
-            out["missing_params"] = [
+            analysis["missing_params"] = [
                 p for p in required if _param_empty(resolved.get(p))
             ]
-            return out
-        resolved.pop("app_names", None)
-        analysis = dict(analysis)
-        analysis["resolved_params"] = resolved
-        required = ACTION_WHITELIST[action_type]["required_params"]
-        analysis["missing_params"] = [
-            p for p in required if _param_empty(resolved.get(p))
-        ]
+        else:
+            explicit = _explicit_names_after_pronoun(
+                extracted if isinstance(extracted, list) else [extracted]
+            )
+            if explicit:
+                out = dict(analysis)
+                resolved["app_names"] = explicit
+                out["resolved_params"] = resolved
+                required = ACTION_WHITELIST[action_type]["required_params"]
+                out["missing_params"] = [
+                    p for p in required if _param_empty(resolved.get(p))
+                ]
+                return out
+            resolved.pop("app_names", None)
+            analysis = dict(analysis)
+            analysis["resolved_params"] = resolved
+            required = ACTION_WHITELIST[action_type]["required_params"]
+            analysis["missing_params"] = [
+                p for p in required if _param_empty(resolved.get(p))
+            ]
     last_names = [
         str(item).strip()
         for item in (session_context.get("last_app_names") or [])
@@ -744,6 +853,232 @@ def _fill_from_session_context(
     out["resolved_params"] = resolved
     required = ACTION_WHITELIST[action_type]["required_params"]
     out["missing_params"] = [p for p in required if _param_empty(resolved.get(p))]
+    return out
+
+
+def _clean_pad_names(raw) -> list[str]:
+    names: list[str] = []
+    for item in raw or []:
+        name = str(item or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _pad_names_for_action(action_type: str, pad: dict) -> list[str]:
+    if action_type == "close_app":
+        return _clean_pad_names(pad.get("last_closed")) or _clean_pad_names(
+            pad.get("last_app_names")
+        )
+    if action_type == "quit_app":
+        return _clean_pad_names(pad.get("last_quit")) or _clean_pad_names(
+            pad.get("last_app_names")
+        )
+    if action_type == "open_app":
+        return _clean_pad_names(pad.get("last_opened")) or _clean_pad_names(
+            pad.get("last_app_names")
+        )
+    return _clean_pad_names(pad.get("last_app_names"))
+
+
+def _utterance_action_type(text: str) -> str | None:
+    stripped = (text or "").strip()
+    if _ACTION_QUIT_RE.match(stripped):
+        return "quit_app"
+    if _ACTION_CLOSE_RE.match(stripped):
+        return "close_app"
+    if _ACTION_OPEN_RE.match(stripped):
+        return "open_app"
+    return None
+
+
+_PAD_PRONOUN_STRIP_RE = re.compile(
+    r"\b(?:it|that|those|them|these)\b", re.IGNORECASE
+)
+
+
+def _utterance_app_leftover(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped:
+        return ""
+    for extractor in (
+        _QUIT_APP_EXTRACT_RE,
+        _CLOSE_APP_EXTRACT_RE,
+        _OPEN_APP_EXTRACT_RE,
+    ):
+        match = extractor.match(stripped)
+        if match and match.lastindex:
+            stripped = (match.group(1) or "").strip()
+            break
+    leftover = _PAD_PRONOUN_STRIP_RE.sub(" ", stripped)
+    leftover = re.sub(r"\s+", " ", leftover).strip()
+    if _is_junk_app_leftover(leftover):
+        return ""
+    return leftover
+
+
+def _utterance_catalog_hit(text: str) -> str | None:
+    leftover = _utterance_app_leftover(text)
+    if not leftover:
+        return None
+    return _leftover_resolves_to_app(leftover)
+
+
+def _pad_state_label_groups(names: list[str]) -> list[tuple[str, list[str]]]:
+    joined = " and ".join(names)
+    return [
+        (
+            "quit_app",
+            [f"retry quitting {joined}", f"{joined} is already quit"],
+        ),
+        (
+            "close_app",
+            [f"retry closing {joined}", f"{joined} is already closed"],
+        ),
+        (
+            "open_app",
+            [f"open {joined}", f"retry opening {joined}"],
+        ),
+        ("CHAT", ["unrelated chat", "hello", "what's for lunch"]),
+    ]
+
+
+def _embed_pad_label(text: str) -> list[float] | None:
+    cached = _PAD_LABEL_VEC_CACHE.get(text)
+    if cached is not None:
+        return cached
+    vec = embeddings.embed_text(text)
+    if vec is not None:
+        _PAD_LABEL_VEC_CACHE[text] = vec
+    return vec
+
+
+def _score_pad_followup(
+    text: str,
+    names: list[str],
+    last_type: str,
+    explicit: str | None = None,
+) -> str | None:
+    query_vec = embeddings.embed_text(text)
+    if query_vec is None:
+        return None
+    by_kind = {kind: labels for kind, labels in _pad_state_label_groups(names)}
+    kinds = [last_type, "CHAT"]
+    if explicit and explicit not in kinds:
+        kinds.insert(0, explicit)
+    scored: list[tuple[float, str]] = []
+    for kind in kinds:
+        labels = by_kind.get(kind) or []
+        if not labels:
+            continue
+        best = 0.0
+        for label in labels:
+            vec = _embed_pad_label(label)
+            if vec is None:
+                return None
+            best = max(best, embeddings.cosine(query_vec, vec))
+        scored.append((best, kind))
+    if not scored:
+        return None
+    scored.sort(key=lambda row: row[0], reverse=True)
+    top_score, top_kind = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    if top_score < PAD_FOLLOWUP_MIN_COSINE:
+        return None
+    if top_score - second < PAD_FOLLOWUP_MARGIN:
+        return None
+    return top_kind
+
+
+def resolve_pad_followup(
+    text: str,
+    pad: Optional[dict],
+    analysis: Optional[dict] = None,
+) -> dict | None:
+    """Bind pad apps from meaning vs pad-state labels. Miss stays unbound.
+
+    Catalog leftovers win. Embed None / weak / tie → no bind. Two pad names
+    do not collapse to one. last_draft is never used.
+    """
+    if not isinstance(pad, dict):
+        return None
+    last_type = str(pad.get("last_action_type") or "").strip()
+    if last_type not in ("open_app", "close_app", "quit_app"):
+        return None
+    pad_names = (
+        _clean_pad_names(pad.get("last_app_names"))
+        or _clean_pad_names(pad.get("last_quit"))
+        or _clean_pad_names(pad.get("last_closed"))
+        or _clean_pad_names(pad.get("last_opened"))
+    )
+    if not pad_names:
+        return None
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    if _ACTION_EMAIL_RE.match(stripped) or _looks_like_resume_draft(stripped):
+        return None
+    if _utterance_catalog_hit(stripped):
+        return None
+    analysis = analysis if isinstance(analysis, dict) else {}
+    action_type = str(analysis.get("action_type") or "").strip().lower()
+    if action_type == "send_email":
+        return None
+    existing = _strip_junk_app_names(
+        _params_dict(analysis.get("resolved_params")).get("app_names")
+    )
+    if existing:
+        return None
+    explicit = _utterance_action_type(stripped)
+    scored = _score_pad_followup(stripped, pad_names, last_type, explicit)
+    if not scored or scored == "CHAT":
+        return None
+    bind_type = explicit or scored
+    if bind_type not in ("open_app", "close_app", "quit_app"):
+        return None
+    names = _pad_names_for_action(bind_type, pad)
+    if len(names) != 1:
+        return {"action_type": bind_type, "app_names": None}
+    return {"action_type": bind_type, "app_names": names}
+
+
+def maybe_promote_pad_followup(
+    intent: str,
+    text: str,
+    pad: Optional[dict],
+    open_action: Optional[dict] = None,
+) -> str:
+    """CHAT→ACTION only. Never flip RETRIEVE/REMEMBER. Skip PENDING Confirm."""
+    if intent != "CHAT":
+        return intent
+    if open_action and str(open_action.get("status") or "") == "PENDING":
+        return intent
+    hit = resolve_pad_followup(text, pad)
+    if not hit:
+        return intent
+    print("intent_promoted=ACTION (pad follow-up)")
+    return "ACTION"
+
+
+def _apply_pad_followup(
+    analysis: dict, text: str, pad: Optional[dict]
+) -> dict:
+    hit = resolve_pad_followup(text, pad, analysis)
+    if not hit:
+        return analysis
+    bind_type = hit["action_type"]
+    out = dict(analysis)
+    out["action_type"] = bind_type
+    resolved = dict(_params_dict(out.get("resolved_params")))
+    names = hit.get("app_names")
+    if names:
+        resolved["app_names"] = list(names)
+    else:
+        resolved.pop("app_names", None)
+    required = ACTION_WHITELIST[bind_type]["required_params"]
+    out["resolved_params"] = resolved
+    out["missing_params"] = [p for p in required if _param_empty(resolved.get(p))]
+    out["related"] = True
     return out
 
 

@@ -1272,6 +1272,162 @@ def test_history_for_reply_omits_action_residue_on_greeting():
     assert "nice, indigo is a good one" in contents
 
 
+def _stub_pad_embed(text: str):
+    """Tiny 3-d stand-in: retry-quit / open / close / unrelated. No Ollama."""
+    t = (text or "").lower()
+    if any(
+        bit in t
+        for bit in (
+            "unrelated chat",
+            "hello",
+            "what's for lunch",
+            "whats for lunch",
+        )
+    ):
+        return [0.0, 0.0, 1.0]
+    if "clos" in t:
+        return [0.0, 0.5, 0.5]
+    if (
+        t.strip() in {"open it", "open"}
+        or t.startswith("open ")
+        or "open calendar" in t
+        or "opening" in t
+    ):
+        return [0.0, 1.0, 0.0]
+    if any(
+        bit in t
+        for bit in (
+            "try again",
+            "wasn't",
+            "wasnt",
+            "retry quitting",
+            "already quit",
+            "quit",
+        )
+    ):
+        return [1.0, 0.0, 0.0]
+    return [0.0, 0.0, 1.0]
+
+
+def _calendar_quit_pad():
+    return {
+        "last_quit": ["Calendar"],
+        "last_app_names": ["Calendar"],
+        "last_action_type": "quit_app",
+        "last_opened": [],
+        "last_closed": [],
+    }
+
+
+def test_try_again_binds_pad_quit_calendar(monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Calendar"])
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: ["Calendar"])
+    out = analyze_action_request("try again", session_context=_calendar_quit_pad())
+    assert out["action_type"] == "quit_app"
+    assert out["resolved_params"]["app_names"] == ["Calendar"]
+    assert "try again" not in [n.lower() for n in out["resolved_params"]["app_names"]]
+
+
+def test_it_wasnt_binds_pad_quit_calendar_not_try_again(monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Calendar"])
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: ["Calendar"])
+    out = analyze_action_request("it wasn't", session_context=_calendar_quit_pad())
+    assert out["action_type"] == "quit_app"
+    assert out["resolved_params"]["app_names"] == ["Calendar"]
+
+
+def test_open_it_after_quit_pad_is_open_not_quit(monkeypatch):
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Calendar"])
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: ["Calendar"])
+    out = analyze_action_request("open it", session_context=_calendar_quit_pad())
+    assert out["action_type"] == "open_app"
+    assert out["resolved_params"]["app_names"] == ["Calendar"]
+
+
+def test_hello_does_not_bind_pad_quit(monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    out = analyze_action_request("hello", session_context=_calendar_quit_pad())
+    names = [n.lower() for n in (out.get("resolved_params") or {}).get("app_names") or []]
+    assert "calendar" not in names
+    assert out.get("action_type") not in ("quit_app", "open_app", "close_app") or (
+        out.get("missing_params") and "app_names" in (out.get("missing_params") or [])
+    )
+
+
+def test_catalog_hit_safari_stays_safari_not_pad(monkeypatch):
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Safari", "Calendar"])
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: ["Safari", "Calendar"])
+    out = analyze_action_request(
+        "quit Safari", session_context=_calendar_quit_pad()
+    )
+    assert out["action_type"] == "quit_app"
+    assert out["resolved_params"]["app_names"] == ["Safari"]
+
+
+def test_two_pad_apps_try_again_does_not_guess(monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    pad = {
+        "last_quit": ["Calendar", "Notes"],
+        "last_app_names": ["Calendar", "Notes"],
+        "last_action_type": "quit_app",
+        "last_opened": [],
+        "last_closed": [],
+    }
+    out = analyze_action_request("try again", session_context=pad)
+    names = (out.get("resolved_params") or {}).get("app_names") or []
+    assert names != ["Calendar"]
+    assert "app_names" in (out.get("missing_params") or []) or not names
+
+
+def test_embed_none_does_not_bind_pad(monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", lambda _t: None)
+    out = analyze_action_request("try again", session_context=_calendar_quit_pad())
+    names = [n.lower() for n in (out.get("resolved_params") or {}).get("app_names") or []]
+    assert "calendar" not in names
+
+
+def test_retrieve_v2_embed_stays_gated():
+    assert retrieve.RETRIEVE_V2 is False
+    assert retrieve._embed_text("try again") is None
+
+
+def test_embeddings_cosine_helper():
+    import embeddings
+
+    assert embeddings.cosine([1.0, 0.0], [1.0, 0.0]) == 1.0
+    assert embeddings.cosine([1.0, 0.0], [0.0, 1.0]) == 0.0
+    assert embeddings.embed_text("") is None
+
+
+def test_maybe_promote_pad_followup_chat_only(monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    pad = _calendar_quit_pad()
+    assert intent.maybe_promote_pad_followup("CHAT", "try again", pad) == "ACTION"
+    assert intent.maybe_promote_pad_followup("CHAT", "hello", pad) == "CHAT"
+    assert intent.maybe_promote_pad_followup("CHAT", "try again", None) == "CHAT"
+    assert intent.maybe_promote_pad_followup("RETRIEVE", "try again", pad) == "RETRIEVE"
+    assert intent.maybe_promote_pad_followup("REMEMBER", "try again", pad) == "REMEMBER"
+    pending = {"status": "PENDING", "action_type": "quit_app"}
+    assert (
+        intent.maybe_promote_pad_followup("CHAT", "try again", pad, open_action=pending)
+        == "CHAT"
+    )
+
+
 def test_history_for_reply_keeps_action_when_this_turn_is_an_order():
     from llm import history_for_reply
 

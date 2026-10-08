@@ -58,6 +58,9 @@ def deterministic_env(monkeypatch):
     so no module reload is needed."""
     monkeypatch.setenv("LLM_PROVIDER", "mock")
     monkeypatch.setenv("INTENT_MODE", "rules")
+    import intent
+
+    intent._PAD_LABEL_VEC_CACHE.clear()
 
 
 @pytest.fixture

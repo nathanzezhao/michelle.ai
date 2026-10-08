@@ -1336,10 +1336,17 @@ def test_is_junk_transcript_gates_silence_and_thanks():
     assert whisper.is_junk_transcript("")
     assert whisper.is_junk_transcript(".")
     assert whisper.is_junk_transcript("thank you")
-    assert whisper.is_junk_transcript("hi there")  # < 4 words
+    assert whisper.is_junk_transcript("hi there")  # email tap: < 4 words
+    assert whisper.is_junk_transcript("open Notes")  # email tap: 2 words
     assert not whisper.is_junk_transcript(
         "Please let Alex know I will be late to dinner."
     )
+
+
+def test_is_junk_transcript_chat_allows_short_commands():
+    assert whisper.is_junk_transcript("open Notes", strict=False) is False
+    assert whisper.is_junk_transcript("thank you", strict=False) is True
+    assert whisper.is_junk_transcript("", strict=False) is True
 
 
 def test_transcribe_wav_missing_never_invents_text(monkeypatch):
@@ -2484,3 +2491,243 @@ def test_ambiguous_draft_pick_survives_on_pad(client, ids, fake_composio):
     assert session_context.get(ids["user_id"], ids["conversation_id"])[
         "last_draft_pick"
     ] is None
+
+
+# --- Pad follow-ups (try again / it wasn't) ----------------------------------
+
+
+def _stub_pad_embed(text: str):
+    t = (text or "").lower()
+    if any(
+        bit in t
+        for bit in (
+            "unrelated chat",
+            "hello",
+            "what's for lunch",
+            "whats for lunch",
+        )
+    ):
+        return [0.0, 0.0, 1.0]
+    if "clos" in t:
+        return [0.0, 0.5, 0.5]
+    if (
+        t.strip() in {"open it", "open"}
+        or t.startswith("open ")
+        or "open calendar" in t
+        or "opening" in t
+    ):
+        return [0.0, 1.0, 0.0]
+    if any(
+        bit in t
+        for bit in (
+            "try again",
+            "wasn't",
+            "wasnt",
+            "retry quitting",
+            "already quit",
+            "quit",
+        )
+    ):
+        return [1.0, 0.0, 0.0]
+    return [0.0, 0.0, 1.0]
+
+
+def _enable_calendar(fake_open, monkeypatch, running=True):
+    names = ["Notes", "Safari", "Calendar"]
+    fake_open.running = list(names if running else ["Notes", "Safari"])
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: names)
+
+
+def _quit_calendar(client, ids, fake_open, monkeypatch, *, running=True, confirm_it=True):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    _enable_calendar(fake_open, monkeypatch, running=running)
+    body = chat(client, "quit Calendar", ids)
+    assert body["action_type"] == "quit_app"
+    if not confirm_it:
+        return body
+    assert body["confirm_required"] is True
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    return out
+
+
+def test_quit_calendar_then_try_again_json_app_names_calendar(
+    client, ids, fake_open, monkeypatch
+):
+    import embeddings
+
+    _quit_calendar(client, ids, fake_open, monkeypatch, running=True)
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    fake_open.running = ["Notes", "Safari", "Calendar"]
+    body = chat(client, "try again", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["resolved_params"]["app_names"] == ["Calendar"]
+    assert "try again" not in str(body.get("resolved_params") or {}).lower()
+
+
+def test_quit_calendar_already_quit_then_try_again_json_app_names_calendar(
+    client, ids, fake_open, monkeypatch
+):
+    import embeddings
+
+    _quit_calendar(client, ids, fake_open, monkeypatch, running=False)
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    body = chat(client, "try again", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["resolved_params"]["app_names"] == ["Calendar"]
+
+
+def test_quit_calendar_then_it_wasnt_json_app_names_calendar_not_try_again(
+    client, ids, fake_open, monkeypatch
+):
+    import embeddings
+
+    _quit_calendar(client, ids, fake_open, monkeypatch, running=True)
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    fake_open.running = ["Notes", "Safari", "Calendar"]
+    body = chat(client, "it wasn't", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["resolved_params"]["app_names"] == ["Calendar"]
+    names = [n.lower() for n in body["resolved_params"]["app_names"]]
+    assert "try again" not in names
+    assert "wasn't" not in names
+    assert "wasnt" not in names
+
+
+def test_catalog_hit_safari_stays_safari_not_pad(client, ids, fake_open, monkeypatch):
+    import embeddings
+
+    _quit_calendar(client, ids, fake_open, monkeypatch, running=True)
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    fake_open.running = ["Notes", "Safari", "Calendar"]
+    monkeypatch.setattr(
+        actions, "_list_installed_app_names", lambda: ["Notes", "Safari", "Calendar"]
+    )
+    body = chat(client, "quit Safari", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "quit_app"
+    assert body["resolved_params"]["app_names"] == ["Safari"]
+
+
+def test_chat_try_again_with_pad_is_action(client, ids, fake_open, monkeypatch):
+    import embeddings
+
+    _quit_calendar(client, ids, fake_open, monkeypatch, running=True)
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    body = chat(client, "try again", ids)
+    assert body["engine"] == "action"
+    assert body["intent"] == "ACTION"
+
+
+def test_chat_try_again_without_pad_stays_chat(client, ids, monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    body = chat(client, "try again", ids)
+    assert body["engine"] == "chat"
+    assert body.get("action_type") != "quit_app"
+
+
+def test_embeddings_mocked_in_pytest_no_ollama_nomic(client, ids, fake_open, monkeypatch):
+    import embeddings
+    import httpx
+
+    hits = []
+
+    def boom(*_a, **_k):
+        hits.append(True)
+        raise AssertionError("live ollama embeddings")
+
+    monkeypatch.setattr(httpx, "post", boom)
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    _quit_calendar(client, ids, fake_open, monkeypatch, running=True)
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    chat(client, "try again", ids)
+    assert hits == []
+    assert retrieve_v2_still_off()
+
+
+def retrieve_v2_still_off():
+    import retrieve
+
+    return retrieve.RETRIEVE_V2 is False or retrieve.RETRIEVE_V2 == 0
+
+
+def test_try_again_reuses_last_action_type_quit_not_open(
+    client, ids, fake_open, monkeypatch
+):
+    import embeddings
+
+    _quit_calendar(client, ids, fake_open, monkeypatch, running=True)
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    body = chat(client, "try again", ids)
+    assert body["action_type"] == "quit_app"
+    assert body["action_type"] != "open_app"
+
+
+def test_two_pad_apps_try_again_does_not_guess(client, ids, fake_open, monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    fake_open.running = ["Notes", "Safari", "Calendar"]
+    monkeypatch.setattr(
+        actions, "_list_installed_app_names", lambda: ["Notes", "Safari", "Calendar"]
+    )
+    first = chat(client, "quit Calendar and Notes", ids)
+    assert first["confirm_required"] is True
+    confirm(client, ids, first["task_id"], "confirm")
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    body = chat(client, "try again", ids)
+    names = (body.get("resolved_params") or {}).get("app_names") or []
+    assert names != ["Calendar"]
+    assert body.get("engine") != "action" or body.get("task_status") == "AWAITING_INPUT" or (
+        "app_names" in (body.get("missing_params") or [])
+    )
+
+
+def test_open_it_after_quit_calendar_is_open(client, ids, fake_open, monkeypatch):
+    _quit_calendar(client, ids, fake_open, monkeypatch, running=True)
+    fake_open.running = ["Notes", "Safari"]
+    monkeypatch.setattr(
+        actions, "_list_installed_app_names", lambda: ["Notes", "Safari", "Calendar"]
+    )
+    body = chat(client, "open it", ids)
+    assert body["engine"] == "action"
+    assert body["action_type"] == "open_app"
+    assert body["resolved_params"]["app_names"] == ["Calendar"]
+
+
+def test_embed_none_try_again_stays_chat(client, ids, fake_open, monkeypatch):
+    import embeddings
+
+    _quit_calendar(client, ids, fake_open, monkeypatch, running=True)
+    monkeypatch.setattr(embeddings, "embed_text", lambda _t: None)
+    body = chat(client, "try again", ids)
+    assert body["engine"] == "chat"
+    assert body.get("action_type") != "quit_app"
+
+
+def test_pending_confirm_it_wasnt_does_not_spawn_second_quit(
+    client, ids, fake_open, monkeypatch
+):
+    import embeddings
+
+    first = _quit_calendar(
+        client, ids, fake_open, monkeypatch, running=True, confirm_it=False
+    )
+    monkeypatch.setattr(embeddings, "embed_text", _stub_pad_embed)
+    assert first["task_status"] == "PENDING"
+    out = chat(client, "it wasn't", ids)
+    quit_rows = [r for r in action_rows(ids) if r["action_type"] == "quit_app"]
+    assert len(quit_rows) == 1
+    names = []
+    for row in quit_rows:
+        params = json.loads(row["payload_json"]).get("resolved_params") or {}
+        names.extend(str(n).lower() for n in (params.get("app_names") or []))
+    assert "try again" not in names
+    assert out.get("task_id") in (None, first["task_id"]) or out.get("engine") != "action"

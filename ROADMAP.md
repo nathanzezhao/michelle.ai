@@ -2,7 +2,7 @@
 
 Reference doc for what's done, what's next, and what's planned later.
 
-**Build order:** Memory + ACTION v1 are in. **Voice UI (three modes, blob default)** is in via Vite/React renderer ([SPEC-VOICE-UI.md](SPEC-VOICE-UI.md)). **Chat voice backend** (`POST /chat/voice`) is wired. Next: chat-bar microphone, then **inbox briefing** (consented Gmail read), then screen capture / vision. Do not call inbox briefing “scraping.”
+**Build order:** Memory + ACTION v1 are in. **Voice UI (three modes, blob default)** is in via Vite/React renderer ([SPEC-VOICE-UI.md](SPEC-VOICE-UI.md)). **Chat voice backend** (`POST /chat/voice`) is wired. **Track 2 remainder (Nathan 2026-09-30):** chat-bar mic → clarifying chips → inbox briefing (LLM intent, not a chip) → evaluator miss → one diagnostic follow-up → more actions. Park SSE, escalation, and auth/hardening. Then screen capture / vision. Do not call inbox briefing “scraping.”
 
 **Screen capture source doc:** `/Users/nathan/Downloads/desktop_ai_agent_roadmap_screencapture.pdf`
 
@@ -77,14 +77,14 @@ main.py → memory.py (last N turns + long-term facts)
 
 From the original Michelle architecture (intent router → RAG → agents):
 
-- [ ] **Chat-bar microphone (NEXT)** — see [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md). Transcribe first, then the same `/chat` path as typing (session_context + classify). Email composer tap stays isolated.
+- [x] **Chat-bar microphone** — see [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md). Tap/tap. `[input] [mic] [Send]`. Hide mic while email composer is open. Header Voice blob stays. Transcript fills the input; user hits Send (does **not** auto-run `/chat`). Email composer tap stays isolated.
 - [x] **Intent includes ACTION** — fourth live label; `INTENT_MODE=llm` uses Ollama/Gemini (rules fallback)
-- [ ] **Intent clarifying questions** — use classifier confidence when she's unsure of the route
+- [ ] **Intent clarifying questions** — if `confidence < 0.6` and top two labels are close: chips (Look up docs / Remember / Do this / Just chat). Do not run ACTION/RETRIEVE until tap. Rules/mock never ask. `force_intent` on `/chat` re-runs the same utterance. Close = shelf-score gap ≤ 0.15.
 - [x] **RETRIEVE v1** — local `docs/` ingest + SQLite FTS5 + grounded answers (sample KB included)
 - [x] **RETRIEVE v2 (baseline)** — query translator + optional Ollama embeddings hybrid behind `retrieve.search()` (`RETRIEVE_V2=1`)
 - [x] **ACTION v1** — `open_app` + `send_email` (Composio), Confirm/Cancel, composer UI, `actions_log`
-- [ ] **Inbox briefing (after chat-bar mic)** — consented Gmail **read** of recent inbox mail; morning catch-up. Not HTML scrape. See below.
-- [ ] **More actions** — quit apps, calendar, Slack, etc. Still whitelist + risk tiers in code, never LLM-judged. Inbox briefing is the first named extra ACTION; do not bury it here.
+- [ ] **Inbox briefing (after clarifying)** — consented Gmail **read**. Trigger is **LLM intent** (same classifier/ACTION analyzer as typing or spoken-then-Send), not a greeting chip and not auto on launch. Cap: last 24h, max 15, one page. See below.
+- [ ] **More actions** — quit apps, calendar, Slack, etc. Still whitelist + risk tiers in code, never LLM-judged. `quit_app` / `close_app` already exist in the whitelist — do not rebuild them as “new.” Inbox briefing is the first **new** extra ACTION.
 
 ### Inbox briefing (Track 2 ACTION — not started)
 
@@ -95,8 +95,8 @@ From the original Michelle architecture (intent router → RAG → agents):
 **Why a new ACTION:** Composio Gmail today is send + drafts only (`GMAIL_SEND_EMAIL`, draft CRUD, `GMAIL_LIST_DRAFTS`). Drafts are outbound. Inbox list/read is a new whitelist type (e.g. `brief_inbox` / `summarize_inbox`), new tool, likely new Gmail readonly scopes (reconnect). `ComposioExecutor.execute` currently runs `send_email` only.
 
 **MVP (done-when):**
-- Explicit trigger only (utterance “catch me up” / “summarize my inbox”, and/or a **tap** chip after greeting — **not** auto-fetch on launch). Trigger A/B/C still open (see Ask Nathan).
-- Cap: last ~12–24h **or** last N messages, one page, no pagination crawl. From + subject + one-liner each, then a short summary. Truncate; no MIME dump, no attachments.
+- **LLM intent** — `classify_intent` / ACTION analyzer maps meaning to the briefing ACTION. No greeting chip. No auto-fetch on launch. Chat-bar does not auto-Send; they must press Send after dictation.
+- **Cap:** last 24h, max 15, one page. From + subject + one-liner each, then a short summary. Truncate; no MIME dump, no attachments.
 - `/session/start` still greets / asks name; window still starts empty of old bubbles. Briefing must not replace the name ask.
 - Honest fail if Gmail isn’t connected (`composio_not_connected` + Connect Link), empty inbox, or list error — never a fake briefing.
 - `actions_log` every fetch. Memory assessor must **not** write inbox into `long_term_facts`. Do not store raw bodies in the DB.
@@ -104,10 +104,18 @@ From the original Michelle architecture (intent router → RAG → agents):
 
 **Out of scope (10-star / later):** thread graphs, auto-replies, labels/search, calendar/Slack, full bodies in UI, reply-from-briefing, every-launch auto-fetch, Gmail HTML / DOM scrape, Track 3 vision.
 
-**Ask Nathan (open):**
-- **(C)** only on “catch me up” (Sam/Ray default for v1)
-- **(A)** “Catch me up?” chip after greeting; fetch only on tap
-- **(B)** ask once, then auto-brief on later launches — **parked** until Ray has a pass; not silent `/session/start`
+**Ask Nathan (locked 2026-09-30):**
+- **Trigger:** LLM intent — `classify_intent` / ACTION analyzer maps meaning to `brief_inbox` (or the whitelist name we ship). No greeting chip. No silent `/session/start` auto-read. Spoken catch-up works only after the user Sends the transcript (chat-bar does not auto-submit).
+- **Cap:** last 24 hours, max 15 messages, one page. From + subject + one-liner, then 3–5 bullets.
+- **(A)/(B)/(C) chips:** not used. (B) auto-brief remains parked.
+
+**Also locked (same day):**
+- Mic: tap/tap; `[input] [mic] [Send]`; keep header blob; hide chat-row mic when composer is open.
+- Transcript: fill the input and wait for Send (overrides SPEC §4 bubble-then-auto-`/chat` for the **chat bar only**; Voice blob still uses `POST /chat/voice`).
+- Chat/blob junk: empty + too-short **audio** + “thank you” hallucinations. Email tap keeps the 4-word / 12-char gate.
+- Clarifying: chips at confidence below 0.6 when top two are close.
+- SSE and production auth/rate-limits: **parked** this track. Keep scramble.
+- Whisper: same `base` / `int8` as email tap. No cloud STT.
 
 - [ ] **Evaluator loop** — Don't hallucinate when retrieval fails; structured "not found" behavior
 - [ ] **Diagnostic agent** — Identify knowledge gaps, ask targeted follow-ups

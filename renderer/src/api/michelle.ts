@@ -13,6 +13,11 @@ export type SessionStartResponse = {
   task_id?: string;
 };
 
+export type ClarifyOption = {
+  intent: "CHAT" | "RETRIEVE" | "REMEMBER" | "ACTION";
+  label: string;
+};
+
 export type ChatResponse = {
   answer: string;
   conversation_id?: string;
@@ -28,6 +33,7 @@ export type ChatResponse = {
   missing_params?: string[];
   error?: string;
   transcript?: string;
+  clarify_options?: ClarifyOption[];
 };
 
 export type ComposerDraft = {
@@ -68,12 +74,18 @@ export async function fetchHistory(
 export async function sendChat(
   text: string,
   conversationId: string | null,
-  userId: string | null
+  userId: string | null,
+  forceIntent?: ClarifyOption["intent"]
 ): Promise<ChatResponse> {
   const r = await fetch(`${BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, conversation_id: conversationId, user_id: userId }),
+    body: JSON.stringify({
+      text,
+      conversation_id: conversationId,
+      user_id: userId,
+      ...(forceIntent ? { force_intent: forceIntent } : {}),
+    }),
   });
   return r.json();
 }
@@ -88,6 +100,19 @@ export async function sendChatVoice(
   if (conversationId) form.append("conversation_id", conversationId);
   if (userId) form.append("user_id", userId);
   const r = await fetch(`${BASE}/chat/voice`, { method: "POST", body: form });
+  return r.json();
+}
+
+export async function transcribeChatAudio(
+  audio: Blob,
+  conversationId: string | null,
+  userId: string | null
+): Promise<ChatResponse> {
+  const form = new FormData();
+  form.append("audio", audio, "voice.wav");
+  if (conversationId) form.append("conversation_id", conversationId);
+  if (userId) form.append("user_id", userId);
+  const r = await fetch(`${BASE}/chat/transcribe`, { method: "POST", body: form });
   return r.json();
 }
 

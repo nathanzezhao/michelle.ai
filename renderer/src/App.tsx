@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { startSession, isOpenEmailComposer, type HistoryMessage } from "@/api/michelle";
+import { startSession, isOpenEmailComposer, type ChatResponse, type HistoryMessage } from "@/api/michelle";
 import type { ComposerFields } from "@/components/EmailComposer/EmailComposer";
 import { AudioLinesIcon } from "@/components/icons/AudioLinesIcon";
 import { MessagesCircleIcon } from "@/components/icons/MessagesCircleIcon";
@@ -77,18 +77,28 @@ export function App() {
   }, []);
 
   const openChat = useCallback(
-    (transcript?: string, answer?: string) => {
-      if (transcript && answer) {
+    (voice?: ChatResponse) => {
+      if (voice?.conversation_id) persistConversation(voice.conversation_id);
+      if (voice?.user_id) persistUser(voice.user_id);
+      if (voice?.transcript && voice?.answer) {
         setSeedMessages([
-          { role: "user", content: transcript },
-          { role: "assistant", content: answer },
+          { role: "user", content: voice.transcript },
+          { role: "assistant", content: voice.answer },
         ]);
-      } else {
+      } else if (!voice) {
         setSeedMessages(undefined);
+      }
+      if (voice && isOpenEmailComposer(voice)) {
+        const resolved = voice.resolved_params || {};
+        setRestoredComposer({
+          recipient: resolved.recipient || "",
+          subject: resolved.subject || "",
+          body: resolved.body || "",
+        });
       }
       void crossfadeTo("chat");
     },
-    [crossfadeTo]
+    [crossfadeTo, persistConversation, persistUser]
   );
 
   const openVoice = useCallback(() => {

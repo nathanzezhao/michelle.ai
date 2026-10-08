@@ -18,10 +18,15 @@ from intent import (
     classify_composer_dismiss,
     classify_intent,
     classify_memory_confirmation,
+    maybe_promote_pad_followup,
     maybe_promote_to_remember,
     mixed_chat_warrants_reply,
     parse_mixed_utterance,
+    should_clarify_intent,
     usable_memory_facts,
+    CLARIFY_CHIPS,
+    CLARIFY_REPLY,
+    INTENTS,
     _ACTION_CLOSE_RE,
     _ACTION_OPEN_RE,
     _ACTION_QUIT_RE,
@@ -74,6 +79,7 @@ class UserMessage(BaseModel):
     conversation_id: Optional[str] = None
     user_id: Optional[str] = None
     attachments: Optional[List[str]] = None
+    force_intent: Optional[str] = None
 
 
 class DraftBodyRequest(BaseModel):
@@ -116,6 +122,22 @@ class ActionDecision(BaseModel):
     decision: str
     conversation_id: Optional[str] = None
     user_id: Optional[str] = None
+
+
+def _last_user_content(history: list) -> str:
+    for row in reversed(history or []):
+        if (row.get("role") or "") == "user":
+            return row.get("content") or ""
+    return ""
+
+
+def _forced_intent(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    intent = str(value).strip().upper()
+    if intent in INTENTS:
+        return intent
+    return None
 
 
 def _valid_uuid(value: Optional[str]) -> str:
@@ -965,7 +987,7 @@ async def chat_voice(
             "engine": "chat",
         }
 
-    if whisper.is_junk_transcript(transcript):
+    if whisper.is_junk_transcript(transcript, strict=False):
         return {
             "error": "heard_nothing",
             "transcript": (transcript or "").strip() or None,
@@ -986,6 +1008,40 @@ async def chat_voice(
     if isinstance(result, dict):
         result = {**result, "transcript": text}
     return result
+
+
+@app.post("/chat/transcribe")
+async def chat_transcribe(
+    audio: UploadFile = File(...),
+    conversation_id: Optional[str] = Form(None),
+    user_id: Optional[str] = Form(None),
+):
+    """Chat-bar dictation: Whisper only. Does not call handle_chat or save a turn."""
+    ids = {
+        "conversation_id": _valid_uuid(conversation_id),
+        "user_id": _valid_uuid(user_id),
+        "engine": "chat",
+        "answer": "",
+    }
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        return {**ids, "error": "heard_nothing"}
+
+    duration = whisper.wav_duration_seconds(audio_bytes)
+    if duration < whisper.MIN_AUDIO_SECONDS:
+        return {**ids, "error": "heard_nothing"}
+
+    try:
+        transcript = whisper.transcribe_wav(audio_bytes)
+    except whisper.WhisperError as exc:
+        return {**ids, "error": exc.error_code}
+
+    if whisper.is_junk_transcript(transcript, strict=False):
+        shown = (transcript or "").strip() or None
+        return {**ids, "error": "heard_nothing", "transcript": shown}
+
+    text = (transcript or "").strip()
+    return {**ids, "transcript": text}
 
 
 @app.post("/chat")
@@ -1170,6 +1226,20 @@ def handle_chat(incoming_data: UserMessage):
         intent_result = classify_intent(
             user_text, reply_history, long_term_facts
         )
+        forced = _forced_intent(incoming_data.force_intent)
+        skip_user_save = bool(forced) and _last_user_content(history) == user_text
+
+        def save_user(kind=None):
+            if skip_user_save:
+                return
+            save_message(conversation_id, "user", user_text, kind=kind)
+        if forced:
+            intent_result = {
+                **intent_result,
+                "intent": forced,
+                "kind": forced,
+                "confidence": 1.0,
+            }
         intent = intent_result["intent"]
         confidence = intent_result["confidence"]
 
@@ -1181,7 +1251,52 @@ def handle_chat(incoming_data: UserMessage):
             f"docs={intent_result.get('docs_score')} "
             f"chat={intent_result.get('chat_score')} "
             f"intent={intent} ({confidence:.2f})"
+            f"{' forced' if forced else ''}"
         )
+
+        pad_now = session_context.get(user_id, conversation_id)
+        prior_intent = intent
+        pad_promoted = False
+        if not forced:
+            intent = maybe_promote_pad_followup(
+                intent, user_text, pad_now, open_action=open_action
+            )
+            pad_promoted = intent == "ACTION" and prior_intent == "CHAT"
+            if pad_promoted:
+                intent_result = {
+                    **intent_result,
+                    "intent": "ACTION",
+                    "kind": "ACTION",
+                }
+
+        # Pause before ACTION/RETRIEVE when the LLM classifier is unsure.
+        # Open composer / confirm rows keep their existing follow-up path.
+        # Skip when a pad follow-up already bound this CHAT turn.
+        if (
+            not forced
+            and not open_action
+            and not pad_promoted
+            and should_clarify_intent(intent_result)
+        ):
+            save_message(conversation_id, "user", user_text, kind="clarify")
+            save_message(conversation_id, "assistant", CLARIFY_REPLY, kind="clarify")
+            print(
+                f"[{provider}] [{conversation_id[:8]}] "
+                f"intent_clarify guessed={intent}"
+            )
+            return {
+                "answer": CLARIFY_REPLY,
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "intent": intent,
+                "is_question": intent_result.get("is_question"),
+                "kind": intent_result.get("kind"),
+                "memory_score": intent_result.get("memory_score"),
+                "docs_score": intent_result.get("docs_score"),
+                "chat_score": intent_result.get("chat_score"),
+                "engine": "clarify",
+                "clarify_options": [dict(row) for row in CLARIFY_CHIPS],
+            }
 
         # --- ACTION engine (SPEC-PIPELINE §3.2, §4, §10) ---------------------
         # Continue a paused AWAITING_INPUT row before starting a new ACTION.
@@ -1267,7 +1382,7 @@ def handle_chat(incoming_data: UserMessage):
                 open_action,
             )
             if action is not None:
-                save_message(conversation_id, "user", user_text, kind="action")
+                save_user("action")
                 save_message(conversation_id, "assistant", answer, kind="action")
                 print(
                     f"[{provider}] [{conversation_id[:8]}] "
@@ -1278,7 +1393,7 @@ def handle_chat(incoming_data: UserMessage):
                     attachments=incoming_data.attachments,
                 )
             if _is_resume_chat_reply(answer):
-                save_message(conversation_id, "user", user_text, kind="action")
+                save_user("action")
                 save_message(conversation_id, "assistant", answer, kind="action")
                 return {
                     "answer": answer,
@@ -1297,7 +1412,7 @@ def handle_chat(incoming_data: UserMessage):
             if answer:
                 action_note = f"\n\n({answer.rstrip('.')})"
             answer = UNSUPPORTED_ACTION_REPLY + action_note
-            save_message(conversation_id, "user", user_text)
+            save_user()
             save_message(conversation_id, "assistant", answer)
             return {
                 "answer": answer,
@@ -1488,7 +1603,8 @@ def handle_chat(incoming_data: UserMessage):
         turn_kind = None
         if intent == "RETRIEVE":
             turn_kind = "retrieve_miss" if not sources else "retrieve"
-        save_message(conversation_id, "user", user_text, kind=turn_kind)
+        if not skip_user_save:
+            save_user(turn_kind)
         save_message(conversation_id, "assistant", answer, kind=turn_kind)
 
         print(f"[{provider}] [{conversation_id[:8]}] Michelle responded: {answer}")
@@ -1638,7 +1754,7 @@ def _run_draft_body(
             return _draft_err(e.error_code)
         spoken = True
 
-    if spoken and whisper.is_junk_transcript(transcript):
+    if spoken and whisper.is_junk_transcript(transcript, strict=True):
         shown = (transcript or "").strip() or None
         return _draft_err("heard_nothing", shown)
 
