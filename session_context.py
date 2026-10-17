@@ -1,8 +1,11 @@
 """Per-conversation working pad: what this chat is doing right now.
 
-Not durable identity. Not long_term_facts. Not injected into the LLM prompt.
-Keyed by (user_id, conversation_id). Cleared on backend process start and
-on /session/start (Electron reload). Chatlog and long-term facts stay.
+Not durable identity. Not long_term_facts. Keyed by (user_id, conversation_id).
+Cleared on backend process start and on /session/start (Electron reload).
+Chatlog and long-term facts stay.
+
+ACTION binds pronouns from this pad in code. CHAT, RETRIEVE, and REMEMBER
+replies also read it, via format_for_prompt. Email body polish does not.
 """
 
 import json
@@ -184,6 +187,42 @@ def put(user_id: str, conversation_id: str, payload: dict) -> dict:
             (user_id, conversation_id, blob),
         )
     return pad
+
+
+def format_for_prompt(pad: dict | None) -> str:
+    """Factual lines for a reply model. Empty pad returns an empty string."""
+    if not isinstance(pad, dict):
+        return ""
+    lines = []
+    opened = _clean_names(pad.get("last_opened"))
+    closed = _clean_names(pad.get("last_closed"))
+    quit_names = _clean_names(pad.get("last_quit"))
+    if opened:
+        lines.append("Opened: " + ", ".join(opened))
+    if closed:
+        lines.append("Closed: " + ", ".join(closed))
+    if quit_names:
+        lines.append("Quit: " + ", ".join(quit_names))
+    draft = pad.get("last_draft")
+    if isinstance(draft, dict):
+        bits = []
+        recipient = _clean_text(draft.get("recipient"))
+        subject = _clean_text(draft.get("subject"))
+        if recipient:
+            bits.append(f"to {recipient}")
+        if subject:
+            bits.append(f"subject {subject}")
+        if bits:
+            lines.append("Email draft: " + ", ".join(bits))
+    if not lines:
+        return ""
+    body = "\n".join(f"- {line}" for line in lines)
+    return (
+        "What this conversation just did (working pad, not a long-term fact):\n"
+        f"{body}\n"
+        "Use this only when they refer to what just happened in this chat. "
+        "Do not mention it on a greeting."
+    )
 
 
 def _clean_names(app_names) -> list[str]:

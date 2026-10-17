@@ -8,6 +8,7 @@ from google.genai import types
 
 from intent import _looks_like_action_order, _looks_like_resume_draft
 from long_term_memory import format_facts
+from session_context import format_for_prompt
 
 ## To keep responses nice and concise
 SYSTEM_PROMPT = (
@@ -30,8 +31,11 @@ SYSTEM_PROMPT = (
 )
 
 
-def _build_system_prompt(long_term_facts: Optional[list[dict]] = None) -> str:
-    """Regular system prompt + long-term facts that survive the short chat window."""
+def _build_system_prompt(
+    long_term_facts: Optional[list[dict]] = None,
+    session_context: Optional[dict] = None,
+) -> str:
+    """System prompt plus long-term facts and this conversation's working pad."""
     prompt = SYSTEM_PROMPT
     facts_block = format_facts(long_term_facts or [])
     if facts_block:
@@ -40,6 +44,9 @@ def _build_system_prompt(long_term_facts: Optional[list[dict]] = None) -> str:
             "Use these facts naturally when relevant. "
             "Do not dump the whole list unless asked."
         )
+    pad_block = format_for_prompt(session_context)
+    if pad_block:
+        prompt = f"{prompt}\n\n{pad_block}"
     return prompt
 
 
@@ -181,17 +188,23 @@ def ask_llm(
     prompt: str,
     history: Optional[list[dict]] = None,
     long_term_facts: Optional[list[dict]] = None,
+    session_context: Optional[dict] = None,
 ) -> str:
     provider = os.getenv("LLM_PROVIDER", "mock").lower()
     history = history or []
     long_term_facts = long_term_facts or []
     history = history_for_reply(history, prompt)
+    system = _build_system_prompt(long_term_facts, session_context)
     if provider == "mock":
-        return _ask_mock(prompt, history, long_term_facts)
+        return _ask_mock(prompt, history, long_term_facts, session_context)
     if provider == "ollama":
-        return _ask_ollama(prompt, history, long_term_facts)
+        return _ask_ollama(
+            prompt, history, long_term_facts, system_prompt=system
+        )
     if provider == "gemini":
-        return _ask_gemini(prompt, history, long_term_facts)
+        return _ask_gemini(
+            prompt, history, long_term_facts, system_prompt=system
+        )
     raise ValueError(f"Unknown LLM_PROVIDER: {provider}. Use mock, ollama, or gemini.")
 
 
@@ -200,6 +213,7 @@ def ask_llm_with_context(
     context: str,
     history: Optional[list[dict]] = None,
     long_term_facts: Optional[list[dict]] = None,
+    session_context: Optional[dict] = None,
 ) -> str:
     """Answer a RETRIEVE question grounded in retrieved doc snippets."""
     if not context.strip():
@@ -218,7 +232,8 @@ def ask_llm_with_context(
         "Answer using only those snippets."
     )
     system = (
-        f"{_build_system_prompt(long_term_facts)}\n\n{RETRIEVE_SYSTEM_EXTRA}"
+        f"{_build_system_prompt(long_term_facts, session_context)}\n\n"
+        f"{RETRIEVE_SYSTEM_EXTRA}"
     )
 
     if provider == "ollama":
@@ -270,10 +285,28 @@ def _ask_mock_with_context(prompt: str, context: str) -> str:
     return f"From {source}: {snippet}"
 
 
+def _mock_pad_reply(text: str, pad: Optional[dict]) -> Optional[str]:
+    """Deterministic pad read for mock mode. None means the pad does not apply."""
+    if not isinstance(pad, dict):
+        return None
+    lower = text.lower()
+    if "what did i just ask" in lower or "what did i say" in lower:
+        return None
+    opened = [
+        str(item).strip()
+        for item in (pad.get("last_opened") or [])
+        if str(item).strip()
+    ]
+    if opened and "just open" in lower:
+        return "Opened " + ", ".join(opened) + "."
+    return None
+
+
 def _ask_mock(
     prompt: str,
     history: list[dict],
     long_term_facts: list[dict],
+    session_context: Optional[dict] = None,
 ) -> str:
     text = prompt.strip()
     lower = text.lower()
@@ -317,6 +350,10 @@ def _ask_mock(
             if fact["key"] == "age":
                 return fact["value"]
         return "I don't have your age saved yet. Say \"remember this: my age is 22\"."
+
+    from_pad = _mock_pad_reply(text, session_context)
+    if from_pad:
+        return from_pad
 
     return (
         f"[mock mode] I heard: \"{text}\". "

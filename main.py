@@ -697,7 +697,9 @@ def _handle_action_intents(
     chat = parsed.get("chat") or ""
     if chat and mixed_chat_warrants_reply(chat):
         try:
-            answer_parts.append(ask_llm(chat, history, long_term_facts))
+            answer_parts.append(
+                ask_llm(chat, history, long_term_facts, session_context=pad)
+            )
         except Exception as e:
             print(f"mixed-chat reply failed ({e})")
 
@@ -1509,6 +1511,7 @@ def handle_chat(incoming_data: UserMessage):
                     user_text,
                     reply_history,
                     recall_facts,
+                    session_context=pad_now,
                 )
             else:
                 facts_to_store = store_facts or assessor_facts
@@ -1537,11 +1540,17 @@ def handle_chat(incoming_data: UserMessage):
                         ),
                         reply_history,
                         updated_facts,
+                        session_context=pad_now,
                     )
                 else:
                     # "remind me to email Sam" etc. — not a durable fact.
                     intent = "CHAT"
-                    answer = ask_llm(user_text, reply_history, long_term_facts)
+                    answer = ask_llm(
+                        user_text,
+                        reply_history,
+                        long_term_facts,
+                        session_context=pad_now,
+                    )
         elif intent == "RETRIEVE":
             context, chunks = retrieve.answer_from_docs(user_text)
             sources = sorted({chunk["source"] for chunk in chunks})
@@ -1554,9 +1563,15 @@ def handle_chat(incoming_data: UserMessage):
                 context,
                 reply_history,
                 long_term_facts,
+                session_context=pad_now,
             )
         else:
-            answer = ask_llm(user_text, reply_history, long_term_facts)
+            answer = ask_llm(
+                user_text,
+                reply_history,
+                long_term_facts,
+                session_context=pad_now,
+            )
 
         # Auto-assessor: CHAT only. Don't ask to remember a doc lookup.
         # Still allowed to save user facts (name, prefs) when the assessor is sure,
