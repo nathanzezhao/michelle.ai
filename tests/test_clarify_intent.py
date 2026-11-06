@@ -69,14 +69,15 @@ def test_should_not_clarify_when_runner_up_score_is_zero(monkeypatch):
     )
 
 
-def test_clarify_chips_cover_all_four_intents():
+def test_clarify_chips_cover_docs_remember_chat():
     labels = {row["intent"]: row["label"] for row in intent.CLARIFY_CHIPS}
     assert labels == {
         "RETRIEVE": "Look up docs",
         "REMEMBER": "Remember",
-        "ACTION": "Do this",
         "CHAT": "Just chat",
     }
+    assert "ACTION" not in labels
+    assert "Do this" not in labels.values()
 
 
 def test_rules_mode_chat_never_returns_clarify_engine(client, ids, monkeypatch):
@@ -112,9 +113,9 @@ def test_llm_mode_pauses_retrieve_until_chip(client, ids, monkeypatch):
     assert [row["intent"] for row in first["clarify_options"]] == [
         "RETRIEVE",
         "REMEMBER",
-        "ACTION",
         "CHAT",
     ]
+    assert "Do this" not in [row["label"] for row in first["clarify_options"]]
     assert "QUOKKABERRY-77" not in (first.get("answer") or "")
     assert not first.get("sources")
     assert not first.get("task_id")
@@ -158,11 +159,12 @@ def test_clarify_does_not_run_action(client, ids, monkeypatch):
     body = client.post(
         "/chat",
         json={
-            "text": "open Notes",
+            "text": "please do the thing",
             "conversation_id": ids["conversation_id"],
             "user_id": ids["user_id"],
         },
     ).json()
-    assert body["engine"] == "clarify"
+    # Classifier ACTION is not a skill. Miss path never executes.
+    assert body.get("engine") != "action"
     assert opened == []
     assert not body.get("task_id")

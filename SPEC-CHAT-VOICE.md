@@ -1,7 +1,7 @@
 # SPEC-CHAT-VOICE — Main-chat microphone (next slice)
 
 **Author:** Sam (product), from Nathan
-**Status:** In build. Chat-bar mic is the current Track 2 slice. Nathan 2026-09-30: chat-bar fills the input and waits for Send (does not auto-`/chat`). Voice **blob** still uses `POST /chat/voice` (transcribe then `handle_chat`).
+**Status:** Shipped. Chat-bar fills the input and waits for Send (does not auto-`/chat`). Voice **blob** still uses `POST /chat/voice` (transcribe then `handle_chat`). Current Track 2 slice is the command embedding layer ([SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md)).
 **Contrast:** Email **tap** stays isolated. Chat-bar mic is **dictation into the chat field**, then a normal typed turn when they Send.
 **Note:** This file lives at repo root on purpose. Do not move it into `docs/` — that folder is Michelle's RAG knowledge base.
 

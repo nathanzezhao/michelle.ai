@@ -31,7 +31,8 @@ DB_PATH = Path(os.getenv("MICHELLE_DB_PATH", "michelle.db"))
 
 # Security-critical (SPEC-PIPELINE §7): risk tiers live HERE and only here.
 # No LLM output, env var, or request field may set or override risk.
-ACTION_WHITELIST = {
+# Known handlers — not a filter of user text. Membership = coded handler.
+ACTION_HANDLERS = {
     "open_app": {
         "risk": "low",
         "required_params": ["app_names"],
@@ -53,6 +54,12 @@ ACTION_WHITELIST = {
         "executor": "composio",
     },
 }
+# Alias for older tests that still import the name. Same dict, same risk.
+ACTION_WHITELIST = ACTION_HANDLERS
+
+
+def get_handler(action_type: str) -> dict | None:
+    return ACTION_HANDLERS.get(action_type)
 
 NON_TERMINAL_STATUSES = ("AWAITING_INPUT", "PENDING", "CONFIRMED")
 TERMINAL_STATUSES = ("SUCCESS", "FAILED", "CANCELLED")
@@ -95,7 +102,7 @@ def _row_to_action(row: sqlite3.Row) -> dict:
     except json.JSONDecodeError:
         payload = {}
     action_type = row["action_type"]
-    entry = ACTION_WHITELIST.get(action_type, {})
+    entry = ACTION_HANDLERS.get(action_type, {})
     provider, remote, gmail_id = _sync_mail_ids(
         payload.get("mail_provider"),
         payload.get("mail_draft_id"),
@@ -182,7 +189,7 @@ def _payload_json(
     payload = {
         "resolved_params": resolved or {},
         "missing_params": missing or [],
-        "risk": ACTION_WHITELIST.get(action_type, {}).get("risk", "high"),
+        "risk": ACTION_HANDLERS.get(action_type, {}).get("risk", "high"),
     }
     if error:
         payload["error"] = error
@@ -238,8 +245,8 @@ def create_action(
 ) -> dict:
     """Insert a new action row, cancelling any leftover non-terminal row so the
     one-open-action invariant (§4) holds even if a caller forgot to."""
-    if action_type not in ACTION_WHITELIST:
-        raise ValueError(f"action_type not whitelisted: {action_type}")
+    if action_type not in ACTION_HANDLERS:
+        raise ValueError(f"unknown action handler: {action_type}")
     leftover = get_open_action(user_id, conversation_id)
     if leftover:
         delete_gmail_draft(leftover)
@@ -2069,9 +2076,9 @@ def load_draft(provider: str | None, remote_id: str | None) -> dict:
 def execute_action(action_type: str, params: dict) -> dict:
     """Dispatch to the executor named in the whitelist entry — the only path
     from an action_type to a side effect."""
-    entry = ACTION_WHITELIST.get(action_type)
+    entry = ACTION_HANDLERS.get(action_type)
     if entry is None:
-        return {"ok": False, "detail": "not a whitelisted action", "error": "unsupported"}
+        return {"ok": False, "detail": "not a known action handler", "error": "unsupported"}
     return _EXECUTORS[entry["executor"]].execute(action_type, params)
 
 
@@ -2147,7 +2154,7 @@ def confirm_and_execute(action_id: str) -> tuple[str, dict]:
     update_action(action_id, status="CONFIRMED")
     params = action["resolved_params"]
     draft_id = action.get("gmail_draft_id")
-    executor = _EXECUTORS.get(ACTION_WHITELIST.get(action["action_type"], {}).get("executor"))
+    executor = _EXECUTORS.get(ACTION_HANDLERS.get(action["action_type"], {}).get("executor"))
     if (
         action["action_type"] == "send_email"
         and draft_id

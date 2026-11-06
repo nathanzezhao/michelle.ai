@@ -9,7 +9,7 @@ from google import genai
 
 import actions
 import embeddings
-from actions import ACTION_WHITELIST
+from actions import ACTION_HANDLERS
 from long_term_memory import is_valid_name
 
 INTENTS = ("CHAT", "RETRIEVE", "REMEMBER", "ACTION")
@@ -23,7 +23,6 @@ CLARIFY_REPLY = "Which did you mean?"
 CLARIFY_CHIPS = (
     {"intent": "RETRIEVE", "label": "Look up docs"},
     {"intent": "REMEMBER", "label": "Remember"},
-    {"intent": "ACTION", "label": "Do this"},
     {"intent": "CHAT", "label": "Just chat"},
 )
 
@@ -431,7 +430,7 @@ _LEADING_FILLER = (
     r"(?:(?:please|pls|gonna|wanna|go\s+ahead\s+and)\s+)?"
 )
 _OPEN_VERBS = (
-    r"(?:open|launch|start|run|pull\s+up|fire\s+up|hop\s+(?:in(?:to)?|on)|"
+    r"(?:open(?:ing)?|launch|start|run|pull\s+up|fire\s+up|hop\s+(?:in(?:to)?|on)|"
     r"bring\s+up|boot\s+up|pop\s+open|crank\s+up)"
 )
 # First/last letter pinned like _EMAIL_WORD. close/clsoe/cloes; quit/quti/qiut.
@@ -439,7 +438,9 @@ _OPEN_VERBS = (
 _CLOSE_WORD = r"(?:c[a-z]{3}e|cloes|closed|shut)"
 _QUIT_WORD = r"(?:q[a-z]{2}t|quti|qiut|exit)"
 _CLOSE_TAIL = rf"{_CLOSE_WORD}(?:\s+(?:the\s+)?windows?(?:\s+(?:of|for))?)?"
-_TRAILING_FILLER = r"(?:\s+(?:rq|pls|please|thx|thanks|real\s+quick|for\s+me))*[.!?]*"
+_TRAILING_FILLER = (
+    r"(?:\s+(?:rq|pls|please|thx|thanks|real\s+quick|for\s+me|lol|lmao|um|uh))*[.!?]*"
+)
 
 # "email" with first and last letters pinned (e … l). Middle can be a typo:
 # emial, emauil, emaill, emal. Not "el"/"eel" (too short).
@@ -496,6 +497,7 @@ def analyze_action_request(
     history: Optional[list[dict]] = None,
     task_context: Optional[dict] = None,
     session_context: Optional[dict] = None,
+    locked_action_type: Optional[str] = None,
 ) -> dict:
     """After intent=ACTION (or while an action is AWAITING_INPUT): what task,
     with what params? Runs ONLY on those turns — no other turn pays for it.
@@ -504,22 +506,32 @@ def analyze_action_request(
     missing_params}) when continuing a paused action; the analyzer then also
     decides related (supplying the missing info) vs. unrelated (topic change).
 
+    locked_action_type is a catalog handler id. Rules/LLM may fill params
+    but must not switch to another type.
+
     Returns:
         {
-            "action_type": whitelist key | "unsupported",
+            "action_type": handler key | "unsupported",
             "resolved_params": {...},   # grounded in THIS message (+ open task)
-            "missing_params": [...],    # recomputed in code from the whitelist
+            "missing_params": [...],    # recomputed in code from the handler
             "confidence": float,
             "related": bool,            # meaningful when task_context given
         }
     """
     history = history or []
+    locked = str(locked_action_type or "").strip().lower() or None
+    if locked and locked not in ACTION_HANDLERS:
+        locked = None
     mode = os.getenv("INTENT_MODE", "llm").lower()
     rules = _analyze_action_with_rules(text, task_context)
+    if locked:
+        rules = _lock_action_type(rules, locked, text)
 
     if mode in ("rules", "mock") or _intent_backend() == "rules":
         raw = rules
-    elif _rules_action_is_grounded(rules):
+    elif _rules_action_is_grounded(rules) and (
+        not locked or str(rules.get("action_type") or "") == locked
+    ):
         raw = rules
     else:
         try:
@@ -532,8 +544,12 @@ def analyze_action_request(
             # related=false on a bare app name. Fill gaps from the rules
             # extractor — never invent values, only recover what the user typed.
             raw = _fill_action_from_rules(raw, rules)
+        if locked:
+            raw = _lock_action_type(raw, locked, text)
 
-    finalized = _finalize_action_analysis(raw, text, history, task_context)
+    finalized = _finalize_action_analysis(
+        raw, text, history, task_context, locked_action_type=locked
+    )
     # Pad names are not in THIS utterance — fill after grounding so they
     # are not stripped. Recompute missing_params here.
     filled = _fill_from_session_context(finalized, text, session_context)
@@ -551,7 +567,7 @@ def _rules_action_is_grounded(rules: dict) -> bool:
     if rules.get("resume") or rules.get("dismiss"):
         return True
     action_type = str(rules.get("action_type") or "").strip().lower()
-    if action_type not in ACTION_WHITELIST:
+    if action_type not in ACTION_HANDLERS:
         return False
     resolved = _params_dict(rules.get("resolved_params"))
     if action_type == "open_app":
@@ -572,14 +588,14 @@ def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
     out["resolved_params"] = _params_dict(out.get("resolved_params"))
     raw_type = str(out.get("action_type") or "").strip().lower()
     rules_type = str(rules.get("action_type") or "").strip().lower()
-    if rules_type in ACTION_WHITELIST and (
-        raw_type not in ACTION_WHITELIST or rules_type != raw_type
+    if rules_type in ACTION_HANDLERS and (
+        raw_type not in ACTION_HANDLERS or rules_type != raw_type
     ):
         # llama often labels "send an email …" as open_app. If rules matched a
         # real verb, that type wins.
         out["action_type"] = rules_type
         raw_type = rules_type
-        allowed = set(ACTION_WHITELIST[rules_type]["required_params"])
+        allowed = set(ACTION_HANDLERS[rules_type]["required_params"])
         resolved = {
             k: v
             for k, v in _params_dict(out.get("resolved_params")).items()
@@ -606,7 +622,7 @@ def _fill_action_from_rules(raw: dict, rules: dict) -> dict:
     out["resolved_params"] = _coerce_app_params(raw_type, resolved)
     if rules.get("related"):
         out["related"] = True
-        if raw_type not in ACTION_WHITELIST and rules_type in ACTION_WHITELIST:
+        if raw_type not in ACTION_HANDLERS and rules_type in ACTION_HANDLERS:
             out["action_type"] = rules_type
     if rules.get("dismiss"):
         out["dismiss"] = True
@@ -629,10 +645,14 @@ def _finalize_action_analysis(
     text: str,
     history: list[dict],
     task_context: Optional[dict],
+    locked_action_type: Optional[str] = None,
 ) -> dict:
     """Code-side validation (§3.2): the LLM never gets to invent an executable
     action type, and params must be grounded in the user's own words."""
     action_type = str(raw.get("action_type") or "").strip().lower()
+    locked = str(locked_action_type or "").strip().lower() or None
+    if locked and locked in ACTION_HANDLERS:
+        action_type = locked
     related = bool(raw.get("related", False))
     try:
         confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.5) or 0.5)))
@@ -651,7 +671,7 @@ def _finalize_action_analysis(
             prior_params = {}
 
     # Whitelist validation happens HERE, in code, after the model call.
-    if action_type not in ACTION_WHITELIST:
+    if action_type not in ACTION_HANDLERS:
         return {
             "action_type": "unsupported",
             "resolved_params": {},
@@ -668,7 +688,7 @@ def _finalize_action_analysis(
     grounded = _ground_action_params(incoming, text)
     prior_params = _coerce_app_params(action_type, prior_params)
     resolved = {**prior_params, **grounded}
-    required = ACTION_WHITELIST[action_type]["required_params"]
+    required = ACTION_HANDLERS[action_type]["required_params"]
     resolved = {k: v for k, v in resolved.items() if k in required}
     missing = [p for p in required if _param_empty(resolved.get(p))]
 
@@ -798,7 +818,7 @@ def _fill_from_session_context(
                     out = dict(analysis)
                     resolved["app_names"] = cleaned
                     out["resolved_params"] = resolved
-                    required = ACTION_WHITELIST[action_type]["required_params"]
+                    required = ACTION_HANDLERS[action_type]["required_params"]
                     out["missing_params"] = [
                         p for p in required if _param_empty(resolved.get(p))
                     ]
@@ -807,7 +827,7 @@ def _fill_from_session_context(
             resolved.pop("app_names", None)
             analysis = dict(analysis)
             analysis["resolved_params"] = resolved
-            required = ACTION_WHITELIST[action_type]["required_params"]
+            required = ACTION_HANDLERS[action_type]["required_params"]
             analysis["missing_params"] = [
                 p for p in required if _param_empty(resolved.get(p))
             ]
@@ -819,7 +839,7 @@ def _fill_from_session_context(
                 out = dict(analysis)
                 resolved["app_names"] = explicit
                 out["resolved_params"] = resolved
-                required = ACTION_WHITELIST[action_type]["required_params"]
+                required = ACTION_HANDLERS[action_type]["required_params"]
                 out["missing_params"] = [
                     p for p in required if _param_empty(resolved.get(p))
                 ]
@@ -827,7 +847,7 @@ def _fill_from_session_context(
             resolved.pop("app_names", None)
             analysis = dict(analysis)
             analysis["resolved_params"] = resolved
-            required = ACTION_WHITELIST[action_type]["required_params"]
+            required = ACTION_HANDLERS[action_type]["required_params"]
             analysis["missing_params"] = [
                 p for p in required if _param_empty(resolved.get(p))
             ]
@@ -851,7 +871,7 @@ def _fill_from_session_context(
     out = dict(analysis)
     resolved["app_names"] = names
     out["resolved_params"] = resolved
-    required = ACTION_WHITELIST[action_type]["required_params"]
+    required = ACTION_HANDLERS[action_type]["required_params"]
     out["missing_params"] = [p for p in required if _param_empty(resolved.get(p))]
     return out
 
@@ -1075,7 +1095,7 @@ def _apply_pad_followup(
         resolved["app_names"] = list(names)
     else:
         resolved.pop("app_names", None)
-    required = ACTION_WHITELIST[bind_type]["required_params"]
+    required = ACTION_HANDLERS[bind_type]["required_params"]
     out["resolved_params"] = resolved
     out["missing_params"] = [p for p in required if _param_empty(resolved.get(p))]
     out["related"] = True
@@ -1163,7 +1183,7 @@ def _param_empty(value) -> bool:
 def _clean_app_name(raw: str) -> str:
     app = (raw or "").strip().strip("\"'").strip()
     app = re.sub(
-        r"\s+(?:rq|pls|please|thx|thanks|real\s+quick|for\s+me)+$",
+        r"\s+(?:rq|pls|please|thx|thanks|real\s+quick|for\s+me|lol|lmao|um|uh)+$",
         "",
         app,
         flags=re.IGNORECASE,
@@ -1214,8 +1234,85 @@ def _coerce_app_params(action_type: str, resolved: dict) -> dict:
     return out
 
 
+_LOCKED_OPEN_SPAN_RE = re.compile(
+    rf"(?:kick\s+off|{_OPEN_VERBS})(?:\s+up)?\s+(?:the\s+)?(.+?){_TRAILING_FILLER}$",
+    re.IGNORECASE,
+)
+_LOCKED_CLOSE_SPAN_RE = re.compile(
+    rf"{_CLOSE_TAIL}\s+(?:the\s+)?(.+?){_TRAILING_FILLER}$",
+    re.IGNORECASE,
+)
+_LOCKED_QUIT_SPAN_RE = re.compile(
+    rf"{_QUIT_WORD}\s+(?:the\s+)?(.+?){_TRAILING_FILLER}$",
+    re.IGNORECASE,
+)
+_LOCKED_EMAIL_NAME_RE = re.compile(
+    rf"^(?:{_LEADING_FILLER})(?:send\s+(?:an?\s+)?{_EMAIL_WORD}|{_EMAIL_WORD})"
+    rf"\s+to\s+([A-Za-z][\w.'-]*)",
+    re.IGNORECASE,
+)
+_LOCKED_EMAIL_BARE_NAME_RE = re.compile(
+    rf"^(?:{_LEADING_FILLER}){_EMAIL_WORD}\s+([A-Za-z][\w.'-]*)\s*$",
+    re.IGNORECASE,
+)
+_EMAIL_NAME_JUNK = {
+    "for",
+    "me",
+    "please",
+    "pls",
+    "rq",
+    "the",
+    "a",
+    "an",
+    "my",
+    "now",
+    "later",
+}
+
+
+def _extract_params_for_locked(action_type: str, text: str) -> dict:
+    """Fill slots for a catalog-locked handler. Verb regex is extraction only."""
+    stripped = (text or "").strip()
+    if action_type in ("open_app", "close_app", "quit_app"):
+        span = {
+            "open_app": _LOCKED_OPEN_SPAN_RE,
+            "close_app": _LOCKED_CLOSE_SPAN_RE,
+            "quit_app": _LOCKED_QUIT_SPAN_RE,
+        }[action_type]
+        match = span.search(stripped)
+        names = _split_app_names(match.group(1)) if match else []
+        return {"app_names": names} if names else {}
+    if action_type == "send_email":
+        params = _extract_email_params(stripped)
+        if not params.get("recipient"):
+            named = _LOCKED_EMAIL_NAME_RE.search(stripped) or _LOCKED_EMAIL_BARE_NAME_RE.search(
+                stripped
+            )
+            if named and named.group(1).lower() not in _EMAIL_NAME_JUNK:
+                params = {**params, "recipient": named.group(1)}
+        return params
+    return {}
+
+
+def _lock_action_type(raw: dict, locked: str, text: str) -> dict:
+    """Keep the catalog handler. Still extract params from this utterance."""
+    out = dict(raw) if isinstance(raw, dict) else {}
+    out["action_type"] = locked
+    extracted = _extract_params_for_locked(locked, text)
+    resolved = dict(_params_dict(out.get("resolved_params")))
+    if extracted:
+        for key, value in extracted.items():
+            if not _param_empty(value) and _param_empty(resolved.get(key)):
+                resolved[key] = value
+        if locked in ("open_app", "close_app", "quit_app") and extracted.get("app_names"):
+            resolved["app_names"] = extracted["app_names"]
+    out["resolved_params"] = _coerce_app_params(locked, resolved)
+    out["related"] = True
+    return out
+
+
 def _analyze_action_with_rules(text: str, task_context: Optional[dict]) -> dict:
-    """Regex extractor for whitelist actions — offline QA parity (§3.2)."""
+    """Regex extractor for handler params — offline QA parity (§3.2)."""
     stripped = (text or "").strip()
 
     if (
@@ -1349,7 +1446,7 @@ def _analyze_action_with_llm(
     context = "\n".join(f"{turn['role']}: {turn['content']}" for turn in recent)
     catalog = "\n".join(
         f'- "{name}": requires {", ".join(entry["required_params"])}'
-        for name, entry in ACTION_WHITELIST.items()
+        for name, entry in ACTION_HANDLERS.items()
     )
     task_block = ""
     if task_context:

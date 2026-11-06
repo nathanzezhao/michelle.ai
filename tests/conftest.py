@@ -51,6 +51,104 @@ def client():
     return TestClient(main.app)
 
 
+# Orthogonal handler axes for the command-layer stub (same map Ada uses).
+_OPEN_VEC = [1.0, 0.0, 0.0, 0.0, 0.0]
+_CLOSE_VEC = [0.0, 1.0, 0.0, 0.0, 0.0]
+_QUIT_VEC = [0.0, 0.0, 1.0, 0.0, 0.0]
+_EMAIL_VEC = [0.0, 0.0, 0.0, 1.0, 0.0]
+_CHAT_VEC = [0.0, 0.0, 0.0, 0.0, 1.0]
+_TIE_VEC = [0.7071, 0.0, 0.0, 0.7071, 0.0]
+_OTHER_VEC = [0.3, 0.3, 0.3, 0.3, 0.3]
+
+
+def _stub_is_chat_sink(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if t in {"yo wsp", "yo", "wsp", "hello", "hi", "hey"}:
+        return True
+    if "how do i open" in t or "how do you open" in t or "how to open" in t:
+        return True
+    if "how to close" in t or "how do you close" in t or "how do i close" in t:
+        return True
+    if "steps to open" in t or "steps to close" in t:
+        return True
+    if "quit my job" in t or "closed the deal" in t:
+        return True
+    if "email me later" in t:
+        return True
+    return False
+
+
+def stub_embed_text(text: str):
+    """Deterministic embed stub: command axes + pad 3-d follow-ups. No Ollama."""
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    # Pad-state labels / queries stay 3-d so try-again cosine still binds.
+    if t in {"unrelated chat", "hello", "what's for lunch", "whats for lunch"}:
+        return [0.0, 0.0, 1.0]
+    if any(
+        bit in t
+        for bit in (
+            "try again",
+            "wasn't",
+            "wasnt",
+            "retry quitting",
+            "already quit",
+            "retry closing",
+            "retry opening",
+        )
+    ):
+        return [1.0, 0.0, 0.0]
+    if _stub_is_chat_sink(t):
+        return list(_CHAT_VEC)
+    if "refund" in t:
+        return list(_OTHER_VEC)
+    if "delete_files" in t or "delete all my files" in t or "book a flight" in t:
+        return list(_OTHER_VEC)
+    has_open = (not _stub_is_chat_sink(t)) and (
+        t in {"open", "launch", "kick off", "pull up", "fire up"}
+        or any(
+            bit in t
+            for bit in (
+                "kick off",
+                "open notes",
+                "open ",
+                "launch ",
+                "pull up",
+                "fire up",
+                "hop into",
+                "bring up",
+            )
+        )
+    )
+    has_email = (not _stub_is_chat_sink(t)) and (
+        any(
+            bit in t
+            for bit in ("send an email", "send email", "email sam", "e-mail")
+        )
+        or t.startswith("email ")
+    )
+    if has_open and has_email:
+        return list(_TIE_VEC)
+    if has_open:
+        return list(_OPEN_VEC)
+    if has_email or "send an email" in t or "send an ema" in t:
+        return list(_EMAIL_VEC)
+    if t in {"close", "close notes"} or t.startswith("close ") or t.startswith("shut "):
+        return list(_CLOSE_VEC)
+    if t in {"quit", "quit notes"} or t.startswith("quit "):
+        return list(_QUIT_VEC)
+    if any(bit in t for bit in ("open", "kick off", "launch", "pull up")):
+        return list(_OPEN_VEC)
+    if "email" in t or "gmail" in t:
+        return list(_EMAIL_VEC)
+    if "close" in t or "clsoe" in t or "shut" in t:
+        return list(_CLOSE_VEC)
+    if "quit" in t or "quti" in t:
+        return list(_QUIT_VEC)
+    return list(_OTHER_VEC)
+
+
 @pytest.fixture(autouse=True)
 def deterministic_env(monkeypatch):
     """Default every test to mock LLM + rules intent; tests that need
@@ -58,9 +156,19 @@ def deterministic_env(monkeypatch):
     so no module reload is needed."""
     monkeypatch.setenv("LLM_PROVIDER", "mock")
     monkeypatch.setenv("INTENT_MODE", "rules")
+    import embeddings
     import intent
 
     intent._PAD_LABEL_VEC_CACHE.clear()
+    monkeypatch.setattr(embeddings, "embed_text", stub_embed_text)
+    try:
+        import command_layer
+
+        command_layer.reset_prototypes()
+        if hasattr(command_layer, "embeddings"):
+            monkeypatch.setattr(command_layer.embeddings, "embed_text", stub_embed_text)
+    except ImportError:
+        pass
 
 
 @pytest.fixture

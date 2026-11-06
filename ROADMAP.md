@@ -2,12 +2,13 @@
 
 Reference doc for what's done, what's next, and what's planned later.
 
-**Build order:** Memory + ACTION v1 are in. **Voice UI (three modes, blob default)** is in via Vite/React renderer ([SPEC-VOICE-UI.md](SPEC-VOICE-UI.md)). **Chat voice backend** (`POST /chat/voice`) is wired. **Track 2 remainder (Nathan 2026-09-30):** chat-bar mic → clarifying chips → inbox briefing (LLM intent, not a chip) → evaluator miss → one diagnostic follow-up → more actions. Park SSE, escalation, and auth/hardening. Then screen capture / vision. Do not call inbox briefing “scraping.”
+**Build order:** Memory + ACTION v1 are in. **Voice UI (three modes, blob default)** is in via Vite/React renderer ([SPEC-VOICE-UI.md](SPEC-VOICE-UI.md)). **Chat voice backend** (`POST /chat/voice`) is wired. **Chat-bar mic shipped.** **Clarifying chips shipped** (Look up docs / Remember / Just chat — **no Do this**). **Current Track 2 slice: command embedding layer** ([SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md)). **Inbox briefing PARKED.** Then evaluator miss → one diagnostic follow-up. Park SSE, escalation, and auth/hardening. Then screen capture / vision. Do not call inbox briefing “scraping.”
 
 **Screen capture source doc:** `/Users/nathan/Downloads/desktop_ai_agent_roadmap_screencapture.pdf`
 
-**Slice 1 spec:** [SPEC-PIPELINE.md](SPEC-PIPELINE.md) (ACTION engine).
-**Next-slice spec:** [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md) (main-chat microphone). Do not put specs in `docs/` — that folder is Michelle's RAG KB.
+**Slice 1 spec:** [SPEC-PIPELINE.md](SPEC-PIPELINE.md) (ACTION engine; routing amended).
+**Current Track 2 spec:** [SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md) (pre-intent cosine catalog).
+**Chat-bar mic spec:** [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md) (shipped). Do not put specs in `docs/` — that folder is Michelle's RAG KB.
 
 ---
 
@@ -21,9 +22,10 @@ Reference doc for what's done, what's next, and what's planned later.
 - Last 10 messages sent to LLM per turn (`MAX_HISTORY`, tunable via `.env`)
 - **Long-term fact memory:** second assessor + `long_term_facts` table keyed by `user_id`
 - Guardrails: blank messages, 4000-char cap, invalid UUID rejected, failed turns not saved
-- **Intent router:** CHAT / RETRIEVE / REMEMBER / **ACTION** (live). `INTENT_MODE=llm` uses the same model as `LLM_PROVIDER`
+- **Intent router:** CHAT / RETRIEVE / REMEMBER; ACTION is a **handler lock**, not a classifier label. `INTENT_MODE=llm` uses the same model as `LLM_PROVIDER`
 - **RETRIEVE v1:** local `docs/` folder → SQLite FTS5 → grounded answer (`retrieve.py`)
-- **ACTION v1:** whitelist only — `open_app` (native `open -a`) and `send_email` (Composio Gmail)
+- **ACTION v1:** handlers `open_app` / `close_app` / `quit_app` / `send_email`. Risk on the handler object. Confirm/Cancel, composer, Composio Gmail, `actions_log`. Command **match** is the command-layer slice (not keywords).
+- **Clarifying chips:** Look up docs / Remember / Just chat. No Do this. `force_intent=ACTION` is ignored.
 - **Email composer** in the window: to / subject / body, urgent, attach, generate body; files + generate pinned above Send; Confirm / Cancel before send
 - **Composio Platform** Gmail: real sends as the connected inbox (`COMPOSIO_API_KEY` project key `ak_…`, user `default`). For You `ck_…` keys are rejected
 - `actions_log` audit + no replay after backend restart
@@ -43,8 +45,10 @@ Reference doc for what's done, what's next, and what's planned later.
 
 ```
 main.py → memory.py (last N turns + long-term facts)
-       → intent.py (CHAT | RETRIEVE | REMEMBER | ACTION)
-       → ACTION: analyze params (+ session_context pad) → actions_log → native or Composio
+       → pad / PENDING / composer continuation (if the turn belongs to an open job)
+       → cosine command layer (handlers; skip classify on hit)   ← current Track 2 slice
+       → else intent.py (CHAT | RETRIEVE | REMEMBER only)
+       → ACTION (catalog hit): locked handler → params → actions_log → native or Composio
        → REMEMBER: existing store/recall
        → RETRIEVE: docs/ FTS
        → CHAT: reply + synchronous memory assessor
@@ -77,20 +81,22 @@ main.py → memory.py (last N turns + long-term facts)
 
 From the original Michelle architecture (intent router → RAG → agents):
 
-- [x] **Chat-bar microphone** — see [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md). Tap/tap. `[input] [mic] [Send]`. Hide mic while email composer is open. Header Voice blob stays. Transcript fills the input; user hits Send (does **not** auto-run `/chat`). Email composer tap stays isolated.
-- [x] **Intent includes ACTION** — fourth live label; `INTENT_MODE=llm` uses Ollama/Gemini (rules fallback)
-- [ ] **Intent clarifying questions** — if `confidence < 0.6` and top two labels are close: chips (Look up docs / Remember / Do this / Just chat). Do not run ACTION/RETRIEVE until tap. Rules/mock never ask. `force_intent` on `/chat` re-runs the same utterance. Close = shelf-score gap ≤ 0.15.
+- [x] **Chat-bar microphone** — shipped. See [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md). Tap/tap. `[input] [mic] [Send]`. Hide mic while email composer is open. Header Voice blob stays. Transcript fills the input; user hits Send (does **not** auto-run `/chat`). Email composer tap stays isolated.
+- [x] **ACTION engine v1** — handlers `open_app` + `close_app` + `quit_app` + `send_email` (Composio), Confirm/Cancel, composer UI, `actions_log`. Risk on the handler object in code.
+- [x] **Intent clarifying questions** — shipped **without Do this**. If `confidence < 0.6` and top two labels are close: chips (Look up docs / Remember / Just chat). Rules/mock never ask. `force_intent` CHAT | RETRIEVE | REMEMBER re-runs the same utterance. `force_intent=ACTION` is ignored. Close = shelf-score gap ≤ 0.15.
+- [ ] **Command embedding layer (current slice)** — cosine catalog before `classify_intent`. Handlers, not keywords. [SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md).
 - [x] **RETRIEVE v1** — local `docs/` ingest + SQLite FTS5 + grounded answers (sample KB included)
 - [x] **RETRIEVE v2 (baseline)** — query translator + optional Ollama embeddings hybrid behind `retrieve.search()` (`RETRIEVE_V2=1`)
-- [x] **ACTION v1** — `open_app` + `send_email` (Composio), Confirm/Cancel, composer UI, `actions_log`
-- [ ] **Inbox briefing (after clarifying)** — consented Gmail **read**. Trigger is **LLM intent** (same classifier/ACTION analyzer as typing or spoken-then-Send), not a greeting chip and not auto on launch. Cap: last 24h, max 15, one page. See below.
-- [ ] **More actions** — quit apps, calendar, Slack, etc. Still whitelist + risk tiers in code, never LLM-judged. `quit_app` / `close_app` already exist in the whitelist — do not rebuild them as “new.” Inbox briefing is the first **new** extra ACTION.
+- [ ] **Inbox briefing — PARKED.** Do not start. Not the current slice. Spec below is kept so we do not reinvent it later.
+- [ ] **More actions** — calendar, Slack, etc. Still new handler object + prototypes, risk in code, never LLM-judged. `quit_app` / `close_app` already exist — do not rebuild them as “new.” Inbox briefing is **not** the next ACTION.
 
-### Inbox briefing (Track 2 ACTION — not started)
+### Inbox briefing (PARKED — not started)
+
+**Parked.** Command embedding layer is the current Track 2 slice. Do not assign Ned/Kit on briefing until Nathan unparks it.
 
 **User outcome:** After Gmail is connected, the user can get a short briefing of recent inbox mail (from / subject + a few bullets). Copy: “inbox briefing” / “catch me up.” Never “scraping.”
 
-**Team call (2026-09-28):** Sam option 2 — put it on Track 2 now, **build after chat-bar mic**. Tom: Ned (whitelist + Composio list) + Kit (greeting UI) + Oz (read scopes). Ray: **block silent auto-read on every `/session/start`.**
+**Team call (2026-09-28, superseded for order):** Sam option 2 had it after chat-bar mic. Chat-bar mic and clarifying chips are shipped. Briefing waits. Tom: Ned (handler + Composio list) + Kit (no greeting chip) + Oz (read scopes) **when unparked**. Ray: **block silent auto-read on every `/session/start`.**
 
 **Why a new ACTION:** Composio Gmail today is send + drafts only (`GMAIL_SEND_EMAIL`, draft CRUD, `GMAIL_LIST_DRAFTS`). Drafts are outbound. Inbox list/read is a new whitelist type (e.g. `brief_inbox` / `summarize_inbox`), new tool, likely new Gmail readonly scopes (reconnect). `ComposioExecutor.execute` currently runs `send_email` only.
 
@@ -113,7 +119,7 @@ From the original Michelle architecture (intent router → RAG → agents):
 - Mic: tap/tap; `[input] [mic] [Send]`; keep header blob; hide chat-row mic when composer is open.
 - Transcript: fill the input and wait for Send (overrides SPEC §4 bubble-then-auto-`/chat` for the **chat bar only**; Voice blob still uses `POST /chat/voice`).
 - Chat/blob junk: empty + too-short **audio** + “thank you” hallucinations. Email tap keeps the 4-word / 12-char gate.
-- Clarifying: chips at confidence below 0.6 when top two are close.
+- Clarifying: chips at confidence below 0.6 when top two are close. **Do this dropped.** `force_intent=ACTION` ignored.
 - SSE and production auth/rate-limits: **parked** this track. Keep scramble.
 - Whisper: same `base` / `int8` as email tap. No cloud STT.
 
@@ -205,8 +211,8 @@ let htmlContent = element.innerHTML;
 ### Phase 5 — Background task execution (The Hands)
 
 - **Tool integration:** Composio. Gmail send is live in ACTION v1 (`actions.py` + Platform project key).
-- **Still later:** more apps (Slack, Notion, calendar), same confirm-before-write pattern. Inbox briefing is Track 2 (Gmail **read**), not this phase.
-- **Flow:** LLM decides action → whitelist + executor → Confirm if high-risk → reports back in the floating window
+- **Still later:** more apps (Slack, Notion, calendar), same confirm-before-write pattern. Inbox briefing is PARKED (Gmail **read**), not this phase and not the current Track 2 slice.
+- **Flow:** cosine catalog locks a handler → handler object (risk + executor) → Confirm if high-risk → reports back in the floating window
 - Does **not** hijack mouse/keyboard
 
 ---
@@ -224,7 +230,7 @@ let htmlContent = element.innerHTML;
 | CHAT | Ollama/Gemini/mock reply |
 | RETRIEVE | Search `docs/` (FTS5) + grounded answer |
 | REMEMBER | Store or recall long-term facts |
-| ACTION | `open_app` now; `send_email` composer + Confirm → Composio Gmail. Inbox briefing (read) is planned, not live. |
+| ACTION | Cosine match to handlers (`open_app`, `close_app`, `quit_app`, `send_email`) — not keywords. Composer + Confirm → Composio Gmail. Inbox briefing PARKED. |
 
 ---
 
@@ -237,15 +243,17 @@ let htmlContent = element.innerHTML;
 | `retrieve.py` | Index/search `docs/` via SQLite FTS5 |
 | `docs/` | Sample + user knowledge base (`.md` / `.txt`) |
 | `scripts/reset_michelle.sh` | Wipe local DB so another person starts clean |
-| `intent.py` | Intent router + memory assessor + action analyzer |
-| `actions.py` | ACTION whitelist, `actions_log`, native + Composio executors |
+| `intent.py` | Intent router (CHAT/RETRIEVE/REMEMBER) + memory assessor + action analyzer |
+| `embeddings.py` | Pad + command-layer embed (`EMBED_MODEL` / `nomic-embed-text`). No extra env for catalog. |
+| `actions.py` | Handler objects (risk/params/executor), `actions_log`, native + Composio executors |
 | `llm.py` | Chat replies + grounded RETRIEVE answers |
 | `main.py` | `/chat`, `/session/start`, `/action/confirm`, `/action/draft_body` |
 | `index.html` | Electron UI (chat, composer, Confirm/Cancel) |
 | `main.js` | Window collapse/expand, drag |
 | `tests/` | R0/R1 pytest (httpx); `COMPOSIO_API_KEY` unset in suite |
-| `SPEC-PIPELINE.md` | Slice 1 ACTION spec (not a RAG doc) |
-| `SPEC-CHAT-VOICE.md` | Next: main-chat mic → Whisper → `/chat` (not email tap) |
+| `SPEC-PIPELINE.md` | Slice 1 ACTION engine spec; routing amended by command layer |
+| `SPEC-COMMAND-LAYER.md` | Current Track 2: pre-intent cosine catalog (not a RAG doc) |
+| `SPEC-CHAT-VOICE.md` | Chat-bar mic (shipped) → Whisper → `/chat` (not email tap) |
 | `michelle.db` | Local chat archive + facts + doc index + actions (gitignored) |
 
 ## Quick reference: memory assessor

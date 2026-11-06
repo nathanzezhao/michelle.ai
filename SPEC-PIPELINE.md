@@ -1,8 +1,8 @@
 # SPEC-PIPELINE — Non-Question Pipeline v1 (ACTION Engine + contract hardening)
 
 **Author:** Sam (product)
-**Status:** Approved for build — Slice 1. Code must not start until Ada's R0 regression suite exists (Nathan's decision 10).
-**Source:** `rag_agent_pipeline_spec.pdf` (SPEC-RAG-AGENT-V1), scoped to the non-question half only (`Is Question? -> False`), amended by Nathan's locked decisions from the pipeline redesign review.
+**Status:** Slice 1 ACTION engine is live. **Routing amendment:** pre-intent cosine catalog — see [SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md). Do not re-read §3 as "classifier emits ACTION."
+**Source:** `rag_agent_pipeline_spec.pdf` (SPEC-RAG-AGENT-V1), scoped to the non-question half only (`Is Question? -> False`), amended by Nathan's locked decisions from the pipeline redesign review, then by the command-layer lock (cosine gate, handler-object risk).
 **Note:** This file lives at repo root on purpose. Do not move it into `docs/` — that folder is Michelle's RAG knowledge base and this spec would pollute retrieval.
 
 ---
@@ -22,25 +22,29 @@
 
 **Out of scope:** see §12. Notably: document vectors (Slice 2), any schema adoption from the PDF beyond `actions_log`, async memory scoring, auto-resume of actions after restart.
 
-**Non-question pipeline after this slice:**
+**Non-question pipeline after the command-layer amendment:**
 
 ```
-User input (is_question = false)
-  → single classifier call (intent.py): CHAT | RETRIEVE | REMEMBER | ACTION
-      ACTION   → param extraction → state machine → executor (native | Composio)
-      REMEMBER → existing store/recall flow (unchanged)
-      RETRIEVE → existing docs FTS flow (unchanged)
-      CHAT     → existing reply + synchronous memory assessor (unchanged)
+User input
+  → pad / PENDING / composer continuation (if this turn belongs to an open job)
+  → cosine catalog (SPEC-COMMAND-LAYER) before classify_intent
+      hit  → lock handler → param extraction → state machine → executor
+      miss → classify_intent: CHAT | RETRIEVE | REMEMBER only
+      REMEMBER → existing store/recall flow
+      RETRIEVE → existing docs FTS flow
+      CHAT     → existing reply + synchronous memory assessor
 ```
+
+This is **not** the PDF's Action→Retrieval→Memory→Fallback waterfall. That waterfall stays rejected.
 
 ---
 
 ## 2. Locked decisions (do not relitigate)
 
-1. **Router:** the existing single classifier call in `classify_intent()` is extended with ACTION as a fourth live label. No sequential engine waterfall (the PDF's Action→Retrieval→Memory→Fallback chain is rejected).
+1. **Router:** a pre-intent **cosine catalog** (SPEC-COMMAND-LAYER) runs on every `POST /chat` **before** `classify_intent`. Unique handler hit → skip the classifier, lock the handler. Miss / tie / CHAT-sink → `classify_intent` may emit CHAT | RETRIEVE | REMEMBER only. ACTION is not a classifier label and not a keyword fallback. This cosine **gate** is allowed. The PDF's Action→Retrieval→Memory→Fallback **waterfall** is still rejected.
 2. **Memory scoring:** keep high/medium/low priority + confidence bands mapping to commit/confirm/discard. No 0–10 scale. Scoring stays **synchronous** — the "want me to remember?" ask rides in the same reply, exactly as today.
 3. **Action Engine v1:** external actions (email first) included from day one, gated behind confirmation. Low-risk local actions execute immediately with visible-but-subtle feedback — never fully silent, always audited in `actions_log`.
-4. **Risk tiers are code-enforced** via a whitelist constant in code. Never LLM-judged, never env-configurable.
+4. **Risk lives on the handler object in code.** Looked up after a handler id is locked. Never a whitelist of **user strings**, never LLM output, never env-configurable, never read back from `payload_json`. Matching the user's text is cosine vs prototypes — not scanning `ACTION_WHITELIST` keys.
 5. **Confirmation UX:** Confirm/Cancel **buttons** for high-risk actions. Memory asks stay **typed yes/no**. Buttons = action, typed = memory — this is the disambiguation mechanism (see §10-A).
 6. **Composio** is the external executor (Nathan's directive). The executor is an interface: native macOS for local actions, Composio SDK for external. Missing `COMPOSIO_API_KEY` → classify + confirm still work, then a graceful "email isn't connected yet" reply.
 7. **Schema:** keep `long_term_facts` (with `user_id`). Do **not** adopt the PDF's `entities`/`memories` tables. Add `actions_log` (§6). **No auto-resume** after backend restart — on startup, stale `PENDING`/`AWAITING_INPUT` rows are marked `CANCELLED` (security review decision; the PDF's "resume when AWAITING_INPUT" directive is rejected).
@@ -55,7 +59,9 @@ User input (is_question = false)
 
 ### 3.1 Routing
 
-`classify_intent()` keeps its exact shape — one LLM call, question-first tree. Changes:
+**Superseded for ACTION routing.** `POST /chat` runs the cosine catalog first (SPEC-COMMAND-LAYER). On a unique hit, `classify_intent` is not called. On a miss, `classify_intent` returns CHAT | RETRIEVE | REMEMBER only — no ACTION label, no keyword ACTION fallback. The rest of this section is historical Slice 1 text for the analyzer/state machine that still runs **after** a handler is locked.
+
+`classify_intent()` keeps its question-first tree for non-ACTION. Changes:
 
 - `INTENTS` becomes `("CHAT", "RETRIEVE", "REMEMBER", "ACTION")`; `RESERVED_INTENTS` is removed.
 - In `_classify_with_llm()`, the `kind == "ACTION" → intent = "CHAT"` demotion is deleted: on the non-question path, `kind = ACTION` now yields `intent = ACTION`. The prompt's Step 2b already labels ACTION ("external task (email, remind me to…)"); update the wording from "Parked — still label ACTION" to a live definition: *ACTION = an order to perform a task on the computer or an external service (open an app, send an email). Not a memory instruction, not a doc lookup.*
@@ -166,26 +172,27 @@ Same `michelle.db`, new module `actions.py` (mirrors `long_term_memory.py` conve
 
 ---
 
-## 7. Whitelist v1 (code constant, security-critical)
+## 7. Handler objects (code constant, security-critical)
+
+Risk is a field on the **handler object**, not a filter on what the user typed, not LLM output.
+
+Handlers in code today (metadata after a cosine lock — see SPEC-COMMAND-LAYER):
 
 ```python
-ACTION_WHITELIST = {
-    "open_app": {
-        "risk": "low",
-        "required_params": ["app_name"],
-        "executor": "native",
-    },
-    "send_email": {
-        "risk": "high",
-        "required_params": ["recipient", "subject", "body"],
-        "executor": "composio",
-    },
+# Handler registry. NOT a user-text whitelist.
+# Cosine locks a handler id; risk/params/executor are read from here.
+{
+    "open_app":   {"risk": "low",  "required_params": ["app_names"], "executor": "native"},
+    "close_app":  {"risk": "low",  "required_params": ["app_names"], "executor": "native"},
+    "quit_app":   {"risk": "high", "required_params": ["app_names"], "executor": "native"},
+    "send_email": {"risk": "high", "required_params": ["recipient", "subject", "body"], "executor": "composio"},
 }
 ```
 
-- Risk is read from this dict only. There is no code path where an LLM output, env var, or request field sets or overrides risk (decision 4).
-- Unknown `action_type` → unsupported flow (§3.2), never executed, never logged as an action.
-- Adding an action = adding an entry here + executor support. That's the whole extension surface.
+- Risk is read from this object only, **after** the catalog locks a handler id. There is no code path where an LLM output, env var, request field, or user-string match sets or overrides risk (decision 4).
+- Do **not** use these keys as a substring/keyword filter on the utterance. That is the old routing bug. Matching is cosine vs `command_vectors` prototypes.
+- Unknown handler id → unsupported flow (§3.2), never executed, never logged as an action.
+- Adding a skill = new handler object **plus** prototypes in `command_vectors` (SPEC-COMMAND-LAYER). That is the whole extension surface.
 
 ---
 
@@ -198,10 +205,11 @@ Existing fields are unchanged (R0 protects them). New:
 | `engine` | string | every turn | `"chat"` \| `"retrieve"` \| `"remember"` \| `"action"` |
 | `task_id` | string | action turns | `actions_log.action_id` |
 | `task_status` | string | action turns | the status after this turn's processing |
-| `action_type` | string | action turns | whitelist key |
+| `action_type` | string | action turns | locked handler id |
 | `risk` | string | action turns | `"low"` \| `"high"` |
 | `confirm_required` | bool | action turns | `true` iff `task_status == "PENDING"` |
 | `missing_params` | list | action turns | empty when complete |
+| `routed_by` | string | catalog **hit** only | `"catalog"` (SPEC-COMMAND-LAYER). Omit on classifier turns. |
 
 Notes:
 - `engine` is lowercase and present on **every** turn (QA asserts routing on it). The existing `intent` field stays as-is for back-compat.
@@ -269,7 +277,7 @@ Why: this is exactly how the pending-memory ask behaves today (`main.py` clears 
 | `COMPOSIO_API_KEY` | unset | Composio auth. Absent → graceful not-connected path (§5). Backend must boot without it. |
 | `ACTION_ANALYZER_TIMEOUT` | inherit LLM timeouts | No new knob unless Ned needs one; extraction uses the same `_llm_json` backend as intent. |
 
-Explicitly **not** env vars: the whitelist, risk tiers, confirmation requirements (decision 4). Existing vars (`LLM_PROVIDER`, `INTENT_MODE`, `MEMORY_SAVE_THRESHOLD`, `MEMORY_MIN_PRIORITY`, `MAX_HISTORY`, `MICHELLE_DB_PATH`, etc.) are unchanged.
+Explicitly **not** env vars: handler risk, confirmation requirements, cosine thresholds, catalog on/off (decision 4). Command matching reuses `EMBED_MODEL` (same as the pad). No new embed var. Existing vars (`LLM_PROVIDER`, `INTENT_MODE`, `MEMORY_SAVE_THRESHOLD`, `MEMORY_MIN_PRIORITY`, `MAX_HISTORY`, `MICHELLE_DB_PATH`, etc.) are unchanged.
 
 `.env.example` / README gain `COMPOSIO_API_KEY` documentation.
 

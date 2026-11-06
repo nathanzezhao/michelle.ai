@@ -936,8 +936,8 @@ def test_non_whitelisted_order_is_chat_no_row(client, ids, text):
 
 
 def test_unsupported_after_classify_no_row(client, ids, monkeypatch):
-    # Force the post-classify branch: intent=ACTION but the analyzer returns a
-    # non-whitelisted type — code-side validation must treat it as unsupported.
+    # Miss path: classifier ACTION is coerced to CHAT. A patched analyzer
+    # that returns unsupported must not spawn a row.
     monkeypatch.setattr(
         main,
         "analyze_action_request",
@@ -949,9 +949,8 @@ def test_unsupported_after_classify_no_row(client, ids, monkeypatch):
             "related": False,
         },
     )
-    body = chat(client, "open Notes", ids)
+    body = chat(client, "please do the thing", ids)
     assert body["engine"] == "chat"
-    assert body["answer"] == main.UNSUPPORTED_ACTION_REPLY
     assert_no_task_fields(body)
     assert action_rows(ids) == []
 
@@ -2496,40 +2495,7 @@ def test_ambiguous_draft_pick_survives_on_pad(client, ids, fake_composio):
 # --- Pad follow-ups (try again / it wasn't) ----------------------------------
 
 
-def _stub_pad_embed(text: str):
-    t = (text or "").lower()
-    if any(
-        bit in t
-        for bit in (
-            "unrelated chat",
-            "hello",
-            "what's for lunch",
-            "whats for lunch",
-        )
-    ):
-        return [0.0, 0.0, 1.0]
-    if "clos" in t:
-        return [0.0, 0.5, 0.5]
-    if (
-        t.strip() in {"open it", "open"}
-        or t.startswith("open ")
-        or "open calendar" in t
-        or "opening" in t
-    ):
-        return [0.0, 1.0, 0.0]
-    if any(
-        bit in t
-        for bit in (
-            "try again",
-            "wasn't",
-            "wasnt",
-            "retry quitting",
-            "already quit",
-            "quit",
-        )
-    ):
-        return [1.0, 0.0, 0.0]
-    return [0.0, 0.0, 1.0]
+from conftest import stub_embed_text as _stub_pad_embed
 
 
 def _enable_calendar(fake_open, monkeypatch, running=True):

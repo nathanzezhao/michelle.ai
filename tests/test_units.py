@@ -1272,41 +1272,7 @@ def test_history_for_reply_omits_action_residue_on_greeting():
     assert "nice, indigo is a good one" in contents
 
 
-def _stub_pad_embed(text: str):
-    """Tiny 3-d stand-in: retry-quit / open / close / unrelated. No Ollama."""
-    t = (text or "").lower()
-    if any(
-        bit in t
-        for bit in (
-            "unrelated chat",
-            "hello",
-            "what's for lunch",
-            "whats for lunch",
-        )
-    ):
-        return [0.0, 0.0, 1.0]
-    if "clos" in t:
-        return [0.0, 0.5, 0.5]
-    if (
-        t.strip() in {"open it", "open"}
-        or t.startswith("open ")
-        or "open calendar" in t
-        or "opening" in t
-    ):
-        return [0.0, 1.0, 0.0]
-    if any(
-        bit in t
-        for bit in (
-            "try again",
-            "wasn't",
-            "wasnt",
-            "retry quitting",
-            "already quit",
-            "quit",
-        )
-    ):
-        return [1.0, 0.0, 0.0]
-    return [0.0, 0.0, 1.0]
+from conftest import stub_embed_text as _stub_pad_embed
 
 
 def _calendar_quit_pad():

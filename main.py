@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import actions
+import command_layer
 from intent import (
     analyze_action_request,
     analyze_remember_request,
@@ -49,6 +50,7 @@ load_dotenv()
 init_db()
 long_term_memory.init_db()
 retrieve.init_db()
+command_layer.init_db()
 retrieve.index_docs()
 actions.init_db()
 session_context.init_db()
@@ -367,7 +369,7 @@ def _restore_gmail_composer(user_id: str, conversation_id: str) -> dict | None:
     for key in ("recipient", "subject", "body"):
         if not str(params.get(key) or "").strip() and local.get(key):
             params[key] = local[key]
-    required = actions.ACTION_WHITELIST["send_email"]["required_params"]
+    required = actions.ACTION_HANDLERS["send_email"]["required_params"]
     missing = [p for p in required if not str(params.get(p) or "").strip()]
     action = actions.create_action(
         user_id,
@@ -553,7 +555,7 @@ def _reopen_stashed_draft(
             val = str(stash.get(key) or "").strip()
             if val:
                 params[key] = val
-    required = actions.ACTION_WHITELIST["send_email"]["required_params"]
+    required = actions.ACTION_HANDLERS["send_email"]["required_params"]
     missing = [p for p in required if not str(params.get(p) or "").strip()]
     action = actions.create_action(
         user_id,
@@ -648,6 +650,7 @@ def _handle_action_intents(
     user_id: str,
     conversation_id: str,
     open_action: dict | None,
+    command_hits: list | None = None,
 ) -> tuple[dict, str]:
     """Run every action clause in the message. Chat filler gets a reply too.
 
@@ -656,21 +659,48 @@ def _handle_action_intents(
     Confirm on the current one.
     """
     parsed = parse_mixed_utterance(user_text)
-    clauses = parsed["actions"] or [user_text]
     pad = session_context.get(user_id, conversation_id)
     analyses = []
-    for clause in clauses:
-        analysis = analyze_action_request(
-            clause, reply_history, session_context=pad
-        )
-        print(
-            f"action_clause={clause!r} type={analysis['action_type']} "
-            f"resolved={analysis['resolved_params']} "
-            f"missing={analysis['missing_params']}"
-        )
-        if analysis["action_type"] in actions.ACTION_WHITELIST:
+    if command_hits:
+        for hit in command_hits:
+            locked = str(hit.get("handler_id") or "").strip()
+            clause = str(hit.get("clause") or user_text)
+            if locked not in actions.ACTION_HANDLERS:
+                continue
+            analysis = analyze_action_request(
+                clause,
+                reply_history,
+                session_context=pad,
+                locked_action_type=locked,
+            )
+            analysis = dict(analysis)
+            analysis["action_type"] = locked
+            print(
+                f"action_clause={clause!r} type={analysis['action_type']} "
+                f"resolved={analysis['resolved_params']} "
+                f"missing={analysis['missing_params']}"
+            )
             analyses.append(analysis)
+    else:
+        clauses = parsed["actions"] or [user_text]
+        for clause in clauses:
+            analysis = analyze_action_request(
+                clause, reply_history, session_context=pad
+            )
+            print(
+                f"action_clause={clause!r} type={analysis['action_type']} "
+                f"resolved={analysis['resolved_params']} "
+                f"missing={analysis['missing_params']}"
+            )
+            if analysis["action_type"] in actions.ACTION_HANDLERS:
+                analyses.append(analysis)
 
+    named = []
+    for analysis in analyses:
+        names = (analysis.get("resolved_params") or {}).get("app_names") or []
+        if names:
+            named = list(names)
+            break
     kept = []
     for analysis in analyses:
         missing = analysis.get("missing_params") or []
@@ -678,6 +708,14 @@ def _handle_action_intents(
             analysis["action_type"] in ("close_app", "quit_app", "open_app")
             and missing == ["app_names"]
         )
+        if nameless_app and named:
+            analysis = dict(analysis)
+            resolved = dict(analysis.get("resolved_params") or {})
+            resolved["app_names"] = list(named)
+            analysis["resolved_params"] = resolved
+            analysis["missing_params"] = []
+            kept.append(analysis)
+            continue
         if nameless_app and any(not (a.get("missing_params") or []) for a in analyses):
             continue
         kept.append(analysis)
@@ -706,7 +744,7 @@ def _handle_action_intents(
     immediate = []
     deferred = []
     for analysis in analyses:
-        risk = actions.ACTION_WHITELIST[analysis["action_type"]]["risk"]
+        risk = actions.ACTION_HANDLERS[analysis["action_type"]]["risk"]
         if analysis["missing_params"] or risk == "high":
             deferred.append(analysis)
         else:
@@ -867,9 +905,10 @@ def _action_turn_payload(
     action: dict,
     intent_result: dict,
     attachments=None,
+    routed_by: str | None = None,
 ) -> dict:
     action = _merge_attachments(action, attachments) or action
-    return {
+    payload = {
         "answer": answer,
         "conversation_id": conversation_id,
         "user_id": user_id,
@@ -884,6 +923,9 @@ def _action_turn_payload(
         "engine": "action",
         **_task_fields(action),
     }
+    if routed_by:
+        payload["routed_by"] = routed_by
+    return payload
 
 
 @app.post("/session/start")
@@ -1225,23 +1267,82 @@ def handle_chat(incoming_data: UserMessage):
         # Classify on the same filtered history the reply model sees, so a
         # failed lookup does not bias the next intent toward that topic.
         reply_history = history_for_reply(history, user_text)
-        intent_result = classify_intent(
-            user_text, reply_history, long_term_facts
-        )
+        pad_now = session_context.get(user_id, conversation_id)
         forced = _forced_intent(incoming_data.force_intent)
+        if forced == "ACTION":
+            forced = None
         skip_user_save = bool(forced) and _last_user_content(history) == user_text
 
         def save_user(kind=None):
             if skip_user_save:
                 return
             save_message(conversation_id, "user", user_text, kind=kind)
-        if forced:
+
+        pad_would_promote = (
+            maybe_promote_pad_followup(
+                "CHAT", user_text, pad_now, open_action=open_action
+            )
+            == "ACTION"
+        )
+        skip_command_layer = bool(
+            forced in ("RETRIEVE", "REMEMBER", "CHAT")
+            or pad_would_promote
+            or _looks_like_resume_draft(user_text)
+        )
+
+        command_hits = None
+        if not skip_command_layer:
+            matched = command_layer.match_command(user_text)
+            status = (matched or {}).get("status")
+            if status == "embed_down":
+                answer = command_layer.EMBED_DOWN_REPLY
+                save_user()
+                save_message(conversation_id, "assistant", answer)
+                print(
+                    f"[{provider}] [{conversation_id[:8]}] "
+                    "command_layer=embed_down"
+                )
+                return {
+                    "answer": answer,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "intent": "CHAT",
+                    "remembered": [],
+                    "asked_to_remember": False,
+                    "engine": "chat",
+                }
+            if status == "hit":
+                command_hits = matched.get("hits") or []
+
+        if command_hits:
             intent_result = {
-                **intent_result,
-                "intent": forced,
-                "kind": forced,
+                "intent": "ACTION",
+                "kind": "ACTION",
                 "confidence": 1.0,
+                "is_question": False,
+                "memory_score": 0.0,
+                "docs_score": 0.0,
+                "chat_score": 0.0,
             }
+        else:
+            intent_result = classify_intent(
+                user_text, reply_history, long_term_facts
+            )
+            if forced:
+                intent_result = {
+                    **intent_result,
+                    "intent": forced,
+                    "kind": forced,
+                    "confidence": 1.0,
+                }
+            elif intent_result.get("intent") == "ACTION" and not _looks_like_resume_draft(
+                user_text
+            ):
+                intent_result = {
+                    **intent_result,
+                    "intent": "CHAT",
+                    "kind": "CHAT",
+                }
         intent = intent_result["intent"]
         confidence = intent_result["confidence"]
 
@@ -1254,12 +1355,12 @@ def handle_chat(incoming_data: UserMessage):
             f"chat={intent_result.get('chat_score')} "
             f"intent={intent} ({confidence:.2f})"
             f"{' forced' if forced else ''}"
+            f"{' catalog' if command_hits else ''}"
         )
 
-        pad_now = session_context.get(user_id, conversation_id)
         prior_intent = intent
         pad_promoted = False
-        if not forced:
+        if not forced and not command_hits:
             intent = maybe_promote_pad_followup(
                 intent, user_text, pad_now, open_action=open_action
             )
@@ -1278,6 +1379,7 @@ def handle_chat(incoming_data: UserMessage):
             not forced
             and not open_action
             and not pad_promoted
+            and not command_hits
             and should_clarify_intent(intent_result)
         ):
             save_message(conversation_id, "user", user_text, kind="clarify")
@@ -1382,6 +1484,7 @@ def handle_chat(incoming_data: UserMessage):
                 user_id,
                 conversation_id,
                 open_action,
+                command_hits=command_hits,
             )
             if action is not None:
                 save_user("action")
@@ -1393,6 +1496,7 @@ def handle_chat(incoming_data: UserMessage):
                 return _action_turn_payload(
                     answer, conversation_id, user_id, action, intent_result,
                     attachments=incoming_data.attachments,
+                    routed_by="catalog" if command_hits else None,
                 )
             if _is_resume_chat_reply(answer):
                 save_user("action")
@@ -1855,7 +1959,7 @@ def submit_draft(incoming: SubmitDraftRequest):
             None,
         )
 
-    required = actions.ACTION_WHITELIST["send_email"]["required_params"]
+    required = actions.ACTION_HANDLERS["send_email"]["required_params"]
     resolved = dict(open_action.get("resolved_params") or {})
     recipient = (incoming.recipient or "").strip()
     subject = (incoming.subject or "").strip()
@@ -1907,7 +2011,7 @@ def sync_draft(incoming: SubmitDraftRequest):
             user_id,
             None,
         )
-    required = actions.ACTION_WHITELIST["send_email"]["required_params"]
+    required = actions.ACTION_HANDLERS["send_email"]["required_params"]
     resolved = dict(open_action.get("resolved_params") or {})
     resolved["recipient"] = (incoming.recipient or "").strip()
     resolved["subject"] = (incoming.subject or "").strip()

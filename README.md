@@ -20,22 +20,24 @@ Project roadmap and checklist: [ROADMAP.md](ROADMAP.md)
 
 - **Regular:** last `MAX_HISTORY` messages (default 10) from SQLite per conversation
 - **Long-term:** durable facts (e.g. name) per `user_id`, injected every turn
-- Flow: `main.py` → `memory.py` / `long_term_memory.py` → `intent.py` → `llm.py` / `retrieve.py`
+- Flow: `main.py` → `memory.py` / `long_term_memory.py` → pad/PENDING continuation → cosine command layer → `intent.py` (CHAT/RETRIEVE/REMEMBER) → `llm.py` / `retrieve.py` / ACTION engine
 
 ## Intents
 
 - **CHAT** → normal reply from Ollama/Gemini/mock
 - **RETRIEVE** → search files in `docs/` (SQLite FTS), then answer from snippets
 - **REMEMBER** → keep something / recall something already saved
-- **ACTION** → do a task. v1 whitelist:
+- **ACTION** → do a task. Command match is **embedding vs handlers**, not keywords. Cosine catalog runs on every `POST /chat` before the classifier (`EMBED_MODEL`, same helper as the pad; default `nomic-embed-text` via `RETRIEVE_EMBED_MODEL` fallback). **No new env var.** Handlers:
   - `open_app` — runs now (`open -a` on macOS)
+  - `close_app` / `quit_app` — native; quit is high-risk (Confirm)
   - `send_email` — glass composer (to / subject / body, urgent, attach, generate body) then **Confirm / Cancel**. Sent via Composio Gmail. Everything else is refused. Every attempt is audited in `actions_log`.
+  Risk lives on the handler object in code, not on the user's words. Miss/tie → chat/docs/memory only. See [SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md).
 
 Say *send an email* (even without the details). Michelle asks for what’s missing and the composer drops under her message. Fill it, press **Send** with the chat box empty (or Enter in the body), then Confirm. Send posts the fields as an email draft — it does not run the body through chat, intent, or memory. Files and generate sit in the same bottom bar as Send.
 
 **Tap — microphone (email composer only).** Tap **tap** to record the body; tap again to stop. Whisper transcribes what you said, then the LLM only fixes grammar and fillers — it does not chat as Michelle, does not read long-term memory, and does not rewrite the letter. Voice is body-only: it never sends mail. **Confirm** is still required.
 
-**Chat-bar mic is next** ([SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md)): that recording will transcribe, then run the same `/chat` path as typing (session pad + classifier). Do not send it through this composer tap.
+**Chat-bar mic is shipped** ([SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md)): tap/tap on the main input row. Transcript fills the field; you hit **Send**. That turn is the same `/chat` path as typing (pad → cosine command layer → classifier). Do not send chat-bar audio through composer tap. Header Voice blob still uses `POST /chat/voice`.
 
 On first hold, macOS may ask for the microphone. That press does not send (and does not tap-draft). Allow, then hold again.
 
@@ -73,6 +75,8 @@ INTENT_MODE=llm      ← default; uses the SAME model as LLM_PROVIDER (Ollama or
 INTENT_MODE=rules    ← keyword matching only (no model call)
 INTENT_MODE=mock     ← simplest keywords, for terminal testing
 ```
+
+Command matching does **not** use `INTENT_MODE` keywords. It uses `embeddings.py` (`EMBED_MODEL`, same as the pad). Rules/mock still classify CHAT/RETRIEVE/REMEMBER on a catalog miss; they must not keyword-route ACTION.
 
 So with `LLM_PROVIDER=ollama` + `INTENT_MODE=llm`, Ollama does chat **and** intent/remember detection first (rules only if Ollama fails).
 
@@ -122,4 +126,6 @@ Click top left square → Collapse animation → Square into circle
 
 Click floating circle → Expand animation
 
-Email composer: to / subject / body in the chat card; **files**, **undo**, and **tap** (mic) stay pinned above Send. Tap the mic to record the body, tap again to stop. Chat history in that pane scrolls. Confirm / Cancel still appear once the draft is complete.
+Email composer: to / subject / body in the chat card; **files**, **undo**, and **tap** (mic) stay pinned above Send. Tap the mic to record the body, tap again to stop. Chat-row mic is on the main input (`[input] [mic] [Send]`) and hides while the composer is open. Chat history in that pane scrolls. Confirm / Cancel still appear once the draft is complete.
+
+If she's unsure (docs vs remember vs chat), she shows chips — Look up docs / Remember / Just chat. There is no **Do this** chip.
