@@ -30,8 +30,10 @@ Requires `.env` for provider keys. See README for Composio Gmail setup.
 ```
 POST /chat
   → load history + long-term facts (memory.py, long_term_memory.py)
-  → classify_intent → CHAT | RETRIEVE | REMEMBER | ACTION
-  → engine for that intent
+  → pad / PENDING / composer continuation
+  → cosine command layer (hit → ACTION)
+  → else classify_intent → CHAT | RETRIEVE | REMEMBER
+  → RETRIEVE: code evaluator; close-miss asks once
   → save turn (+ facts / action audit row)
 ```
 

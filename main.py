@@ -25,6 +25,8 @@ from intent import (
     parse_mixed_utterance,
     should_clarify_intent,
     usable_memory_facts,
+    _is_greeting_only,
+    _looks_like_composer_dismiss,
     CLARIFY_CHIPS,
     CLARIFY_REPLY,
     INTENTS,
@@ -35,10 +37,12 @@ from intent import (
     _looks_like_resume_draft,
 )
 from llm import (
+    RETRIEVE_MISS_REPLY,
     ask_llm,
     ask_llm_with_context,
     history_for_reply,
     polish_email_body,
+    retrieve_close_miss_reply,
 )
 import long_term_memory
 from memory import get_full_history, get_history, init_db, save_message
@@ -233,6 +237,11 @@ def _task_fields(action: dict) -> dict:
         "missing_params": action["missing_params"],
         "resolved_params": action.get("resolved_params") or {},
     }
+
+
+def _is_retrieve_diag_bail(text: str) -> bool:
+    stripped = (text or "").strip()
+    return _is_greeting_only(stripped) or _looks_like_composer_dismiss(stripped)
 
 
 def _missing_ask(action_type: str, missing: list) -> str:
@@ -1295,6 +1304,7 @@ def handle_chat(incoming_data: UserMessage):
             matched = command_layer.match_command(user_text)
             status = (matched or {}).get("status")
             if status == "embed_down":
+                session_context.clear_retrieve_gap(user_id, conversation_id)
                 answer = command_layer.EMBED_DOWN_REPLY
                 save_user()
                 save_message(conversation_id, "assistant", answer)
@@ -1314,7 +1324,43 @@ def handle_chat(incoming_data: UserMessage):
             if status == "hit":
                 command_hits = matched.get("hits") or []
 
-        if command_hits:
+        diag_claimed = None
+        awaiting_action = bool(
+            open_action and open_action.get("status") == "AWAITING_INPUT"
+        )
+        if (
+            command_hits
+            or awaiting_action
+            or pad_would_promote
+            or forced
+        ):
+            session_context.clear_retrieve_gap(user_id, conversation_id)
+            pad_now = session_context.get(user_id, conversation_id)
+        else:
+            gap = (pad_now or {}).get("last_retrieve_gap") or {}
+            if gap.get("query"):
+                if _is_retrieve_diag_bail(user_text):
+                    session_context.clear_retrieve_gap(user_id, conversation_id)
+                    pad_now = session_context.get(user_id, conversation_id)
+                else:
+                    merged = f"{gap['query']} {user_text}".strip()
+                    diag_claimed = retrieve.evaluate_search(
+                        merged, keep_query=user_text
+                    )
+                    session_context.clear_retrieve_gap(user_id, conversation_id)
+                    pad_now = session_context.get(user_id, conversation_id)
+
+        if diag_claimed is not None:
+            intent_result = {
+                "intent": "RETRIEVE",
+                "kind": "RETRIEVE",
+                "confidence": 1.0,
+                "is_question": True,
+                "memory_score": 0.0,
+                "docs_score": 1.0,
+                "chat_score": 0.0,
+            }
+        elif command_hits:
             intent_result = {
                 "intent": "ACTION",
                 "kind": "ACTION",
@@ -1360,7 +1406,7 @@ def handle_chat(incoming_data: UserMessage):
 
         prior_intent = intent
         pad_promoted = False
-        if not forced and not command_hits:
+        if not forced and not command_hits and diag_claimed is None:
             intent = maybe_promote_pad_followup(
                 intent, user_text, pad_now, open_action=open_action
             )
@@ -1380,6 +1426,7 @@ def handle_chat(incoming_data: UserMessage):
             and not open_action
             and not pad_promoted
             and not command_hits
+            and diag_claimed is None
             and should_clarify_intent(intent_result)
         ):
             save_message(conversation_id, "user", user_text, kind="clarify")
@@ -1656,19 +1703,33 @@ def handle_chat(incoming_data: UserMessage):
                         session_context=pad_now,
                     )
         elif intent == "RETRIEVE":
-            context, chunks = retrieve.answer_from_docs(user_text)
+            retry = diag_claimed is not None
+            outcome = diag_claimed or retrieve.evaluate_search(user_text)
+            chunks = outcome.get("chunks") or []
+            context = outcome.get("context") or ""
+            status = outcome.get("status") or "hopeless"
             sources = sorted({chunk["source"] for chunk in chunks})
             print(
                 f"[{provider}] [{conversation_id[:8]}] "
-                f"retrieve_hits={len(chunks)} sources={sources}"
+                f"retrieve_hits={len(chunks)} sources={sources} "
+                f"eval={status}{' retry' if retry else ''}"
             )
-            answer = ask_llm_with_context(
-                user_text,
-                context,
-                reply_history,
-                long_term_facts,
-                session_context=pad_now,
-            )
+            if status == "hit":
+                answer = ask_llm_with_context(
+                    user_text,
+                    context,
+                    [] if retry else reply_history,
+                    long_term_facts,
+                    session_context=pad_now,
+                )
+            elif retry or status == "hopeless":
+                session_context.clear_retrieve_gap(user_id, conversation_id)
+                answer = RETRIEVE_MISS_REPLY
+            else:
+                session_context.set_retrieve_gap(
+                    user_id, conversation_id, user_text
+                )
+                answer = retrieve_close_miss_reply()
         else:
             answer = ask_llm(
                 user_text,

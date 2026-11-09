@@ -55,6 +55,12 @@ RETRIEVE_MISS_REPLY = (
     "Try another question, or add a file under the docs/ folder and restart the backend."
 )
 
+RETRIEVE_CLOSE_MISS_QUESTION = "Which topic or document did you mean?"
+
+
+def retrieve_close_miss_reply() -> str:
+    return f"{RETRIEVE_MISS_REPLY} {RETRIEVE_CLOSE_MISS_QUESTION}"
+
 RETRIEVE_SYSTEM_EXTRA = (
     "You are answering using the document snippets provided below. "
     "If a snippet is about the same topic as the question, answer from it — "

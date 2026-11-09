@@ -2,12 +2,13 @@
 
 Reference doc for what's done, what's next, and what's planned later.
 
-**Build order:** Memory + ACTION v1 are in. **Voice UI (three modes, blob default)** is in via Vite/React renderer ([SPEC-VOICE-UI.md](SPEC-VOICE-UI.md)). **Chat voice backend** (`POST /chat/voice`) is wired. **Chat-bar mic shipped.** **Clarifying chips shipped** (Look up docs / Remember / Just chat — **no Do this**). **Current Track 2 slice: command embedding layer** ([SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md)). **Inbox briefing PARKED.** Then evaluator miss → one diagnostic follow-up. Park SSE, escalation, and auth/hardening. Then screen capture / vision. Do not call inbox briefing “scraping.”
+**Build order:** Memory + ACTION v1 are in. **Voice UI (three modes, blob default)** is in via Vite/React renderer ([SPEC-VOICE-UI.md](SPEC-VOICE-UI.md)). **Chat voice backend** (`POST /chat/voice`) is wired. **Chat-bar mic shipped.** **Clarifying chips shipped** (Look up docs / Remember / Just chat — **no Do this**). **Command embedding layer shipped** ([SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md)). **Current Track 2 slice: retrieve evaluator + one diagnostic** ([SPEC-RETRIEVE-EVAL.md](SPEC-RETRIEVE-EVAL.md)). **Inbox briefing PARKED.** Park SSE, escalation, and auth/hardening. Then screen capture / vision. Do not call inbox briefing “scraping.”
 
 **Screen capture source doc:** `/Users/nathan/Downloads/desktop_ai_agent_roadmap_screencapture.pdf`
 
 **Slice 1 spec:** [SPEC-PIPELINE.md](SPEC-PIPELINE.md) (ACTION engine; routing amended).
-**Current Track 2 spec:** [SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md) (pre-intent cosine catalog).
+**Command-layer spec:** [SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md) (pre-intent cosine catalog, shipped).
+**Current Track 2 spec:** [SPEC-RETRIEVE-EVAL.md](SPEC-RETRIEVE-EVAL.md) (code evaluator + one close-miss diagnostic).
 **Chat-bar mic spec:** [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md) (shipped). Do not put specs in `docs/` — that folder is Michelle's RAG KB.
 
 ---
@@ -46,11 +47,11 @@ Reference doc for what's done, what's next, and what's planned later.
 ```
 main.py → memory.py (last N turns + long-term facts)
        → pad / PENDING / composer continuation (if the turn belongs to an open job)
-       → cosine command layer (handlers; skip classify on hit)   ← current Track 2 slice
+       → cosine command layer (handlers; skip classify on hit)
        → else intent.py (CHAT | RETRIEVE | REMEMBER only)
        → ACTION (catalog hit): locked handler → params → actions_log → native or Composio
        → REMEMBER: existing store/recall
-       → RETRIEVE: docs/ FTS
+       → RETRIEVE: docs/ FTS + code evaluator; close-miss asks once   ← current Track 2 slice
        → CHAT: reply + synchronous memory assessor
        → save turn / facts / action row
 ```
@@ -84,15 +85,16 @@ From the original Michelle architecture (intent router → RAG → agents):
 - [x] **Chat-bar microphone** — shipped. See [SPEC-CHAT-VOICE.md](SPEC-CHAT-VOICE.md). Tap/tap. `[input] [mic] [Send]`. Hide mic while email composer is open. Header Voice blob stays. Transcript fills the input; user hits Send (does **not** auto-run `/chat`). Email composer tap stays isolated.
 - [x] **ACTION engine v1** — handlers `open_app` + `close_app` + `quit_app` + `send_email` (Composio), Confirm/Cancel, composer UI, `actions_log`. Risk on the handler object in code.
 - [x] **Intent clarifying questions** — shipped **without Do this**. If `confidence < 0.6` and top two labels are close: chips (Look up docs / Remember / Just chat). Rules/mock never ask. `force_intent` CHAT | RETRIEVE | REMEMBER re-runs the same utterance. `force_intent=ACTION` is ignored. Close = shelf-score gap ≤ 0.15.
-- [ ] **Command embedding layer (current slice)** — cosine catalog before `classify_intent`. Handlers, not keywords. [SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md).
+- [x] **Command embedding layer** — cosine catalog before `classify_intent`. Handlers, not keywords. [SPEC-COMMAND-LAYER.md](SPEC-COMMAND-LAYER.md).
 - [x] **RETRIEVE v1** — local `docs/` ingest + SQLite FTS5 + grounded answers (sample KB included)
 - [x] **RETRIEVE v2 (baseline)** — query translator + optional Ollama embeddings hybrid behind `retrieve.search()` (`RETRIEVE_V2=1`)
+- [ ] **Retrieve evaluator + one diagnostic (current slice)** — code miss gate; close-miss asks once. [SPEC-RETRIEVE-EVAL.md](SPEC-RETRIEVE-EVAL.md).
 - [ ] **Inbox briefing — PARKED.** Do not start. Not the current slice. Spec below is kept so we do not reinvent it later.
 - [ ] **More actions** — calendar, Slack, etc. Still new handler object + prototypes, risk in code, never LLM-judged. `quit_app` / `close_app` already exist — do not rebuild them as “new.” Inbox briefing is **not** the next ACTION.
 
 ### Inbox briefing (PARKED — not started)
 
-**Parked.** Command embedding layer is the current Track 2 slice. Do not assign Ned/Kit on briefing until Nathan unparks it.
+**Parked.** Retrieve evaluator is the current Track 2 slice. Do not assign Ned/Kit on briefing until Nathan unparks it.
 
 **User outcome:** After Gmail is connected, the user can get a short briefing of recent inbox mail (from / subject + a few bullets). Copy: “inbox briefing” / “catch me up.” Never “scraping.”
 
@@ -228,7 +230,7 @@ let htmlContent = element.innerHTML;
 | Intent | Today |
 |--------|-------|
 | CHAT | Ollama/Gemini/mock reply |
-| RETRIEVE | Search `docs/` (FTS5) + grounded answer |
+| RETRIEVE | Search `docs/` (FTS5) + code evaluator. Close-miss asks once. |
 | REMEMBER | Store or recall long-term facts |
 | ACTION | Cosine match to handlers (`open_app`, `close_app`, `quit_app`, `send_email`) — not keywords. Composer + Confirm → Composio Gmail. Inbox briefing PARKED. |
 
@@ -252,7 +254,8 @@ let htmlContent = element.innerHTML;
 | `main.js` | Window collapse/expand, drag |
 | `tests/` | R0/R1 pytest (httpx); `COMPOSIO_API_KEY` unset in suite |
 | `SPEC-PIPELINE.md` | Slice 1 ACTION engine spec; routing amended by command layer |
-| `SPEC-COMMAND-LAYER.md` | Current Track 2: pre-intent cosine catalog (not a RAG doc) |
+| `SPEC-COMMAND-LAYER.md` | Pre-intent cosine catalog (shipped; not a RAG doc) |
+| `SPEC-RETRIEVE-EVAL.md` | Current Track 2: code retrieve evaluator + one diagnostic |
 | `SPEC-CHAT-VOICE.md` | Chat-bar mic (shipped) → Whisper → `/chat` (not email tap) |
 | `michelle.db` | Local chat archive + facts + doc index + actions (gitignored) |
 

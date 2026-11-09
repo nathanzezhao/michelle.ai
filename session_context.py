@@ -10,6 +10,7 @@ replies also read it, via format_for_prompt. Email body polish does not.
 
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -39,6 +40,9 @@ def init_db() -> None:
         )
 
 
+_EMAIL_IN_TEXT_RE = re.compile(r"\S+@\S+")
+
+
 def _empty() -> dict:
     return {
         "last_opened": [],
@@ -48,11 +52,22 @@ def _empty() -> dict:
         "last_action_type": None,
         "last_draft": None,
         "last_draft_pick": None,
+        "last_retrieve_gap": None,
     }
 
 
 def _clean_text(value) -> str:
     return str(value or "").strip()
+
+
+def _normalize_retrieve_gap(gap) -> dict | None:
+    if not isinstance(gap, dict):
+        return None
+    query = _EMAIL_IN_TEXT_RE.sub(" ", _clean_text(gap.get("query")))
+    query = re.sub(r"\s+", " ", query).strip()[:400]
+    if not query:
+        return None
+    return {"query": query, "asked": bool(gap.get("asked"))}
 
 
 def _normalize_last_draft(draft) -> dict | None:
@@ -165,6 +180,7 @@ def get(user_id: str, conversation_id: str) -> dict:
     pad["last_action_type"] = str(action_type).strip() if action_type else None
     pad["last_draft"] = _normalize_last_draft(stored.get("last_draft"))
     pad["last_draft_pick"] = _normalize_last_draft_pick(stored.get("last_draft_pick"))
+    pad["last_retrieve_gap"] = _normalize_retrieve_gap(stored.get("last_retrieve_gap"))
     return pad
 
 
@@ -174,6 +190,7 @@ def put(user_id: str, conversation_id: str, payload: dict) -> dict:
         pad.update(payload)
     pad["last_draft"] = _normalize_last_draft(pad.get("last_draft"))
     pad["last_draft_pick"] = _normalize_last_draft_pick(pad.get("last_draft_pick"))
+    pad["last_retrieve_gap"] = _normalize_retrieve_gap(pad.get("last_retrieve_gap"))
     blob = json.dumps(pad)
     with _connect() as conn:
         conn.execute(
@@ -281,6 +298,18 @@ def set_draft_pick(user_id: str, conversation_id: str, pick) -> dict:
 
 def clear_draft_pick(user_id: str, conversation_id: str) -> dict:
     return set_draft_pick(user_id, conversation_id, None)
+
+
+def set_retrieve_gap(user_id: str, conversation_id: str, query: str) -> dict:
+    pad = get(user_id, conversation_id)
+    pad["last_retrieve_gap"] = {"query": query, "asked": True}
+    return put(user_id, conversation_id, pad)
+
+
+def clear_retrieve_gap(user_id: str, conversation_id: str) -> dict:
+    pad = get(user_id, conversation_id)
+    pad["last_retrieve_gap"] = None
+    return put(user_id, conversation_id, pad)
 
 
 def pad_draft_stash(user_id: str, conversation_id: str) -> dict | None:

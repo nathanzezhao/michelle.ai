@@ -348,6 +348,16 @@ def search(query: str, limit: int = TOP_K) -> list[dict]:
     return _merge_hybrid(fts_hits, vector_hits, limit)
 
 
+_GENERIC_CONTENT = {
+    "policy",
+    "document",
+    "documents",
+    "company",
+    "information",
+    "details",
+    "question",
+}
+
 _CONTENT_STOP = {
     "the",
     "and",
@@ -384,16 +394,43 @@ def _content_tokens(text: str) -> set[str]:
     return tokens - _CONTENT_STOP
 
 
+def _distinctive_tokens(text: str) -> set[str]:
+    return {
+        tok
+        for tok in _content_tokens(text)
+        if len(tok) >= 6 and tok not in _GENERIC_CONTENT
+    }
+
+
+def _token_in_chunk(needle: str, haystack: set[str]) -> bool:
+    if needle in haystack:
+        return True
+    if len(needle) < 6:
+        return False
+    for item in haystack:
+        if len(item) < 6:
+            continue
+        if item.startswith(needle) or needle.startswith(item):
+            return True
+    return False
+
+
 def _relevant_chunks(query: str, chunks: list[dict]) -> list[dict]:
-    """Drop FTS hits that don't actually share the question's content words."""
+    """Keep chunks that actually share the question's distinctive words.
+
+    Empty query tokens is a miss (not keep-all). Generic overlap like
+    'policy' alone is not enough.
+    """
     query_tokens = _content_tokens(query)
     if not query_tokens or not chunks:
-        return chunks
-    need = 2 if len(query_tokens) >= 2 else 1
+        return []
+    distinctive = _distinctive_tokens(query)
+    if not distinctive:
+        return []
     kept = []
     for chunk in chunks:
-        overlap = query_tokens & _content_tokens(chunk.get("content", ""))
-        if len(overlap) >= need:
+        chunk_tokens = _content_tokens(chunk.get("content", ""))
+        if all(_token_in_chunk(tok, chunk_tokens) for tok in distinctive):
             kept.append(chunk)
     return kept
 
@@ -409,7 +446,44 @@ def format_context(chunks: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
+def _search_recall(query: str) -> list[dict]:
+    """FTS hits plus simple plural stems so 'refunds' can recall 'refund'."""
+    hits = list(search(query) or [])
+    seen = {(hit.get("source"), hit.get("content")) for hit in hits}
+    stems = []
+    for tok in _distinctive_tokens(query):
+        if tok.endswith("s") and len(tok) > 6:
+            stems.append(tok[:-1])
+    extra_query = " ".join(stems)
+    if extra_query:
+        for hit in search(extra_query) or []:
+            key = (hit.get("source"), hit.get("content"))
+            if key not in seen:
+                hits.append(hit)
+                seen.add(key)
+    return hits
+
+
+def evaluate_search(query: str, keep_query: str | None = None) -> dict:
+    """Code evaluator: hit, close_miss (raw hits dropped), or hopeless."""
+    keep = keep_query if keep_query is not None else query
+    raw = _search_recall(query)
+    if keep_query and keep_query.strip() and keep_query.strip() != (query or "").strip():
+        seen = {(hit.get("source"), hit.get("content")) for hit in raw}
+        for hit in _search_recall(keep_query):
+            key = (hit.get("source"), hit.get("content"))
+            if key not in seen:
+                raw.append(hit)
+                seen.add(key)
+    kept = _relevant_chunks(keep, raw)
+    if kept:
+        return {"status": "hit", "chunks": kept, "context": format_context(kept)}
+    if raw:
+        return {"status": "close_miss", "chunks": [], "context": ""}
+    return {"status": "hopeless", "chunks": [], "context": ""}
+
+
 def answer_from_docs(query: str) -> tuple[str, list[dict]]:
     """Search docs and return (context_string, chunks)."""
-    chunks = _relevant_chunks(query, search(query))
-    return format_context(chunks), chunks
+    outcome = evaluate_search(query)
+    return outcome["context"], outcome["chunks"]

@@ -31,7 +31,7 @@ User input
       hit  → lock handler → param extraction → state machine → executor
       miss → classify_intent: CHAT | RETRIEVE | REMEMBER only
       REMEMBER → existing store/recall flow
-      RETRIEVE → existing docs FTS flow
+      RETRIEVE → docs FTS + code evaluator (SPEC-RETRIEVE-EVAL); close-miss asks once
       CHAT     → existing reply + synchronous memory assessor
 ```
 
@@ -49,7 +49,7 @@ This is **not** the PDF's Action→Retrieval→Memory→Fallback waterfall. That
 6. **Composio** is the external executor (Nathan's directive). The executor is an interface: native macOS for local actions, Composio SDK for external. Missing `COMPOSIO_API_KEY` → classify + confirm still work, then a graceful "email isn't connected yet" reply.
 7. **Schema:** keep `long_term_facts` (with `user_id`). Do **not** adopt the PDF's `entities`/`memories` tables. Add `actions_log` (§6). **No auto-resume** after backend restart — on startup, stale `PENDING`/`AWAITING_INPUT` rows are marked `CANCELLED` (security review decision; the PDF's "resume when AWAITING_INPUT" directive is rejected).
 8. **/chat contract** gains `engine` plus action fields (§8) so QA can assert routing. Memory decisions already exposed via `remembered`/`asked_to_remember`.
-9. **DNE stays internal.** User-facing copy for retrieval misses stays conversational (current `RETRIEVE_MISS_REPLY`). No "Does Not Exist (DNE)" string ever reaches the user.
+9. **DNE stays internal.** User-facing copy for retrieval misses stays conversational (`RETRIEVE_MISS_REPLY`). Hopeless and second-miss answers are that sentence verbatim. Close-miss appends one template question — see [SPEC-RETRIEVE-EVAL.md](SPEC-RETRIEVE-EVAL.md). No "Does Not Exist (DNE)" string ever reaches the user.
 10. **Tests first.** Ada's R0 regression suite over current behavior is a prerequisite. This spec + R0 gate Slice 1 code.
 11. **Document vectors** (sqlite-vec + nomic-embed-text) are Slice 2, after Oz's venv fix. Mentioned here only as the next slice.
 
@@ -291,7 +291,7 @@ Explicitly **not** env vars: handler risk, confirmation requirements, cosine thr
 - Auto-resume/replay of actions after restart (explicitly rejected — startup cancels).
 - More than one pending action; action queues; scheduled/deferred actions ("remind me at 5").
 - Any action beyond `open_app` and `send_email`; any Composio toolkit beyond email.
-- User-facing DNE wording changes; retrieval behavior changes of any kind.
+- User-facing DNE wording. Retrieval miss copy is governed by SPEC-RETRIEVE-EVAL (verbatim hopeless/second miss; close-miss stem + one question).
 - Streaming/SSE, UI history reload, auth/rate limiting (tracked in ROADMAP).
 - Changes to memory thresholds, priority bands, or the yes/no memory flow.
 
@@ -306,7 +306,7 @@ All assertable via `/chat` / `/action/confirm` JSON plus direct `actions_log`/`l
 2. "open Notes" → `engine: "action"`, `action_type: "open_app"`, `risk: "low"`, `confirm_required: false`, `task_status: "SUCCESS"` (or `FAILED` with an honest answer if the app doesn't exist), and an `actions_log` row exists. (M)
 3. "send an email to alex@example.com subject hi body hello" → `engine: "action"`, `action_type: "send_email"`, `risk: "high"`, `confirm_required: true`, `task_status: "PENDING"`, `missing_params: []`.
 4. A non-whitelisted order ("delete all my files", "book a flight") → `engine: "chat"`, no task fields, no `actions_log` row, reply says she can't do that. **Zero** execution paths for non-whitelist types (code inspection + test).
-5. Existing R0 behaviors unchanged: greeting/name flow, RETRIEVE hit + miss copy (`RETRIEVE_MISS_REPLY` verbatim), REMEMBER store/recall, memory auto-save only at high priority + confidence ≥ `MEMORY_SAVE_THRESHOLD`, medium → `asked_to_remember: true`, low → silent discard.
+5. Existing R0 behaviors unchanged except retrieval miss (SPEC-RETRIEVE-EVAL): greeting/name flow, RETRIEVE **hit** copy, hopeless/second-miss `RETRIEVE_MISS_REPLY` verbatim, close-miss stem + one question, REMEMBER store/recall, memory auto-save only at high priority + confidence ≥ `MEMORY_SAVE_THRESHOLD`, medium → `asked_to_remember: true`, low → silent discard.
 
 **State machine**
 6. "send an email to alex" (no subject/body) → `task_status: "AWAITING_INPUT"`, `missing_params` lists `subject`,`body`; reply asks for them. Follow-up supplying both → same `task_id`, `task_status: "PENDING"`, buttons payload present.

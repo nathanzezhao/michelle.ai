@@ -15,10 +15,16 @@ def test_refund_question_hits_doc(client, ids):
 
 
 def test_unknown_topic_misses(client, ids):
+    """Teleportation+policy is a close-miss on the sample/test KB (FTS hits
+    'policy', evaluator drops 'teleportation'). Stem + one question."""
     body = chat(client, "what is the teleportation policy", ids)
     assert body["intent"] == "RETRIEVE"
     assert body["sources"] == []
-    assert body["answer"] == RETRIEVE_MISS_REPLY
+    assert body["answer"].startswith(RETRIEVE_MISS_REPLY)
+    assert body["answer"] != RETRIEVE_MISS_REPLY
+    assert "?" in body["answer"]
+    assert "DNE" not in body["answer"]
+    assert "Does Not Exist" not in body["answer"]
 
 
 def test_chat_after_miss_is_not_stuck_on_topic(client, ids):

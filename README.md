@@ -86,7 +86,7 @@ So with `LLM_PROVIDER=ollama` + `INTENT_MODE=llm`, Ollama does chat **and** inte
 2. Restart the backend (`b`) so Michelle re-indexes.
 3. Ask things like “What’s the refund policy?” or “How much vacation do we get?”
 
-No Postgres. Search is local SQLite full-text over that folder. Later you can swap in embeddings/pgvector behind the same retrieve API.
+If she finds overlapping docs but not a real answer, she’ll say she couldn’t find it and ask **once** which topic you meant. A total miss stays the short “nothing relevant” sentence. No Postgres. Search is local SQLite full-text over that folder. Later you can swap in embeddings/pgvector behind the same retrieve API.
 
 Try these demo questions against the sample KB:
 

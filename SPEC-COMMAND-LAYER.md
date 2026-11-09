@@ -1,7 +1,7 @@
 # SPEC-COMMAND-LAYER — Pre-intent cosine catalog
 
 **Author:** Sam (product), from Nathan (locked)
-**Status:** Approved for build — current Track 2 slice. Inbox briefing stays PARKED.
+**Status:** Shipped. Inbox briefing stays PARKED. Current Track 2 slice is [SPEC-RETRIEVE-EVAL.md](SPEC-RETRIEVE-EVAL.md).
 **Note:** This file lives at repo root on purpose. Do not move it into `docs/` — that folder is Michelle's RAG knowledge base and this spec would pollute retrieval.
 
 Replaces ACTION *routing* in [SPEC-PIPELINE.md](SPEC-PIPELINE.md) §2.1. Does **not** replace the ACTION state machine, Confirm/Cancel, executors, or `actions_log`. Those still run **after** a handler is locked.
