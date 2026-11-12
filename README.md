@@ -27,7 +27,7 @@ Project roadmap and checklist: [ROADMAP.md](ROADMAP.md)
 - **CHAT** → normal reply from Ollama/Gemini/mock
 - **RETRIEVE** → search files in `docs/` (SQLite FTS), then answer from snippets
 - **REMEMBER** → keep something / recall something already saved
-- **ACTION** → do a task. Command match is **embedding vs handlers**, not keywords. Cosine catalog runs on every `POST /chat` before the classifier (`EMBED_MODEL`, same helper as the pad; default `nomic-embed-text` via `RETRIEVE_EMBED_MODEL` fallback). **No new env var.** Handlers:
+- **ACTION** → do a task. Command match is **embedding vs handlers**, not keywords. Cosine catalog runs on every `POST /chat` before the classifier (`EMBED_MODEL`, same helper as the pad; default `sentence-transformers/all-MiniLM-L6-v2`). **No new env var.** Ollama is chat/intent only — not embeddings. Restart `b` after this swap so `command_vectors` re-embed. Handlers:
   - `open_app` — runs now (`open -a` on macOS)
   - `close_app` / `quit_app` — native; quit is high-risk (Confirm)
   - `send_email` — glass composer (to / subject / body, urgent, attach, generate body) then **Confirm / Cancel**. Sent via Composio Gmail. Everything else is refused. Every attempt is audited in `actions_log`.
@@ -76,9 +76,9 @@ INTENT_MODE=rules    ← keyword matching only (no model call)
 INTENT_MODE=mock     ← simplest keywords, for terminal testing
 ```
 
-Command matching does **not** use `INTENT_MODE` keywords. It uses `embeddings.py` (`EMBED_MODEL`, same as the pad). Rules/mock still classify CHAT/RETRIEVE/REMEMBER on a catalog miss; they must not keyword-route ACTION.
+Command matching does **not** use `INTENT_MODE` keywords. It uses `embeddings.py` (local MiniLM via Sentence Transformers, `EMBED_MODEL`). Rules/mock still classify CHAT/RETRIEVE/REMEMBER on a catalog miss; they must not keyword-route ACTION.
 
-So with `LLM_PROVIDER=ollama` + `INTENT_MODE=llm`, Ollama does chat **and** intent/remember detection first (rules only if Ollama fails).
+So with `LLM_PROVIDER=ollama` + `INTENT_MODE=llm`, Ollama does chat **and** intent/remember detection first (rules only if Ollama fails). It does not embed commands.
 
 ## Docs / RETRIEVE (how to “link” your own files)
 

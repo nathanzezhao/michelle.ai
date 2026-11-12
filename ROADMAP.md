@@ -246,7 +246,7 @@ let htmlContent = element.innerHTML;
 | `docs/` | Sample + user knowledge base (`.md` / `.txt`) |
 | `scripts/reset_michelle.sh` | Wipe local DB so another person starts clean |
 | `intent.py` | Intent router (CHAT/RETRIEVE/REMEMBER) + memory assessor + action analyzer |
-| `embeddings.py` | Pad + command-layer embed (`EMBED_MODEL` / `nomic-embed-text`). No extra env for catalog. |
+| `embeddings.py` | Pad + command-layer embed (`EMBED_MODEL` / MiniLM). No extra env for catalog. Ollama is not the embedder. |
 | `actions.py` | Handler objects (risk/params/executor), `actions_log`, native + Composio executors |
 | `llm.py` | Chat replies + grounded RETRIEVE answers |
 | `main.py` | `/chat`, `/session/start`, `/action/confirm`, `/action/draft_body` |

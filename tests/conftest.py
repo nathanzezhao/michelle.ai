@@ -160,6 +160,9 @@ def deterministic_env(monkeypatch):
     import intent
 
     intent._PAD_LABEL_VEC_CACHE.clear()
+    import actions
+
+    actions._APP_NAME_VEC_CACHE.clear()
     monkeypatch.setattr(embeddings, "embed_text", stub_embed_text)
     try:
         import command_layer

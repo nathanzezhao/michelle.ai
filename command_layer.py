@@ -18,8 +18,8 @@ from embeddings import cosine
 
 DB_PATH = Path(os.getenv("MICHELLE_DB_PATH", "michelle.db"))
 
-MIN_SCORE = 0.62
-MARGIN = 0.08
+MIN_SCORE = 0.620
+MARGIN = 0.080
 CHAT_SINK_ID = "__chat__"
 
 EMBED_DOWN_REPLY = (
@@ -29,7 +29,7 @@ EMBED_DOWN_REPLY = (
 # Skill cards + paraphrases. Not a filter of what the user may type.
 # Window handlers share the same objects (the app / notes / it) so an app
 # name cannot pull every utterance toward open_app.
-_WINDOW_OBJECTS = ("the app", "notes", "it")
+_WINDOW_OBJECTS = ("the app", "notes", "it", "notes and safari")
 
 def _window_phrases(verbs: tuple[str, ...]) -> tuple[str, ...]:
     cards = []
@@ -77,9 +77,8 @@ HANDLER_PROTOTYPES = {
     ),
 }
 
-# Instructional / life-event paraphrases. Short "how do I open Notes?" and
-# "can you tell me how to open notes" sit inside the polite-open cluster
-# (nomic ~0.93). Short "I quit my job" sits next to "quit Chrome".
+# Instructional / life-event paraphrases. Short "how do I open Notes?"
+# and "I quit my job" must beat open_app / quit_app (MiniLM score-gate).
 CHAT_SINK_PROTOTYPES = (
     "hello",
     "yo wsp",
@@ -90,6 +89,7 @@ CHAT_SINK_PROTOTYPES = (
     "explain how to close notes",
     "what are the steps to close notes",
     "I quit my job last week",
+    "I quit my job",
     "I left my job",
     "I closed the deal",
     "email me later",
@@ -202,7 +202,9 @@ def ensure_prototypes() -> None:
     """Index handler + CHAT-sink paraphrases. Lazy — never at import."""
     global _prototypes_ready
     if _prototypes_ready:
-        return
+        if _load_vectors():
+            return
+        _prototypes_ready = False
     init_db()
     rows: list[tuple[str, str, str]] = []
     for handler_id, phrases in HANDLER_PROTOTYPES.items():
@@ -216,6 +218,9 @@ def ensure_prototypes() -> None:
         if not vec:
             continue
         rows.append((CHAT_SINK_ID, phrase, json.dumps(vec)))
+    if not rows:
+        print("[command_layer] prototype embed failed — catalog empty")
+        return
     with _connect() as conn:
         conn.execute("DELETE FROM command_vectors")
         conn.executemany(

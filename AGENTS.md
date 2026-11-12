@@ -8,7 +8,7 @@ Desktop AI assistant: Electron floating UI + FastAPI backend. Not a plain LLM wr
 |-------|------|
 | UI | Electron + Vite/React (`renderer/`, `main.js`) — chat (default), voice stub, collapsed |
 | API | FastAPI (`main.py`) |
-| LLM | Ollama (default), Gemini, or mock via `LLM_PROVIDER` |
+| LLM | Ollama (default), Gemini, or mock via `LLM_PROVIDER` (chat/intent only — embeddings are local MiniLM) |
 | DB | SQLite (`michelle.db`, gitignored) |
 | RAG | Local `docs/` → SQLite FTS5 (`retrieve.py`) |
 | Actions | Whitelist only: `open_app`, `send_email` (`actions.py`) |

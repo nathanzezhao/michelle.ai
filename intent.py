@@ -1280,7 +1280,13 @@ def _extract_params_for_locked(action_type: str, text: str) -> dict:
             "quit_app": _LOCKED_QUIT_SPAN_RE,
         }[action_type]
         match = span.search(stripped)
-        names = _split_app_names(match.group(1)) if match else []
+        raw_span = match.group(1) if match else ""
+        # ';' / '|' are payload, not extra apps (open Notes; rm -rf ~).
+        if not re.search(r"[;|]", raw_span or stripped):
+            embedded = actions.embed_match_app_names(raw_span or stripped)
+            if embedded:
+                return {"app_names": embedded}
+        names = _split_app_names(raw_span) if raw_span else []
         return {"app_names": names} if names else {}
     if action_type == "send_email":
         params = _extract_email_params(stripped)

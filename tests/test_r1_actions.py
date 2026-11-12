@@ -133,6 +133,8 @@ class FakeSubprocess:
         self.calls = []
         self.returncode = 0
         self.running = ["Notes", "Safari", "Google Chrome", "Slack", "Mail", "Finder"]
+        # Processes System Events still sees when background only is true.
+        self.background = []
 
     def run(self, argv, **kwargs):
         # NativeExecutor must pass args as a list, never a shell string (§5).
@@ -145,8 +147,14 @@ class FakeSubprocess:
             and any("every process" in str(part) for part in argv)
         )
         if is_list:
+            names = list(self.running)
+            script = " ".join(str(part) for part in argv)
+            if "background only" not in script:
+                for extra in self.background:
+                    if extra not in names:
+                        names.append(extra)
             return types.SimpleNamespace(
-                returncode=0, stdout=", ".join(self.running), stderr=""
+                returncode=0, stdout=", ".join(names), stderr=""
             )
         return types.SimpleNamespace(
             returncode=self.returncode, stdout="", stderr=""
@@ -726,6 +734,74 @@ def test_close_and_quit_then_open_does_not_skip_quit(client, ids, fake_open):
         ["open", "-a", "Music"],
         ["osascript", "-e", 'tell application "Notes" to quit'],
     ]
+
+
+def test_quit_notes_and_calendar_quits_both(client, ids, fake_open, monkeypatch):
+    """Distributive quit: 'and' is not an app; both named apps get quit."""
+    fake_open.running = ["Notes", "Safari", "Calendar"]
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Notes", "Safari", "Calendar"],
+    )
+    body = chat(client, "quit notes and calendar", ids)
+    assert body["action_type"] == "quit_app"
+    names = [n.lower() for n in body["resolved_params"]["app_names"]]
+    assert names == ["notes", "calendar"]
+    assert "and" not in names
+    assert body["confirm_required"] is True
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert "already quit" not in (out.get("answer") or "").lower()
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Notes" to quit'],
+        ["osascript", "-e", 'tell application "Calendar" to quit'],
+    ]
+
+
+def test_quit_notes_and_calendar_quits_background_calendar(
+    client, ids, fake_open, monkeypatch
+):
+    """Calendar.app can be running with background only true — still quit it."""
+    fake_open.running = ["Notes", "Safari"]
+    fake_open.background = ["Calendar"]
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Notes", "Safari", "Calendar"],
+    )
+    body = chat(client, "quit notes and calendar", ids)
+    assert body["action_type"] == "quit_app"
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    assert native_action_calls(fake_open) == [
+        ["osascript", "-e", 'tell application "Notes" to quit'],
+        ["osascript", "-e", 'tell application "Calendar" to quit'],
+    ]
+    assert "already quit" not in (out.get("answer") or "").lower()
+
+
+def test_quit_calendar_widget_only_is_already_quit(
+    client, ids, fake_open, monkeypatch
+):
+    """CalendarWidgetExtension is not Calendar.app — do not quit the widget."""
+    fake_open.running = ["Notes", "Safari"]
+    fake_open.background = ["CalendarWidgetExtension"]
+    monkeypatch.setattr(
+        actions,
+        "_list_installed_app_names",
+        lambda: ["Notes", "Safari", "Calendar"],
+    )
+    body = chat(client, "quit notes and calendar", ids)
+    out = confirm(client, ids, body["task_id"], "confirm")
+    assert out["task_status"] == "SUCCESS"
+    calls = native_action_calls(fake_open)
+    assert ["osascript", "-e", 'tell application "Notes" to quit'] in calls
+    assert not any("CalendarWidgetExtension" in " ".join(c) for c in calls)
+    assert not any(
+        c == ["osascript", "-e", 'tell application "Calendar" to quit'] for c in calls
+    )
+    assert "already quit" in (out.get("answer") or "").lower()
 
 
 def test_quit_then_open_keeps_both_targets(client, ids, fake_open):

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 import actions
 import command_layer
+import embeddings
 from intent import (
     analyze_action_request,
     analyze_remember_request,
@@ -58,6 +59,16 @@ command_layer.init_db()
 retrieve.index_docs()
 actions.init_db()
 session_context.init_db()
+# Pytest sets LLM_PROVIDER=mock before importing main — do not download MiniLM.
+if os.getenv("LLM_PROVIDER", "").lower() != "mock":
+    if embeddings.warmup():
+        command_layer.reset_prototypes()
+        command_layer.ensure_prototypes()
+    else:
+        print(
+            "[embeddings] MiniLM warmup failed — command matching unavailable "
+            "until weights load"
+        )
 # Working pad is this process only — "close it" / last draft stash do not
 # survive `b` refresh. messages + long_term_facts stay.
 session_context.clear_all()

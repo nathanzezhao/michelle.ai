@@ -1375,6 +1375,91 @@ def test_embeddings_cosine_helper():
     assert embeddings.cosine([1.0, 0.0], [1.0, 0.0]) == 1.0
     assert embeddings.cosine([1.0, 0.0], [0.0, 1.0]) == 0.0
     assert embeddings.embed_text("") is None
+    import math
+
+    near = embeddings.cosine([1.0, 0.0], [0.6194, math.sqrt(1.0 - 0.6194**2)])
+    assert near == 0.619
+
+
+def test_resolve_model_id_maps_nomic_alias(monkeypatch):
+    import embeddings
+
+    monkeypatch.delenv("EMBED_MODEL", raising=False)
+    monkeypatch.delenv("RETRIEVE_EMBED_MODEL", raising=False)
+    assert embeddings.resolve_model_id() == embeddings.DEFAULT_EMBED_MODEL
+    monkeypatch.setenv("EMBED_MODEL", "nomic-embed-text")
+    assert embeddings.resolve_model_id() == embeddings.DEFAULT_EMBED_MODEL
+    monkeypatch.setenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    assert embeddings.resolve_model_id() == "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def test_ensure_prototypes_unready_when_embed_down(monkeypatch):
+    import command_layer
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", lambda _t: None)
+    monkeypatch.setattr(command_layer.embeddings, "embed_text", lambda _t: None)
+    command_layer.reset_prototypes()
+    command_layer.ensure_prototypes()
+    assert command_layer._prototypes_ready is False
+    command_layer.ensure_prototypes()
+    assert command_layer._prototypes_ready is False
+
+
+def _app_mention_embed(text: str):
+    """Orthogonal app axes so 'and' cannot unique-hit Notes or Calendar."""
+    t = (text or "").strip().lower()
+    notes = [1.0, 0.0, 0.0]
+    calendar = [0.0, 1.0, 0.0]
+    glue = [0.0, 0.0, 1.0]
+    if t in {"notes"}:
+        return list(notes)
+    if t in {"calendar"}:
+        return list(calendar)
+    return list(glue)
+
+
+def test_embed_match_app_names_distributive_drops_and(monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _app_mention_embed)
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Notes", "Calendar"])
+    monkeypatch.setattr(
+        actions, "_list_installed_app_names", lambda: ["Notes", "Calendar"]
+    )
+    actions._APP_NAME_VEC_CACHE.clear()
+    assert actions.embed_match_app_names("notes and calendar") == [
+        "notes",
+        "calendar",
+    ]
+    assert actions.embed_match_app_names("and") == []
+    assert actions.embed_match_app_names("please") == []
+
+
+def test_locked_quit_embed_names_skip_and(monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", _app_mention_embed)
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Notes", "Calendar"])
+    monkeypatch.setattr(
+        actions, "_list_installed_app_names", lambda: ["Notes", "Calendar"]
+    )
+    actions._APP_NAME_VEC_CACHE.clear()
+    out = analyze_action_request(
+        "quit notes and calendar", locked_action_type="quit_app"
+    )
+    assert out["action_type"] == "quit_app"
+    assert out["resolved_params"]["app_names"] == ["notes", "calendar"]
+
+
+def test_embed_match_app_names_none_when_embed_down(monkeypatch):
+    import embeddings
+
+    monkeypatch.setattr(embeddings, "embed_text", lambda _t: None)
+    monkeypatch.setattr(actions, "_list_running_app_names", lambda: ["Notes"])
+    monkeypatch.setattr(actions, "_list_installed_app_names", lambda: ["Notes"])
+    actions._APP_NAME_VEC_CACHE.clear()
+    assert actions.embed_match_app_names("notes and calendar") is None
 
 
 def test_maybe_promote_pad_followup_chat_only(monkeypatch):

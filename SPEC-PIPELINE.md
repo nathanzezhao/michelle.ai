@@ -51,7 +51,7 @@ This is **not** the PDF's Action→Retrieval→Memory→Fallback waterfall. That
 8. **/chat contract** gains `engine` plus action fields (§8) so QA can assert routing. Memory decisions already exposed via `remembered`/`asked_to_remember`.
 9. **DNE stays internal.** User-facing copy for retrieval misses stays conversational (`RETRIEVE_MISS_REPLY`). Hopeless and second-miss answers are that sentence verbatim. Close-miss appends one template question — see [SPEC-RETRIEVE-EVAL.md](SPEC-RETRIEVE-EVAL.md). No "Does Not Exist (DNE)" string ever reaches the user.
 10. **Tests first.** Ada's R0 regression suite over current behavior is a prerequisite. This spec + R0 gate Slice 1 code.
-11. **Document vectors** (sqlite-vec + nomic-embed-text) are Slice 2, after Oz's venv fix. Mentioned here only as the next slice.
+11. **Document vectors** (sqlite-vec + MiniLM; nomic via Ollama is retired) are Slice 2, after Oz's venv fix. Mentioned here only as the next slice.
 
 ---
 
@@ -285,7 +285,7 @@ Explicitly **not** env vars: handler risk, confirmation requirements, cosine thr
 
 ## 12. Out of scope (Slice 1)
 
-- **Document vectors** — sqlite-vec + nomic-embed-text is Slice 2, blocked on Oz's venv fix. `retrieve.py` FTS is untouched this slice.
+- **Document vectors** — sqlite-vec + MiniLM is Slice 2, blocked on Oz's venv fix. `retrieve.py` FTS is untouched this slice.
 - The PDF's `entities` / `memories` / `vec_memories` / `document_chunks` schemas, CRUD memory manager, similarity-based conflict resolution, timestamp weighting, reranker, parallel hybrid retrieval.
 - The PDF's sequential engine waterfall and 0–10 async memory scoring.
 - Auto-resume/replay of actions after restart (explicitly rejected — startup cancels).

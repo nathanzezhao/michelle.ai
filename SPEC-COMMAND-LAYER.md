@@ -30,7 +30,7 @@ Replaces ACTION *routing* in [SPEC-PIPELINE.md](SPEC-PIPELINE.md) §2.1. Does **
 2. **This is not the PDF waterfall.** Cosine catalog → (hit? ACTION engine : classify CHAT/RETRIEVE/REMEMBER) is allowed. Action→Retrieval→Memory→Fallback is still rejected.
 3. **Match handlers, not user-string whitelists.** Cosine against handler prototypes. `ACTION_WHITELIST` is handler metadata (risk, params, executor) **after** a lock. It is not a filter on the user's text. The LLM does not pick the handler.
 4. **Risk lives on the handler object in code.** Never a list of user phrases, never LLM output, never env, never `payload_json`. Same rule as SPEC-PIPELINE §2.4 / §7, restated so nobody "fixes" routing by scanning the utterance against the dict keys.
-5. **Hit:** cosine ≥ **0.62** **and** margin (top − second) ≥ **0.08**. Skip `classify_intent`. Lock that handler. Run existing param extraction + state machine + executor.
+5. **Hit:** cosine (rounded to **3 decimal places**) ≥ **0.620** **and** margin (top − second) ≥ **0.080**. Skip `classify_intent`. Lock that handler. Run existing param extraction + state machine + executor.
 6. **Miss / tie / CHAT-sink:** no lock. `classify_intent` runs with CHAT | RETRIEVE | REMEMBER only. No ACTION label. No `_looks_like_action_order` promotion. No keyword ACTION fallback in rules/mock either.
 7. **Embed `None`:** no task. Honest sentence. No keyword fallback. See §9.
 8. **Incomplete unique hit still locks.** Bare "open" / "send an email" with a unique handler hit **asks** for missing params (`AWAITING_INPUT`). It does not fall through to CHAT.
@@ -40,7 +40,7 @@ Replaces ACTION *routing* in [SPEC-PIPELINE.md](SPEC-PIPELINE.md) §2.1. Does **
 12. **Future skills = new handler object + prototypes.** Not a new classifier label. Not a new env flag.
 13. **`command_vectors` = prototypes only.** Never email bodies, never chat transcripts, never `actions_log` payloads.
 14. **`/chat` `routed_by=catalog` on hit.** Misses do not claim catalog.
-15. **Same embed as the pad.** `EMBED_MODEL` (fallback `RETRIEVE_EMBED_MODEL`, default `nomic-embed-text`) in `embeddings.py`. **No new env var.**
+15. **Same embed as the pad.** `EMBED_MODEL` (fallback `RETRIEVE_EMBED_MODEL`, default `sentence-transformers/all-MiniLM-L6-v2`) in `embeddings.py`. **No new env var.** Ollama is not the embedder. Leftover `nomic-embed-text` maps to MiniLM.
 
 ---
 
@@ -95,9 +95,9 @@ For each clause (whole utterance if unsplit):
 1. Normalize (§6).
 2. Embed with the pad helper (`embeddings.embed_text`). Same model. If `None` → §9.
 3. Cosine vs `command_vectors` prototypes. Score a handler as **max** cosine across its prototypes. CHAT-sink is a competitor, not an executable.
-4. **Hit** iff `top >= 0.62` and `(top - second) >= 0.08` and top is an executable handler.
-5. **Tie:** margin < 0.08 (including executable vs CHAT-sink). Miss.
-6. **Miss:** top < 0.62, or CHAT-sink wins, or no vectors. Classifier only.
+4. **Hit** iff `top >= 0.620` and `(top - second) >= 0.080` and top is an executable handler. Cosine is rounded to 3 decimal places before this check.
+5. **Tie:** margin < 0.080 (including executable vs CHAT-sink). Miss.
+6. **Miss:** top < 0.620, or CHAT-sink wins, or no vectors. Classifier only.
 
 On hit:
 
@@ -137,6 +137,7 @@ Split the (already normalized) utterance on `\band\b` / `\balso\b` / `\bthen\b`.
 | Several unique hits, **different** handlers | Existing single-slot + `queue`: first unique hit this turn, rest queued after SUCCESS. Same as today's two-email queue. |
 | Any clause ties | That clause is not a lock. Other unique hits still lock. |
 | Trailing name after the same handler ("open notes and safari") | Second clause with no verb attaches to the previous unique same-handler hit if it is an app-name leftover — one `open_app`, `app_names: [Notes, Safari]`. Do not CHAT-sink "safari" into a miss that drops Safari. |
+| Distributive objects ("quit notes and calendar") | One handler lock. App slots are unique cosine hits of tokens/ngrams against running∪installed app names (same 0.620 / 0.080 as the catalog, 3 decimal places). Coordinators (`and` / `then` / `also`) are not a stop list — they miss that catalog and are dropped. Quit then resolves against **all** System Events processes (not only `background only is false`); widget/helper process names are not the .app. |
 
 Do not execute two non-terminal rows at once (SPEC-PIPELINE §10-A still holds).
 
@@ -210,10 +211,10 @@ There is no chip that forces a handler. If cosine missed, Nathan chats or says t
 
 | Var | Role |
 |---|---|
-| `EMBED_MODEL` | Already used by the pad (`embeddings.py`). Command layer uses the same call. |
-| `RETRIEVE_EMBED_MODEL` | Fallback if `EMBED_MODEL` unset. Default `nomic-embed-text`. |
+| `EMBED_MODEL` | Sentence Transformers id for the pad + command layer. Default MiniLM. |
+| `RETRIEVE_EMBED_MODEL` | Fallback if `EMBED_MODEL` unset. Default `sentence-transformers/all-MiniLM-L6-v2`. |
 
-**No new env var.** Not a cosine threshold knob. Not a catalog on/off flag. Thresholds 0.62 / 0.08 are code constants.
+**No new env var.** Not a cosine threshold knob. Not a catalog on/off flag. Thresholds 0.620 / 0.080 are code constants. Cosine is rounded to 3 decimal places.
 
 ---
 
@@ -233,7 +234,7 @@ There is no chip that forces a handler. If cosine missed, Nathan chats or says t
 
 ## 15. Acceptance (QA bar — Ray's team)
 
-Ada stubs `embeddings.embed_text` / cosine. Do not require live Ollama embed in CI. R0 stays green. Quinn does live utterances after.
+Ada stubs `embeddings.embed_text` / cosine. Do not require MiniLM (or Ollama) in CI. R0 stays green. Quinn does live utterances after `b` restart.
 
 **Routing**
 1. "open Notes" → skip classify (spy: not called), `engine: "action"`, `action_type: "open_app"`, `routed_by: "catalog"`, `risk: "low"` from the handler object.
@@ -270,7 +271,7 @@ Ada stubs `embeddings.embed_text` / cosine. Do not require live Ollama embed in 
 
 - **Ned:** cosine layer before `classify_intent`; `command_vectors`; lock handler; skip classify on hit; strip ACTION from classifier + rules/mock; ignore `force_intent=ACTION`; drop Do this from `CLARIFY_CHIPS`; `routed_by`; embed-None honest path. Reuse `embeddings.py`. No new env.
 - **Kit:** chips from API only; Do this gone. No new UI for catalog.
-- **Oz:** no new env. Same Ollama embed as pad (`EMBED_MODEL` / `nomic-embed-text`). Document in README (already this slice).
+- **Oz:** no new env. MiniLM via `sentence-transformers` (`EMBED_MODEL`). Ollama is chat/intent only. Document in README.
 - **Ray:** Ada §15; Quinn live open/close/quit/email vs chat; Vale embed-down and whitelist-as-filter abuse.
 
 Have Tom assign Ned (and Kit for the chip). Have Ray assign Ada/Quinn/Vale. Sam does not implement.

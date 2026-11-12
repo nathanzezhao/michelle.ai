@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
+import embeddings
+
 _UNSET = object()
 
 # One page of the Drafts folder. Do not paginate with page_token.
@@ -732,6 +734,13 @@ _LIST_RUNNING_SCRIPT = (
     'tell application "System Events" to get name of every process '
     "whose background only is false"
 )
+_LIST_ALL_PROCESSES_SCRIPT = (
+    'tell application "System Events" to get name of every process'
+)
+APP_MENTION_MIN = 0.620
+APP_MENTION_MARGIN = 0.080
+_APP_NAME_VEC_CACHE: dict[str, list[float]] = {}
+_APP_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+._-]*")
 
 
 def _app_names_from_params(params: dict) -> list[str]:
@@ -764,10 +773,10 @@ def _format_app_list(names: list[str]) -> str:
     return ", ".join(clean[:-1]) + f", and {clean[-1]}"
 
 
-def _list_running_app_names() -> list[str]:
+def _osascript_name_list(script: str) -> list[str]:
     try:
         result = subprocess.run(
-            ["osascript", "-e", _LIST_RUNNING_SCRIPT],
+            ["osascript", "-e", script],
             capture_output=True,
             text=True,
             timeout=10,
@@ -778,6 +787,15 @@ def _list_running_app_names() -> list[str]:
         return []
     blob = (result.stdout or "").replace("\n", ",")
     return [p.strip() for p in blob.split(",") if p.strip()]
+
+
+def _list_running_app_names() -> list[str]:
+    return _osascript_name_list(_LIST_RUNNING_SCRIPT)
+
+
+def _list_process_names() -> list[str]:
+    """Every System Events process, including background-only apps."""
+    return _osascript_name_list(_LIST_ALL_PROCESSES_SCRIPT)
 
 
 def _list_installed_app_names() -> list[str]:
@@ -873,20 +891,188 @@ def _fuzzy_pick(query: str, candidates: list[str]) -> str | None:
     return None
 
 
-def resolve_app_target(query: str) -> tuple[str, str | None]:
+def _app_universe() -> list[str]:
+    names: list[str] = []
+    seen = set()
+    for item in _list_running_app_names() + _list_installed_app_names():
+        key = (item or "").strip().lower()
+        if item and key not in seen:
+            seen.add(key)
+            names.append(item)
+    return names
+
+
+def _nearby_apps(phrase: str, universe: list[str]) -> list[str]:
+    q = (phrase or "").strip()
+    if not q:
+        return []
+    ql = q.lower()
+    nearby: list[str] = []
+    seen = set()
+
+    def add(name: str | None) -> None:
+        if not name:
+            return
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            nearby.append(name)
+
+    add(_fuzzy_pick(q, universe))
+    lowered = {c.lower(): c for c in universe}
+    for c in universe:
+        tokens = _name_tokens(c)
+        cl = c.lower()
+        if cl == ql or ql in tokens or cl.startswith(ql):
+            add(c)
+    if len(ql) >= 2:
+        for match in difflib.get_close_matches(ql, list(lowered), n=4, cutoff=0.55):
+            add(lowered[match])
+    return nearby
+
+
+def _app_name_vec(name: str) -> list[float] | None:
+    key = (name or "").strip().lower()
+    if not key:
+        return None
+    cached = _APP_NAME_VEC_CACHE.get(key)
+    if cached is not None:
+        return cached
+    vec = embeddings.embed_text(name)
+    if vec is not None:
+        _APP_NAME_VEC_CACHE[key] = vec
+    return vec
+
+
+def _unique_app_embed(phrase: str, universe: list[str]):
+    """Return (canonical, status) where status is hit|miss|down."""
+    nearby = _nearby_apps(phrase, universe)
+    if not nearby:
+        return None, "miss"
+    query_vec = embeddings.embed_text(phrase)
+    if query_vec is None:
+        return None, "down"
+    scored: list[tuple[float, str]] = []
+    saw_vec = False
+    for name in nearby:
+        name_vec = _app_name_vec(name)
+        if name_vec is None:
+            continue
+        saw_vec = True
+        scored.append((embeddings.cosine(query_vec, name_vec), name))
+    if not scored:
+        return None, "down" if not saw_vec else "miss"
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_score, top_name = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    if top_score < APP_MENTION_MIN:
+        return None, "miss"
+    if top_score - second < APP_MENTION_MARGIN:
+        return None, "miss"
+    return top_name, "hit"
+
+
+def embed_match_app_names(span: str) -> list[str] | None:
+    """Distributive app slots: unique cosine hits against running+installed.
+
+    Coordinators like 'and' are not a stop list — they miss the catalog.
+    None means embed down (caller may fall back). [] means no unique hits.
+    """
+    blob = (span or "").strip()
+    if not blob:
+        return []
+    universe = _app_universe()
+    if not universe:
+        return []
+    tokens = _APP_TOKEN_RE.findall(blob)
+    if not tokens:
+        return []
+    hits: list[str] = []
+    seen = set()
+    saw_down = False
+    i = 0
+    while i < len(tokens):
+        chosen = None
+        taken = 0
+        for width in (3, 2, 1):
+            if i + width > len(tokens):
+                continue
+            phrase = " ".join(tokens[i : i + width])
+            if width > 1 and _fuzzy_pick(phrase, universe) is None:
+                continue
+            canonical, status = _unique_app_embed(phrase, universe)
+            if status == "down":
+                saw_down = True
+                continue
+            if canonical:
+                chosen = (phrase, canonical)
+                taken = width
+                break
+        if chosen:
+            phrase, canonical = chosen
+            key = canonical.lower()
+            if key not in seen:
+                seen.add(key)
+                hits.append(phrase)
+            i += taken
+            continue
+        i += 1
+    if saw_down and not hits:
+        return None
+    return hits
+
+
+def _installed_prefix_parent(process: str, installed: list[str]) -> str | None:
+    pl = (process or "").strip().lower()
+    if not pl:
+        return None
+    parents = []
+    for app in installed:
+        al = (app or "").strip().lower()
+        if len(al) < 3 or not pl.startswith(al) or pl == al:
+            continue
+        rest = pl[len(al) :]
+        if rest and rest[0].isalpha():
+            parents.append(app)
+    if len(parents) == 1:
+        return parents[0]
+    return None
+
+
+def _canonical_running_app(
+    process: str | None, running: list[str], installed: list[str]
+) -> str | None:
+    """Keep the .app process. Widget/helper names are not the app."""
+    if not process:
+        return None
+    parent = _installed_prefix_parent(process, installed)
+    if parent and process.lower() != parent.lower():
+        if any(p.lower() == parent.lower() for p in running):
+            return parent
+        return None
+    return process
+
+
+def resolve_app_target(
+    query: str, *, include_background: bool = False
+) -> tuple[str, str | None]:
     """Map a typed name to (running|not_running|unknown, canonical)."""
     if not _app_name_allowed(query):
         return ("unknown", None)
-    running = _list_running_app_names()
+    running = (
+        _list_process_names() if include_background else _list_running_app_names()
+    )
     hit = _fuzzy_pick(query, running)
-    if hit:
-        return ("running", hit)
+    canonical = _canonical_running_app(hit, running, _list_installed_app_names()) if hit else None
+    if canonical:
+        return ("running", canonical)
     installed = _list_installed_app_names()
     hit = _fuzzy_pick(query, installed)
     if hit:
         alias = _fuzzy_pick(hit, running)
-        if alias:
-            return ("running", alias)
+        alias_can = _canonical_running_app(alias, running, installed) if alias else None
+        if alias_can:
+            return ("running", alias_can)
         return ("not_running", hit)
     if not running and not installed:
         return ("running", query)
@@ -1005,7 +1191,9 @@ class NativeExecutor:
                 fail_names.append(typed)
                 lines.append(f"I couldn't find an app called {typed}.")
                 continue
-            state, canonical = resolve_app_target(typed)
+            state, canonical = resolve_app_target(
+                typed, include_background=quit_app
+            )
             if state == "unknown" or not canonical:
                 fail_names.append(typed)
                 lines.append(f"I couldn't find an app called {typed}.")
