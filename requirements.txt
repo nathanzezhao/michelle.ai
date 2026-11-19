@@ -9,4 +9,4 @@ pytest
 sqlite-vec
 composio
 faster-whisper
-sentence-transformers==3.4.1
+sentence-transformers==6.3.0
